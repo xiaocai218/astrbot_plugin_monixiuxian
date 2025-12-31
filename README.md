@@ -1,4 +1,5 @@
 # AstrBot 插件：文字修仙
+# 暂停更新，新版本请自行去这里下载替换：https://github.com/xiaojuwa/astrbot_plugin_monixiuxian2
 
 **版本:** 1.0.5dev
 **许可证:** AGPL-3.0
@@ -116,3 +117,4 @@
 - **GitHub**: https://github.com/linjianyan0229/astrbot_plugin_monixiuxian
 - **AstrBot**: https://github.com/Soulter/AstrBot
 - **问题反馈**: https://github.com/linjianyan0229/astrbot_plugin_monixiuxian/issues
+
