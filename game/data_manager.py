@@ -1,0 +1,1321 @@
+"""数据持久化管理：SQLite 数据库存储。"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+from datetime import datetime
+from typing import Optional, Any
+
+import aiosqlite
+
+from .models import Player
+
+# 玩家表所有列（与 Player 字段一一对应）
+_PLAYER_COLUMNS = [
+    "user_id", "name", "realm", "sub_realm", "exp",
+    "hp", "max_hp", "attack", "defense", "spirit_stones",
+    "lingqi",
+    "heart_method", "weapon", "gongfa_1", "gongfa_2", "gongfa_3", "armor", "dao_yun",
+    "heart_method_mastery", "heart_method_exp", "heart_method_value",
+    "inventory", "created_at", "last_cultivate_time",
+    "last_checkin_date", "afk_cultivate_start", "afk_cultivate_end",
+    "last_adventure_time", "death_count", "unified_msg_origin", "password_hash",
+]
+
+
+class DataManager:
+    """管理玩家数据的加载和保存（SQLite）。"""
+
+    def __init__(self, data_dir: str):
+        self._data_dir = data_dir
+        self._db_path = os.path.join(data_dir, "xiuxian.db")
+        self.db: Optional[aiosqlite.Connection] = None
+        self._shop_purchase_lock = asyncio.Lock()
+
+    async def initialize(self):
+        """初始化数据目录、打开数据库、建表、迁移旧数据。"""
+        os.makedirs(self._data_dir, exist_ok=True)
+        self.db = await aiosqlite.connect(self._db_path)
+        self.db.row_factory = aiosqlite.Row
+        await self.db.execute("PRAGMA journal_mode=WAL")
+        await self._create_tables()
+        await self._migrate_json_data()
+
+    async def _create_tables(self):
+        """创建数据库表。"""
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS players (
+                user_id             TEXT PRIMARY KEY,
+                name                TEXT NOT NULL,
+                realm               INTEGER DEFAULT 0,
+                sub_realm           INTEGER DEFAULT 0,
+                exp                 INTEGER DEFAULT 0,
+                hp                  INTEGER DEFAULT 100,
+                max_hp              INTEGER DEFAULT 100,
+                attack              INTEGER DEFAULT 10,
+                defense             INTEGER DEFAULT 5,
+                spirit_stones       INTEGER DEFAULT 0,
+                lingqi              INTEGER DEFAULT 50,
+                heart_method        TEXT DEFAULT '无',
+                weapon              TEXT DEFAULT '无',
+                gongfa_1            TEXT DEFAULT '无',
+                gongfa_2            TEXT DEFAULT '无',
+                gongfa_3            TEXT DEFAULT '无',
+                armor               TEXT DEFAULT '无',
+                dao_yun             INTEGER DEFAULT 0,
+                heart_method_mastery INTEGER DEFAULT 0,
+                heart_method_exp    INTEGER DEFAULT 0,
+                heart_method_value  INTEGER DEFAULT 0,
+                inventory           TEXT DEFAULT '{}',
+                created_at          REAL,
+                last_cultivate_time REAL DEFAULT 0.0,
+                last_checkin_date   TEXT,
+                afk_cultivate_start REAL DEFAULT 0.0,
+                afk_cultivate_end   REAL DEFAULT 0.0,
+                last_adventure_time REAL DEFAULT 0.0,
+                death_count         INTEGER DEFAULT 0,
+                unified_msg_origin  TEXT,
+                password_hash       TEXT
+            )
+        """)
+        # 历练场景表
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS adventure_scenes (
+                id          INTEGER PRIMARY KEY,
+                category    TEXT NOT NULL,
+                name        TEXT NOT NULL,
+                description TEXT NOT NULL
+            )
+        """)
+        # 心法定义独立表（可在数据库中独立维护）
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS heart_methods (
+                method_id       TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                realm           INTEGER NOT NULL,
+                quality         INTEGER NOT NULL DEFAULT 0,
+                exp_multiplier  REAL NOT NULL DEFAULT 0.0,
+                attack_bonus    INTEGER NOT NULL DEFAULT 0,
+                defense_bonus   INTEGER NOT NULL DEFAULT 0,
+                dao_yun_rate    REAL NOT NULL DEFAULT 0.0,
+                description     TEXT DEFAULT '',
+                mastery_exp     INTEGER NOT NULL DEFAULT 100,
+                enabled         INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        # 武器/护甲定义独立表（管理员可维护）
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS weapons (
+                equip_id         TEXT PRIMARY KEY,
+                name             TEXT NOT NULL,
+                tier             INTEGER NOT NULL,
+                slot             TEXT NOT NULL,
+                attack           INTEGER NOT NULL DEFAULT 0,
+                defense          INTEGER NOT NULL DEFAULT 0,
+                element          TEXT DEFAULT '无',
+                element_damage   INTEGER NOT NULL DEFAULT 0,
+                description      TEXT DEFAULT '',
+                enabled          INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        # 坊市上架记录
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS market_listings (
+                listing_id   TEXT PRIMARY KEY,
+                seller_id    TEXT NOT NULL,
+                item_id      TEXT NOT NULL,
+                quantity     INTEGER NOT NULL,
+                unit_price   INTEGER NOT NULL,
+                total_price  INTEGER NOT NULL,
+                fee          INTEGER NOT NULL,
+                listed_at    REAL NOT NULL,
+                expires_at   REAL NOT NULL,
+                status       TEXT NOT NULL DEFAULT 'active',
+                buyer_id     TEXT,
+                sold_at      REAL
+            )
+        """)
+        # 坊市成交记录（用于手续费计算）
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS market_history (
+                history_id   TEXT PRIMARY KEY,
+                item_id      TEXT NOT NULL,
+                quantity     INTEGER NOT NULL,
+                unit_price   INTEGER NOT NULL,
+                total_price  INTEGER NOT NULL,
+                fee          INTEGER NOT NULL,
+                seller_id    TEXT NOT NULL,
+                buyer_id     TEXT NOT NULL,
+                sold_at      REAL NOT NULL
+            )
+        """)
+        # 坊市索引
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_market_listings_status
+            ON market_listings (status)
+        """)
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_market_listings_seller
+            ON market_listings (seller_id)
+        """)
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_market_listings_expires
+            ON market_listings (expires_at)
+        """)
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_market_history_item
+            ON market_history (item_id, sold_at)
+        """)
+        # 天机阁购买记录
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS shop_purchases (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      TEXT NOT NULL,
+                item_id      TEXT NOT NULL,
+                quantity     INTEGER NOT NULL DEFAULT 1,
+                unit_price   INTEGER NOT NULL,
+                purchased_at TEXT NOT NULL
+            )
+        """)
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_shop_date
+            ON shop_purchases (purchased_at, item_id)
+        """)
+        # 公告表
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS announcements (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                title      TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                enabled    INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        await self.db.commit()
+        # 数据库升级：为旧表添加新列
+        await self._alter_add_column("players", "last_adventure_time", "REAL DEFAULT 0.0")
+        await self._alter_add_column("players", "death_count", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "lingqi", "INTEGER DEFAULT 50")
+        await self._alter_add_column("players", "heart_method", "TEXT DEFAULT '无'")
+        await self._alter_add_column("players", "weapon", "TEXT DEFAULT '无'")
+        await self._alter_add_column("players", "gongfa_1", "TEXT DEFAULT '无'")
+        await self._alter_add_column("players", "gongfa_2", "TEXT DEFAULT '无'")
+        await self._alter_add_column("players", "gongfa_3", "TEXT DEFAULT '无'")
+        await self._alter_add_column("players", "armor", "TEXT DEFAULT '无'")
+        await self._alter_add_column("players", "dao_yun", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "heart_method_mastery", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "heart_method_exp", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "heart_method_value", "INTEGER DEFAULT 0")
+        # 填充场景数据
+        await self._seed_adventure_scenes()
+        # 填充心法定义（仅补齐缺失，不覆盖已有配置）
+        await self._seed_heart_methods()
+        # 填充装备定义（仅补齐缺失，不覆盖已有配置）
+        await self._seed_weapons()
+
+    async def _migrate_json_data(self):
+        """若存在旧 players.json 且数据库为空，则自动迁移。"""
+        json_file = os.path.join(self._data_dir, "players.json")
+        if not os.path.exists(json_file):
+            return
+        # 检查数据库是否已有数据
+        async with self.db.execute("SELECT COUNT(*) FROM players") as cur:
+            row = await cur.fetchone()
+            if row[0] > 0:
+                return
+        # 读取旧 JSON
+        try:
+            with open(json_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            if not content.strip():
+                return
+            data = json.loads(content)
+            for uid, d in data.items():
+                d["user_id"] = uid
+                player = Player.from_dict(d)
+                await self._upsert_player(player)
+            await self.db.commit()
+            # 迁移完成后重命名旧文件作备份
+            backup = json_file + ".bak"
+            if not os.path.exists(backup):
+                os.rename(json_file, backup)
+        except Exception:
+            pass
+
+    async def load_all_players(self) -> dict[str, Player]:
+        """加载所有玩家数据到内存。"""
+        players = {}
+        async with self.db.execute("SELECT * FROM players") as cur:
+            async for row in cur:
+                d = self._row_to_dict(row)
+                player = Player.from_dict(d)
+                players[player.user_id] = player
+        return players
+
+    async def load_heart_methods(self) -> dict:
+        """加载启用的心法定义（独立表 -> 运行时）。"""
+        from .constants import HEART_METHOD_REGISTRY, HeartMethodDef, HeartMethodQuality
+
+        methods = {}
+        try:
+            async with self.db.execute(
+                """
+                SELECT method_id, name, realm, quality, exp_multiplier,
+                       attack_bonus, defense_bonus, dao_yun_rate, description, mastery_exp
+                FROM heart_methods
+                WHERE enabled = 1
+                ORDER BY realm ASC, quality ASC, method_id ASC
+                """
+            ) as cur:
+                async for row in cur:
+                    method_id = row["method_id"]
+                    methods[method_id] = HeartMethodDef(
+                        method_id=method_id,
+                        name=row["name"],
+                        realm=int(row["realm"]),
+                        quality=HeartMethodQuality(int(row["quality"])),
+                        exp_multiplier=float(row["exp_multiplier"] or 0.0),
+                        attack_bonus=int(row["attack_bonus"] or 0),
+                        defense_bonus=int(row["defense_bonus"] or 0),
+                        dao_yun_rate=float(row["dao_yun_rate"] or 0.0),
+                        description=row["description"] or "",
+                        mastery_exp=int(row["mastery_exp"] or 100),
+                    )
+        except Exception:
+            # 回退到代码内置，避免启动失败
+            return dict(HEART_METHOD_REGISTRY)
+        return methods
+
+    async def load_weapons(self) -> dict:
+        """加载启用的装备定义（独立表 -> 运行时）。"""
+        from .constants import EQUIPMENT_REGISTRY, EquipmentDef
+
+        equips = {}
+        try:
+            async with self.db.execute(
+                """
+                SELECT equip_id, name, tier, slot, attack, defense,
+                       element, element_damage, description
+                FROM weapons
+                WHERE enabled = 1
+                ORDER BY tier ASC, slot ASC, equip_id ASC
+                """
+            ) as cur:
+                async for row in cur:
+                    equip_id = row["equip_id"]
+                    equips[equip_id] = EquipmentDef(
+                        equip_id=equip_id,
+                        name=row["name"],
+                        tier=int(row["tier"]),
+                        slot=row["slot"],
+                        attack=int(row["attack"] or 0),
+                        defense=int(row["defense"] or 0),
+                        element=row["element"] or "无",
+                        element_damage=int(row["element_damage"] or 0),
+                        description=row["description"] or "",
+                    )
+        except Exception:
+            return dict(EQUIPMENT_REGISTRY)
+        return equips
+
+    async def save_player(self, player: Player):
+        """保存单个玩家（INSERT OR REPLACE）。"""
+        await self._upsert_player(player)
+        await self.db.commit()
+
+    async def save_all_players(self, players: dict[str, Player]):
+        """批量保存所有玩家数据（事务：清空 + 重插）。"""
+        await self.db.execute("DELETE FROM players")
+        for player in players.values():
+            await self._upsert_player(player)
+        await self.db.commit()
+
+    async def delete_player(self, user_id: str):
+        """删除单个玩家。"""
+        await self.db.execute("DELETE FROM players WHERE user_id = ?", (user_id,))
+        await self.db.commit()
+
+    async def clear_all_data(self, remove_dir: bool = False):
+        """清理插件数据。"""
+        if remove_dir:
+            await self.close()
+            if os.path.isdir(self._data_dir):
+                await asyncio.to_thread(shutil.rmtree, self._data_dir, True)
+            return
+        await self.db.execute("DELETE FROM players")
+        await self.db.execute("DELETE FROM web_tokens")
+        await self.db.execute("DELETE FROM bind_keys")
+        await self.db.execute("DELETE FROM chat_bindings")
+        await self.db.commit()
+
+    async def close(self):
+        """关闭数据库连接。"""
+        if self.db:
+            await self.db.close()
+            self.db = None
+
+    # ==================== 内部方法 ====================
+
+    async def _upsert_player(self, player: Player, db: aiosqlite.Connection | None = None):
+        """INSERT OR REPLACE 单个玩家。"""
+        d = player.to_dict(include_sensitive=True)
+        # inventory 序列化为 JSON text
+        inv = d.get("inventory", {})
+        if isinstance(inv, dict):
+            inv = json.dumps(inv, ensure_ascii=False)
+        conn = db or self.db
+        if conn is None:
+            raise RuntimeError("数据库连接尚未初始化")
+
+        values = (
+            player.user_id,
+            d.get("name", ""),
+            d.get("realm", 0),
+            d.get("sub_realm", 0),
+            d.get("exp", 0),
+            d.get("hp", 100),
+            d.get("max_hp", 100),
+            d.get("attack", 10),
+            d.get("defense", 5),
+            d.get("spirit_stones", 0),
+            d.get("lingqi", 50),
+            d.get("heart_method", "无"),
+            d.get("weapon", "无"),
+            d.get("gongfa_1", "无"),
+            d.get("gongfa_2", "无"),
+            d.get("gongfa_3", "无"),
+            d.get("armor", "无"),
+            d.get("dao_yun", 0),
+            d.get("heart_method_mastery", 0),
+            d.get("heart_method_exp", 0),
+            d.get("heart_method_value", 0),
+            inv,
+            d.get("created_at", 0),
+            d.get("last_cultivate_time", 0.0),
+            d.get("last_checkin_date"),
+            d.get("afk_cultivate_start", 0.0),
+            d.get("afk_cultivate_end", 0.0),
+            d.get("last_adventure_time", 0.0),
+            d.get("death_count", 0),
+            d.get("unified_msg_origin"),
+            d.get("password_hash"),
+        )
+        placeholders = ", ".join(["?"] * len(_PLAYER_COLUMNS))
+        cols = ", ".join(_PLAYER_COLUMNS)
+        await conn.execute(
+            f"INSERT OR REPLACE INTO players ({cols}) VALUES ({placeholders})",
+            values,
+        )
+
+    @staticmethod
+    def _row_to_dict(row: aiosqlite.Row) -> dict:
+        """将数据库行转为 Player.from_dict 可用的字典。"""
+        d = dict(row)
+        # inventory 从 JSON text 反序列化
+        inv = d.get("inventory", "{}")
+        if isinstance(inv, str):
+            try:
+                d["inventory"] = json.loads(inv)
+            except (json.JSONDecodeError, TypeError):
+                d["inventory"] = {}
+        return d
+
+    async def _alter_add_column(self, table: str, column: str, col_type: str):
+        """安全地为表添加新列（已存在则忽略）。"""
+        try:
+            await self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+            await self.db.commit()
+        except Exception:
+            pass  # 列已存在
+
+    async def _seed_adventure_scenes(self):
+        """若场景表为空，填充40条历练场景数据。"""
+        async with self.db.execute("SELECT COUNT(*) FROM adventure_scenes") as cur:
+            row = await cur.fetchone()
+            if row[0] > 0:
+                return
+        scenes = [
+            # 魔兽森林
+            ("魔兽森林", "幽暗密林", "古树参天，妖兽潜伏于暗处"),
+            ("魔兽森林", "血月狼谷", "狼嚎震天，血月映照下凶兽成群"),
+            ("魔兽森林", "毒瘴沼泽", "瘴气弥漫，毒虫遍地横行"),
+            ("魔兽森林", "万蛇巢穴", "蛇影重重，巨蟒盘踞洞中"),
+            ("魔兽森林", "熊罴险岭", "巨熊咆哮，山石崩裂"),
+            ("魔兽森林", "灵猿古树", "灵猿据守千年古木"),
+            ("魔兽森林", "火鸦荒原", "火鸦群起，烈焰灼天"),
+            ("魔兽森林", "寒冰兽窟", "冰封洞窟中蛰伏着远古凶兽"),
+            ("魔兽森林", "雷鹰崖壁", "崖顶雷鹰振翅带起雷暴"),
+            ("魔兽森林", "九尾狐林", "迷雾中传来蛊惑人心的狐鸣"),
+            # 秘境探险
+            ("秘境探险", "上古遗迹", "断壁残垣中隐藏着远古秘宝"),
+            ("秘境探险", "迷幻阵法", "虚实难辨，一步踏错万劫不复"),
+            ("秘境探险", "地下灵脉", "灵气汹涌的地底矿脉"),
+            ("秘境探险", "沉没宫殿", "水下宫殿中封印着未知力量"),
+            ("秘境探险", "时空裂隙", "时空紊乱的裂缝中危机四伏"),
+            ("秘境探险", "藏经阁废墟", "残破典籍中暗藏逆天功法"),
+            ("秘境探险", "炼丹古洞", "古修士遗留的炼丹福地"),
+            ("秘境探险", "星辰迷宫", "星光指引下的层层考验"),
+            ("秘境探险", "天机棋盘", "以命为棋，一局定生死"),
+            ("秘境探险", "虚空秘境", "虚空中飘浮的远古修炼之地"),
+            # 除魔卫道
+            ("除魔卫道", "魔修巢穴", "魔修聚集的阴暗地窟"),
+            ("除魔卫道", "血祭祭坛", "邪修正在进行血祭仪式"),
+            ("除魔卫道", "鬼蜮幽都", "阴气冲天，厉鬼横行"),
+            ("除魔卫道", "堕落仙山", "被魔气侵蚀的昔日仙门"),
+            ("除魔卫道", "尸傀战场", "操控尸傀的邪修正在为祸"),
+            ("除魔卫道", "妖邪峡谷", "妖邪盘踞的深幽峡谷"),
+            ("除魔卫道", "噬魂阵法", "以魂为引的禁忌大阵"),
+            ("除魔卫道", "天魔分身", "天魔降临世间的一缕分身"),
+            ("除魔卫道", "邪道拍卖", "暗中交易违禁之物的黑市"),
+            ("除魔卫道", "魔道入侵", "魔道大军入侵，需奋力抵御"),
+            # 红尘历练
+            ("红尘历练", "繁华集市", "凡人集市中暗流涌动"),
+            ("红尘历练", "仙门试炼", "仙门弟子间的切磋比试"),
+            ("红尘历练", "悬赏猎杀", "接取悬赏任务追捕通缉犯"),
+            ("红尘历练", "护送商队", "护送灵材商队穿越危险地带"),
+            ("红尘历练", "擂台争霸", "修仙界武斗擂台赛"),
+            ("红尘历练", "奇遇仙缘", "偶遇高人，机缘降临"),
+            ("红尘历练", "山贼劫道", "路遇山贼拦路打劫"),
+            ("红尘历练", "江湖恩怨", "卷入江湖恩怨纷争"),
+            ("红尘历练", "天灾降临", "天降异象，妖兽暴动"),
+            ("红尘历练", "论道大会", "各路修士齐聚论道"),
+        ]
+        await self.db.executemany(
+            "INSERT INTO adventure_scenes (category, name, description) VALUES (?, ?, ?)",
+            scenes,
+        )
+        await self.db.commit()
+
+    async def _seed_heart_methods(self):
+        """若心法表为空或有缺失，按代码内置定义补齐。"""
+        from .constants import HEART_METHOD_REGISTRY
+
+        existing = set()
+        async with self.db.execute("SELECT method_id FROM heart_methods") as cur:
+            async for row in cur:
+                existing.add(row[0])
+
+        rows = []
+        for hm in HEART_METHOD_REGISTRY.values():
+            if hm.method_id in existing:
+                continue
+            rows.append(
+                (
+                    hm.method_id,
+                    hm.name,
+                    int(hm.realm),
+                    int(hm.quality),
+                    float(hm.exp_multiplier),
+                    int(hm.attack_bonus),
+                    int(hm.defense_bonus),
+                    float(hm.dao_yun_rate),
+                    hm.description,
+                    int(hm.mastery_exp),
+                    1,
+                )
+            )
+
+        if not rows:
+            return
+
+        await self.db.executemany(
+            """
+            INSERT OR IGNORE INTO heart_methods (
+                method_id, name, realm, quality, exp_multiplier,
+                attack_bonus, defense_bonus, dao_yun_rate, description, mastery_exp, enabled
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        await self.db.commit()
+
+    async def _seed_weapons(self):
+        """若武器表为空或有缺失，按代码内置定义补齐。"""
+        from .constants import EQUIPMENT_REGISTRY
+
+        existing = set()
+        async with self.db.execute("SELECT equip_id FROM weapons") as cur:
+            async for row in cur:
+                existing.add(row[0])
+
+        rows = []
+        for eq in EQUIPMENT_REGISTRY.values():
+            if eq.equip_id in existing:
+                continue
+            rows.append(
+                (
+                    eq.equip_id,
+                    eq.name,
+                    int(eq.tier),
+                    eq.slot,
+                    int(eq.attack),
+                    int(eq.defense),
+                    eq.element,
+                    int(eq.element_damage),
+                    eq.description,
+                    1,
+                )
+            )
+
+        if not rows:
+            return
+
+        await self.db.executemany(
+            """
+            INSERT OR IGNORE INTO weapons (
+                equip_id, name, tier, slot, attack, defense,
+                element, element_damage, description, enabled
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        await self.db.commit()
+
+    async def get_adventure_scenes(self) -> list[dict]:
+        """获取所有历练场景。"""
+        result = []
+        async with self.db.execute(
+            "SELECT id, category, name, description FROM adventure_scenes ORDER BY id"
+        ) as cur:
+            async for row in cur:
+                result.append({
+                    "id": row[0], "category": row[1],
+                    "name": row[2], "description": row[3],
+                })
+        return result
+
+    async def get_random_scene(self) -> Optional[dict]:
+        """随机获取一个历练场景。"""
+        async with self.db.execute(
+            "SELECT id, category, name, description FROM adventure_scenes ORDER BY RANDOM() LIMIT 1"
+        ) as cur:
+            row = await cur.fetchone()
+            if row:
+                return {"id": row[0], "category": row[1], "name": row[2], "description": row[3]}
+        return None
+
+    # ==================== 管理员 CRUD：历练场景 ====================
+
+    async def admin_list_adventure_scenes(self) -> list[dict[str, Any]]:
+        return await self.get_adventure_scenes()
+
+    async def admin_has_adventure_scene_name(self, name: str) -> bool:
+        """检查历练场景名称是否已存在（不区分大小写，忽略首尾空白）。"""
+        async with self.db.execute(
+            """
+            SELECT 1
+            FROM adventure_scenes
+            WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))
+            LIMIT 1
+            """,
+            (name,),
+        ) as cur:
+            row = await cur.fetchone()
+            return row is not None
+
+    async def admin_create_adventure_scene(self, category: str, name: str, description: str) -> int:
+        cur = await self.db.execute(
+            "INSERT INTO adventure_scenes (category, name, description) VALUES (?, ?, ?)",
+            (category, name, description),
+        )
+        await self.db.commit()
+        return int(cur.lastrowid or 0)
+
+    async def admin_update_adventure_scene(self, scene_id: int, category: str, name: str, description: str) -> bool:
+        cur = await self.db.execute(
+            """
+            UPDATE adventure_scenes
+            SET category = ?, name = ?, description = ?
+            WHERE id = ?
+            """,
+            (category, name, description, scene_id),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_delete_adventure_scene(self, scene_id: int) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM adventure_scenes WHERE id = ?",
+            (scene_id,),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    # ==================== 管理员 CRUD：心法 ====================
+
+    async def admin_list_heart_methods(self) -> list[dict[str, Any]]:
+        result = []
+        async with self.db.execute(
+            """
+            SELECT method_id, name, realm, quality, exp_multiplier,
+                   attack_bonus, defense_bonus, dao_yun_rate, description, mastery_exp, enabled
+            FROM heart_methods
+            ORDER BY realm ASC, quality ASC, method_id ASC
+            """
+        ) as cur:
+            async for row in cur:
+                result.append(dict(row))
+        return result
+
+    async def admin_has_heart_method_name(self, name: str) -> bool:
+        """检查心法名称是否已存在（不区分大小写，忽略首尾空白）。"""
+        async with self.db.execute(
+            """
+            SELECT 1
+            FROM heart_methods
+            WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))
+            LIMIT 1
+            """,
+            (name,),
+        ) as cur:
+            row = await cur.fetchone()
+            return row is not None
+
+    async def admin_create_heart_method(self, data: dict[str, Any]) -> bool:
+        cur = await self.db.execute(
+            """
+            INSERT OR IGNORE INTO heart_methods (
+                method_id, name, realm, quality, exp_multiplier,
+                attack_bonus, defense_bonus, dao_yun_rate, description, mastery_exp, enabled
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["method_id"],
+                data["name"],
+                int(data["realm"]),
+                int(data["quality"]),
+                float(data.get("exp_multiplier", 0.0)),
+                int(data.get("attack_bonus", 0)),
+                int(data.get("defense_bonus", 0)),
+                float(data.get("dao_yun_rate", 0.0)),
+                str(data.get("description", "")),
+                int(data.get("mastery_exp", 100)),
+                int(data.get("enabled", 1)),
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_update_heart_method(self, method_id: str, data: dict[str, Any]) -> bool:
+        cur = await self.db.execute(
+            """
+            UPDATE heart_methods
+            SET name = ?, realm = ?, quality = ?, exp_multiplier = ?,
+                attack_bonus = ?, defense_bonus = ?, dao_yun_rate = ?,
+                description = ?, mastery_exp = ?, enabled = ?
+            WHERE method_id = ?
+            """,
+            (
+                data["name"],
+                int(data["realm"]),
+                int(data["quality"]),
+                float(data.get("exp_multiplier", 0.0)),
+                int(data.get("attack_bonus", 0)),
+                int(data.get("defense_bonus", 0)),
+                float(data.get("dao_yun_rate", 0.0)),
+                str(data.get("description", "")),
+                int(data.get("mastery_exp", 100)),
+                int(data.get("enabled", 1)),
+                method_id,
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_delete_heart_method(self, method_id: str) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM heart_methods WHERE method_id = ?",
+            (method_id,),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    # ==================== 管理员 CRUD：武器/护甲 ====================
+
+    async def admin_list_weapons(self) -> list[dict[str, Any]]:
+        result = []
+        async with self.db.execute(
+            """
+            SELECT equip_id, name, tier, slot, attack, defense,
+                   element, element_damage, description, enabled
+            FROM weapons
+            ORDER BY tier ASC, slot ASC, equip_id ASC
+            """
+        ) as cur:
+            async for row in cur:
+                result.append(dict(row))
+        return result
+
+    async def admin_has_weapon_name(self, name: str) -> bool:
+        """检查装备名称是否已存在（不区分大小写，忽略首尾空白）。"""
+        async with self.db.execute(
+            """
+            SELECT 1
+            FROM weapons
+            WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))
+            LIMIT 1
+            """,
+            (name,),
+        ) as cur:
+            row = await cur.fetchone()
+            return row is not None
+
+    async def admin_create_weapon(self, data: dict[str, Any]) -> bool:
+        cur = await self.db.execute(
+            """
+            INSERT OR IGNORE INTO weapons (
+                equip_id, name, tier, slot, attack, defense,
+                element, element_damage, description, enabled
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["equip_id"],
+                data["name"],
+                int(data["tier"]),
+                data["slot"],
+                int(data.get("attack", 0)),
+                int(data.get("defense", 0)),
+                str(data.get("element", "无") or "无"),
+                int(data.get("element_damage", 0)),
+                str(data.get("description", "")),
+                int(data.get("enabled", 1)),
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_update_weapon(self, equip_id: str, data: dict[str, Any]) -> bool:
+        cur = await self.db.execute(
+            """
+            UPDATE weapons
+            SET name = ?, tier = ?, slot = ?, attack = ?, defense = ?,
+                element = ?, element_damage = ?, description = ?, enabled = ?
+            WHERE equip_id = ?
+            """,
+            (
+                data["name"],
+                int(data["tier"]),
+                data["slot"],
+                int(data.get("attack", 0)),
+                int(data.get("defense", 0)),
+                str(data.get("element", "无") or "无"),
+                int(data.get("element_damage", 0)),
+                str(data.get("description", "")),
+                int(data.get("enabled", 1)),
+                equip_id,
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_delete_weapon(self, equip_id: str) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM weapons WHERE equip_id = ?",
+            (equip_id,),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    # ── 坊市 (Market) CRUD ──────────────────────────────────
+
+    async def insert_market_listing(self, listing: dict) -> None:
+        """插入一条上架记录。"""
+        await self.db.execute(
+            """INSERT INTO market_listings
+               (listing_id, seller_id, item_id, quantity, unit_price,
+                total_price, fee, listed_at, expires_at, status)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                listing["listing_id"],
+                listing["seller_id"],
+                listing["item_id"],
+                listing["quantity"],
+                listing["unit_price"],
+                listing["total_price"],
+                listing["fee"],
+                listing["listed_at"],
+                listing["expires_at"],
+                listing.get("status", "active"),
+            ),
+        )
+        await self.db.commit()
+
+    async def get_active_listings(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        item_id: str | None = None,
+        seller_id: str | None = None,
+    ) -> dict:
+        """分页查询活跃商品。"""
+        conditions = ["status = 'active'"]
+        params: list = []
+        if item_id:
+            conditions.append("item_id = ?")
+            params.append(item_id)
+        if seller_id:
+            conditions.append("seller_id = ?")
+            params.append(seller_id)
+        where = " AND ".join(conditions)
+
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = int(page_size)
+        except (TypeError, ValueError):
+            page_size = 20
+        page = max(1, page)
+        page_size = max(1, page_size)
+
+        row = await self.db.execute(
+            f"SELECT COUNT(*) FROM market_listings WHERE {where}", params,
+        )
+        total = (await row.fetchone())[0]
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, total_pages)
+
+        offset = (page - 1) * page_size
+        params_page = list(params) + [page_size, offset]
+        cur = await self.db.execute(
+            f"""SELECT * FROM market_listings
+                WHERE {where}
+                ORDER BY listed_at DESC
+                LIMIT ? OFFSET ?""",
+            params_page,
+        )
+        rows = await cur.fetchall()
+        columns = [d[0] for d in cur.description]
+        listings = [dict(zip(columns, r)) for r in rows]
+        return {
+            "listings": listings,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        }
+
+    async def get_listing_by_id(self, listing_id: str) -> dict | None:
+        """单条查询上架记录。"""
+        cur = await self.db.execute(
+            "SELECT * FROM market_listings WHERE listing_id = ?",
+            (listing_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        columns = [d[0] for d in cur.description]
+        return dict(zip(columns, row))
+
+    async def get_listing_by_id_prefix(self, prefix: str) -> dict | None:
+        """通过 listing_id 前缀模糊查询（聊天端短编号）。"""
+        cur = await self.db.execute(
+            "SELECT * FROM market_listings WHERE listing_id LIKE ? AND status = 'active'",
+            (prefix + "%",),
+        )
+        rows = await cur.fetchall()
+        if len(rows) != 1:
+            return None
+        columns = [d[0] for d in cur.description]
+        return dict(zip(columns, rows[0]))
+
+    async def update_listing_status(
+        self,
+        listing_id: str,
+        status: str,
+        buyer_id: str | None = None,
+        sold_at: float | None = None,
+        expected_status: str | None = None,
+    ) -> int:
+        """更新上架状态，返回受影响行数。"""
+        if expected_status:
+            cur = await self.db.execute(
+                """UPDATE market_listings
+                   SET status = ?, buyer_id = ?, sold_at = ?
+                   WHERE listing_id = ? AND status = ?""",
+                (status, buyer_id, sold_at, listing_id, expected_status),
+            )
+        else:
+            cur = await self.db.execute(
+                """UPDATE market_listings
+                   SET status = ?, buyer_id = ?, sold_at = ?
+                   WHERE listing_id = ?""",
+                (status, buyer_id, sold_at, listing_id),
+            )
+        await self.db.commit()
+        return cur.rowcount
+
+    async def insert_market_history(self, record: dict) -> None:
+        """插入成交记录。"""
+        await self.db.execute(
+            """INSERT INTO market_history
+               (history_id, item_id, quantity, unit_price, total_price,
+                fee, seller_id, buyer_id, sold_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record["history_id"],
+                record["item_id"],
+                record["quantity"],
+                record["unit_price"],
+                record["total_price"],
+                record["fee"],
+                record["seller_id"],
+                record["buyer_id"],
+                record["sold_at"],
+            ),
+        )
+        await self.db.commit()
+
+    async def get_market_stats(self, item_id: str, days: int = 7) -> dict:
+        """获取指定物品近 N 天的均价和成交量。"""
+        import time as _time
+        cutoff = _time.time() - days * 86400
+        cur = await self.db.execute(
+            """SELECT COUNT(*) as cnt,
+                      COALESCE(AVG(unit_price), 0) as avg_price,
+                      COALESCE(SUM(quantity), 0) as total_qty
+               FROM market_history
+               WHERE item_id = ? AND sold_at >= ?""",
+            (item_id, cutoff),
+        )
+        row = await cur.fetchone()
+        return {
+            "count": row[0],
+            "avg_price": row[1],
+            "total_quantity": row[2],
+        }
+
+    async def get_expired_active_listings(self, now: float) -> list[dict]:
+        """查询已过期但仍为 active 的上架记录。"""
+        cur = await self.db.execute(
+            "SELECT * FROM market_listings WHERE status = 'active' AND expires_at <= ?",
+            (now,),
+        )
+        rows = await cur.fetchall()
+        if not rows:
+            return []
+        columns = [d[0] for d in cur.description]
+        return [dict(zip(columns, r)) for r in rows]
+
+    async def get_my_listings(self, seller_id: str) -> list[dict]:
+        """查询某玩家的所有上架记录（按时间倒序，最多50条）。"""
+        cur = await self.db.execute(
+            """SELECT * FROM market_listings
+               WHERE seller_id = ?
+               ORDER BY listed_at DESC
+               LIMIT 50""",
+            (seller_id,),
+        )
+        rows = await cur.fetchall()
+        if not rows:
+            return []
+        columns = [d[0] for d in cur.description]
+        return [dict(zip(columns, r)) for r in rows]
+
+    async def clear_my_listing_history(self, seller_id: str, include_expired: bool = False) -> int:
+        """清理某玩家历史上架记录（已售/已下架，可选含已过期），返回删除条数。"""
+        statuses = ["sold", "cancelled"]
+        if include_expired:
+            statuses.append("expired")
+        placeholders = ",".join("?" for _ in statuses)
+        params = [seller_id] + statuses
+        cur = await self.db.execute(
+            f"""DELETE FROM market_listings
+               WHERE seller_id = ? AND status IN ({placeholders})""",
+            params,
+        )
+        await self.db.commit()
+        return int(cur.rowcount or 0)
+
+    async def admin_list_market_listings(
+        self,
+        page: int = 1,
+        page_size: int = 20,
+        status: str = "",
+        keyword: str = "",
+    ) -> dict:
+        """管理员分页查询坊市记录（支持状态/关键词过滤）。"""
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            page_size = int(page_size)
+        except (TypeError, ValueError):
+            page_size = 20
+        page = max(1, page)
+        page_size = min(100, max(1, page_size))
+
+        conditions = ["1=1"]
+        params: list[Any] = []
+
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+
+        keyword = str(keyword or "").strip()
+        if keyword:
+            like_kw = f"%{keyword}%"
+            conditions.append(
+                "(listing_id LIKE ? OR seller_id LIKE ? OR item_id LIKE ? OR COALESCE(buyer_id, '') LIKE ?)"
+            )
+            params.extend([like_kw, like_kw, like_kw, like_kw])
+
+        where = " AND ".join(conditions)
+
+        row = await self.db.execute(
+            f"SELECT COUNT(*) FROM market_listings WHERE {where}",
+            params,
+        )
+        total = int((await row.fetchone())[0])
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, total_pages)
+
+        offset = (page - 1) * page_size
+        cur = await self.db.execute(
+            f"""SELECT * FROM market_listings
+               WHERE {where}
+               ORDER BY listed_at DESC
+               LIMIT ? OFFSET ?""",
+            list(params) + [page_size, offset],
+        )
+        rows = await cur.fetchall()
+        columns = [d[0] for d in cur.description]
+        listings = [dict(zip(columns, r)) for r in rows]
+        return {
+            "listings": listings,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        }
+
+    async def admin_create_market_listing(self, data: dict[str, Any]) -> bool:
+        """管理员新增坊市记录。"""
+        cur = await self.db.execute(
+            """INSERT OR IGNORE INTO market_listings
+               (listing_id, seller_id, item_id, quantity, unit_price, total_price,
+                fee, listed_at, expires_at, status, buyer_id, sold_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                data["listing_id"],
+                data["seller_id"],
+                data["item_id"],
+                int(data["quantity"]),
+                int(data["unit_price"]),
+                int(data["total_price"]),
+                int(data.get("fee", 0)),
+                float(data["listed_at"]),
+                float(data["expires_at"]),
+                str(data.get("status", "active")),
+                (str(data.get("buyer_id", "")).strip() or None),
+                (float(data["sold_at"]) if data.get("sold_at") is not None else None),
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_update_market_listing(self, listing_id: str, data: dict[str, Any]) -> bool:
+        """管理员更新坊市记录。"""
+        cur = await self.db.execute(
+            """UPDATE market_listings
+               SET seller_id = ?, item_id = ?, quantity = ?, unit_price = ?, total_price = ?,
+                   fee = ?, listed_at = ?, expires_at = ?, status = ?, buyer_id = ?, sold_at = ?
+               WHERE listing_id = ?""",
+            (
+                data["seller_id"],
+                data["item_id"],
+                int(data["quantity"]),
+                int(data["unit_price"]),
+                int(data["total_price"]),
+                int(data.get("fee", 0)),
+                float(data["listed_at"]),
+                float(data["expires_at"]),
+                str(data.get("status", "active")),
+                (str(data.get("buyer_id", "")).strip() or None),
+                (float(data["sold_at"]) if data.get("sold_at") is not None else None),
+                listing_id,
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_delete_market_listing(self, listing_id: str) -> bool:
+        """管理员删除坊市记录。"""
+        cur = await self.db.execute(
+            "DELETE FROM market_listings WHERE listing_id = ?",
+            (listing_id,),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    # ── 天机阁（商店） ──────────────────────────────────────
+
+    async def get_shop_sold_today(self, item_id: str, date_str: str) -> int:
+        """获取某商品今日全服已购总数。"""
+        cur = await self.db.execute(
+            "SELECT COALESCE(SUM(quantity), 0) FROM shop_purchases WHERE item_id = ? AND purchased_at = ?",
+            (item_id, date_str),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def get_player_shop_today(self, user_id: str, date_str: str) -> list[dict]:
+        """获取某玩家今日购买记录。"""
+        cur = await self.db.execute(
+            "SELECT item_id, SUM(quantity) as qty, unit_price FROM shop_purchases WHERE user_id = ? AND purchased_at = ? GROUP BY item_id",
+            (user_id, date_str),
+        )
+        rows = await cur.fetchall()
+        return [{"item_id": r[0], "quantity": r[1], "unit_price": r[2]} for r in rows]
+
+    async def record_shop_purchase(self, user_id: str, item_id: str, quantity: int, unit_price: int, date_str: str):
+        """记录一笔天机阁购买。"""
+        await self.db.execute(
+            "INSERT INTO shop_purchases (user_id, item_id, quantity, unit_price, purchased_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, item_id, quantity, unit_price, date_str),
+        )
+        await self.db.commit()
+
+    async def reserve_shop_purchase(
+        self,
+        user_id: str,
+        item_id: str,
+        quantity: int,
+        unit_price: int,
+        date_str: str,
+        daily_limit: int,
+    ) -> dict[str, int | bool]:
+        """串行预占商店库存，避免并发下超卖。"""
+        async with self._shop_purchase_lock:
+            cur = await self.db.execute(
+                "SELECT COALESCE(SUM(quantity), 0) FROM shop_purchases WHERE item_id = ? AND purchased_at = ?",
+                (item_id, date_str),
+            )
+            row = await cur.fetchone()
+            sold_today = int(row[0] or 0) if row else 0
+            remaining = max(0, int(daily_limit) - sold_today)
+            if quantity > remaining:
+                return {"success": False, "remaining": remaining, "sold_today": sold_today}
+
+            await self.db.execute(
+                "INSERT INTO shop_purchases (user_id, item_id, quantity, unit_price, purchased_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, item_id, quantity, unit_price, date_str),
+            )
+            await self.db.commit()
+            return {
+                "success": True,
+                "remaining": remaining - quantity,
+                "sold_today": sold_today + quantity,
+            }
+
+    async def commit_shop_purchase_atomic(
+        self,
+        player: Player,
+        item_id: str,
+        quantity: int,
+        unit_price: int,
+        date_str: str,
+        daily_limit: int = 0,
+    ) -> dict[str, int | bool]:
+        """以单个事务提交商店购买记录和玩家状态。"""
+        conn: aiosqlite.Connection | None = None
+        try:
+            conn = await aiosqlite.connect(self._db_path)
+            await conn.execute("PRAGMA busy_timeout = 30000")
+            await conn.execute("BEGIN IMMEDIATE")
+
+            sold_today = 0
+            remaining = 0
+            if daily_limit > 0:
+                cur = await conn.execute(
+                    "SELECT COALESCE(SUM(quantity), 0) FROM shop_purchases WHERE item_id = ? AND purchased_at = ?",
+                    (item_id, date_str),
+                )
+                row = await cur.fetchone()
+                sold_today = int(row[0] or 0) if row else 0
+                remaining = max(0, int(daily_limit) - sold_today)
+                if quantity > remaining:
+                    await conn.rollback()
+                    return {"success": False, "remaining": remaining, "sold_today": sold_today}
+
+            await conn.execute(
+                "INSERT INTO shop_purchases (user_id, item_id, quantity, unit_price, purchased_at) VALUES (?, ?, ?, ?, ?)",
+                (player.user_id, item_id, quantity, unit_price, date_str),
+            )
+            await self._upsert_player(player, db=conn)
+            await conn.commit()
+            return {
+                "success": True,
+                "remaining": max(0, remaining - quantity) if daily_limit > 0 else 0,
+                "sold_today": sold_today + quantity,
+            }
+        except Exception:
+            if conn is not None:
+                await conn.rollback()
+            raise
+        finally:
+            if conn is not None:
+                await conn.close()
+
+    # ── 公告管理 ────────────────────────────────────────────
+    async def get_active_announcements(self) -> list[dict]:
+        """获取所有启用的公告。"""
+        result = []
+        async with self.db.execute(
+            "SELECT id, title, content, created_at, updated_at FROM announcements WHERE enabled=1 ORDER BY id DESC"
+        ) as cur:
+            async for row in cur:
+                result.append({
+                    "id": row[0], "title": row[1], "content": row[2],
+                    "created_at": row[3], "updated_at": row[4],
+                })
+        return result
+
+    async def admin_list_announcements(self) -> list[dict]:
+        """管理员获取全量公告列表。"""
+        result = []
+        async with self.db.execute(
+            "SELECT id, title, content, enabled, created_at, updated_at FROM announcements ORDER BY id DESC"
+        ) as cur:
+            async for row in cur:
+                result.append({
+                    "id": row[0], "title": row[1], "content": row[2],
+                    "enabled": row[3], "created_at": row[4], "updated_at": row[5],
+                })
+        return result
+
+    async def admin_create_announcement(self, title: str, content: str) -> int:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur = await self.db.execute(
+            "INSERT INTO announcements (title, content, enabled, created_at, updated_at) VALUES (?, ?, 1, ?, ?)",
+            (title, content, now, now),
+        )
+        await self.db.commit()
+        return int(cur.lastrowid or 0)
+
+    async def admin_update_announcement(self, ann_id: int, title: str, content: str, enabled: int) -> bool:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cur = await self.db.execute(
+            """
+            UPDATE announcements
+            SET title = ?, content = ?, enabled = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (title, content, enabled, now, ann_id),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_delete_announcement(self, ann_id: int) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM announcements WHERE id = ?",
+            (ann_id,),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
