@@ -17,10 +17,15 @@ from .models import Player
 _PLAYER_COLUMNS = [
     "user_id", "name", "realm", "sub_realm", "exp",
     "hp", "max_hp", "attack", "defense", "spirit_stones",
-    "lingqi",
+    "lingqi", "permanent_max_hp_bonus", "permanent_attack_bonus",
+    "permanent_defense_bonus", "permanent_lingqi_bonus",
     "heart_method", "weapon", "gongfa_1", "gongfa_2", "gongfa_3", "armor", "dao_yun",
-    "heart_method_mastery", "heart_method_exp", "heart_method_value",
-    "inventory", "created_at", "last_cultivate_time",
+    "breakthrough_bonus", "breakthrough_pill_count",
+    "heart_method_mastery", "heart_method_exp", "heart_method_value", "stored_heart_methods",
+    "gongfa_1_mastery", "gongfa_1_exp",
+    "gongfa_2_mastery", "gongfa_2_exp",
+    "gongfa_3_mastery", "gongfa_3_exp",
+    "inventory", "active_buffs", "created_at", "last_cultivate_time",
     "last_checkin_date", "afk_cultivate_start", "afk_cultivate_end",
     "last_adventure_time", "death_count", "unified_msg_origin", "password_hash",
 ]
@@ -59,6 +64,10 @@ class DataManager:
                 defense             INTEGER DEFAULT 5,
                 spirit_stones       INTEGER DEFAULT 0,
                 lingqi              INTEGER DEFAULT 50,
+                permanent_max_hp_bonus INTEGER DEFAULT 0,
+                permanent_attack_bonus INTEGER DEFAULT 0,
+                permanent_defense_bonus INTEGER DEFAULT 0,
+                permanent_lingqi_bonus INTEGER DEFAULT 0,
                 heart_method        TEXT DEFAULT '无',
                 weapon              TEXT DEFAULT '无',
                 gongfa_1            TEXT DEFAULT '无',
@@ -66,10 +75,14 @@ class DataManager:
                 gongfa_3            TEXT DEFAULT '无',
                 armor               TEXT DEFAULT '无',
                 dao_yun             INTEGER DEFAULT 0,
+                breakthrough_bonus  REAL DEFAULT 0.0,
+                breakthrough_pill_count INTEGER DEFAULT 0,
                 heart_method_mastery INTEGER DEFAULT 0,
                 heart_method_exp    INTEGER DEFAULT 0,
                 heart_method_value  INTEGER DEFAULT 0,
+                stored_heart_methods TEXT DEFAULT '{}',
                 inventory           TEXT DEFAULT '{}',
+                active_buffs        TEXT DEFAULT '[]',
                 created_at          REAL,
                 last_cultivate_time REAL DEFAULT 0.0,
                 last_checkin_date   TEXT,
@@ -195,11 +208,33 @@ class DataManager:
                 updated_at TEXT NOT NULL
             )
         """)
+        # 功法定义独立表
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS gongfas (
+                gongfa_id     TEXT PRIMARY KEY,
+                name          TEXT NOT NULL,
+                tier          INTEGER NOT NULL DEFAULT 0,
+                attack_bonus  INTEGER DEFAULT 0,
+                defense_bonus INTEGER DEFAULT 0,
+                hp_regen      INTEGER DEFAULT 0,
+                lingqi_regen  INTEGER DEFAULT 0,
+                description   TEXT DEFAULT '',
+                mastery_exp   INTEGER DEFAULT 200,
+                dao_yun_cost  INTEGER DEFAULT 0,
+                recycle_price INTEGER DEFAULT 1000,
+                lingqi_cost   INTEGER DEFAULT 0,
+                enabled       INTEGER DEFAULT 1
+            )
+        """)
         await self.db.commit()
         # 数据库升级：为旧表添加新列
         await self._alter_add_column("players", "last_adventure_time", "REAL DEFAULT 0.0")
         await self._alter_add_column("players", "death_count", "INTEGER DEFAULT 0")
         await self._alter_add_column("players", "lingqi", "INTEGER DEFAULT 50")
+        await self._alter_add_column("players", "permanent_max_hp_bonus", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "permanent_attack_bonus", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "permanent_defense_bonus", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "permanent_lingqi_bonus", "INTEGER DEFAULT 0")
         await self._alter_add_column("players", "heart_method", "TEXT DEFAULT '无'")
         await self._alter_add_column("players", "weapon", "TEXT DEFAULT '无'")
         await self._alter_add_column("players", "gongfa_1", "TEXT DEFAULT '无'")
@@ -207,15 +242,29 @@ class DataManager:
         await self._alter_add_column("players", "gongfa_3", "TEXT DEFAULT '无'")
         await self._alter_add_column("players", "armor", "TEXT DEFAULT '无'")
         await self._alter_add_column("players", "dao_yun", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "breakthrough_bonus", "REAL DEFAULT 0.0")
+        await self._alter_add_column("players", "breakthrough_pill_count", "INTEGER DEFAULT 0")
         await self._alter_add_column("players", "heart_method_mastery", "INTEGER DEFAULT 0")
         await self._alter_add_column("players", "heart_method_exp", "INTEGER DEFAULT 0")
         await self._alter_add_column("players", "heart_method_value", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "stored_heart_methods", "TEXT DEFAULT '{}'")
+        await self._alter_add_column("players", "active_buffs", "TEXT DEFAULT '[]'")
+        await self._alter_add_column("players", "gongfa_1_mastery", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "gongfa_1_exp", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "gongfa_2_mastery", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "gongfa_2_exp", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "gongfa_3_mastery", "INTEGER DEFAULT 0")
+        await self._alter_add_column("players", "gongfa_3_exp", "INTEGER DEFAULT 0")
+        await self._alter_add_column("gongfas", "lingqi_cost", "INTEGER DEFAULT 0")
         # 填充场景数据
         await self._seed_adventure_scenes()
         # 填充心法定义（仅补齐缺失，不覆盖已有配置）
         await self._seed_heart_methods()
         # 填充装备定义（仅补齐缺失，不覆盖已有配置）
         await self._seed_weapons()
+        # 填充功法定义（仅补齐缺失，不覆盖已有配置）
+        await self._seed_gongfas()
+        await self._sync_gongfa_lingqi_costs()
 
     async def _migrate_json_data(self):
         """若存在旧 players.json 且数据库为空，则自动迁移。"""
@@ -367,6 +416,12 @@ class DataManager:
         inv = d.get("inventory", {})
         if isinstance(inv, dict):
             inv = json.dumps(inv, ensure_ascii=False)
+        stored_heart_methods = d.get("stored_heart_methods", {})
+        if isinstance(stored_heart_methods, dict):
+            stored_heart_methods = json.dumps(stored_heart_methods, ensure_ascii=False)
+        active_buffs = d.get("active_buffs_raw", d.get("active_buffs", []))
+        if isinstance(active_buffs, list):
+            active_buffs = json.dumps(active_buffs, ensure_ascii=False)
         conn = db or self.db
         if conn is None:
             raise RuntimeError("数据库连接尚未初始化")
@@ -383,6 +438,10 @@ class DataManager:
             d.get("defense", 5),
             d.get("spirit_stones", 0),
             d.get("lingqi", 50),
+            d.get("permanent_max_hp_bonus", 0),
+            d.get("permanent_attack_bonus", 0),
+            d.get("permanent_defense_bonus", 0),
+            d.get("permanent_lingqi_bonus", 0),
             d.get("heart_method", "无"),
             d.get("weapon", "无"),
             d.get("gongfa_1", "无"),
@@ -390,10 +449,20 @@ class DataManager:
             d.get("gongfa_3", "无"),
             d.get("armor", "无"),
             d.get("dao_yun", 0),
+            d.get("breakthrough_bonus", 0.0),
+            d.get("breakthrough_pill_count", 0),
             d.get("heart_method_mastery", 0),
             d.get("heart_method_exp", 0),
             d.get("heart_method_value", 0),
+            stored_heart_methods,
+            player.gongfa_1_mastery,
+            player.gongfa_1_exp,
+            player.gongfa_2_mastery,
+            player.gongfa_2_exp,
+            player.gongfa_3_mastery,
+            player.gongfa_3_exp,
             inv,
+            active_buffs,
             d.get("created_at", 0),
             d.get("last_cultivate_time", 0.0),
             d.get("last_checkin_date"),
@@ -422,6 +491,20 @@ class DataManager:
                 d["inventory"] = json.loads(inv)
             except (json.JSONDecodeError, TypeError):
                 d["inventory"] = {}
+        stored_heart_methods = d.get("stored_heart_methods", "{}")
+        if isinstance(stored_heart_methods, str):
+            try:
+                loaded = json.loads(stored_heart_methods)
+                d["stored_heart_methods"] = loaded if isinstance(loaded, dict) else {}
+            except (json.JSONDecodeError, TypeError):
+                d["stored_heart_methods"] = {}
+        active_buffs = d.get("active_buffs", "[]")
+        if isinstance(active_buffs, str):
+            try:
+                loaded = json.loads(active_buffs)
+                d["active_buffs_raw"] = loaded if isinstance(loaded, list) else []
+            except (json.JSONDecodeError, TypeError):
+                d["active_buffs_raw"] = []
         return d
 
     async def _alter_add_column(self, table: str, column: str, col_type: str):
@@ -574,6 +657,249 @@ class DataManager:
             rows,
         )
         await self.db.commit()
+
+    async def _seed_gongfas(self):
+        """若功法表为空或有缺失，按代码内置定义补齐。"""
+        from .constants import GONGFA_REGISTRY
+
+        existing = set()
+        async with self.db.execute("SELECT gongfa_id FROM gongfas") as cur:
+            async for row in cur:
+                existing.add(row[0])
+
+        rows = []
+        for gf in GONGFA_REGISTRY.values():
+            if gf.gongfa_id in existing:
+                continue
+            rows.append(
+                (
+                    gf.gongfa_id,
+                    gf.name,
+                    int(gf.tier),
+                    int(gf.attack_bonus),
+                    int(gf.defense_bonus),
+                    int(gf.hp_regen),
+                    int(gf.lingqi_regen),
+                    gf.description,
+                    int(gf.mastery_exp),
+                    int(gf.dao_yun_cost),
+                    int(gf.recycle_price),
+                    int(gf.lingqi_cost),
+                    1,
+                )
+            )
+
+        if not rows:
+            return
+
+        await self.db.executemany(
+            """
+            INSERT OR IGNORE INTO gongfas (
+                gongfa_id, name, tier, attack_bonus, defense_bonus,
+                hp_regen, lingqi_regen, description, mastery_exp,
+                dao_yun_cost, recycle_price, lingqi_cost, enabled
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        await self.db.commit()
+
+    async def _sync_gongfa_lingqi_costs(self):
+        """为旧数据补齐耗灵字段，避免重载后功法耗灵归零。"""
+        from .constants import calc_gongfa_lingqi_cost
+
+        rows = []
+        async with self.db.execute(
+            """
+            SELECT gongfa_id, tier, attack_bonus, defense_bonus, hp_regen, lingqi_regen, lingqi_cost
+            FROM gongfas
+            """
+        ) as cur:
+            async for row in cur:
+                current_cost = int(row["lingqi_cost"] or 0)
+                if current_cost > 0:
+                    continue
+                rows.append((
+                    calc_gongfa_lingqi_cost(
+                        int(row["tier"] or 0),
+                        int(row["attack_bonus"] or 0),
+                        int(row["defense_bonus"] or 0),
+                        int(row["hp_regen"] or 0),
+                        int(row["lingqi_regen"] or 0),
+                    ),
+                    row["gongfa_id"],
+                ))
+
+        if not rows:
+            return
+
+        await self.db.executemany(
+            "UPDATE gongfas SET lingqi_cost = ? WHERE gongfa_id = ?",
+            rows,
+        )
+        await self.db.commit()
+
+    async def load_gongfas(self) -> dict:
+        """加载启用的功法定义（独立表 -> 运行时）。"""
+        from .constants import GONGFA_REGISTRY, GongfaDef, calc_gongfa_lingqi_cost
+
+        gongfas = {}
+        try:
+            async with self.db.execute(
+                """
+                SELECT gongfa_id, name, tier, attack_bonus, defense_bonus,
+                       hp_regen, lingqi_regen, description, mastery_exp,
+                       dao_yun_cost, recycle_price, lingqi_cost
+                FROM gongfas
+                WHERE enabled = 1
+                ORDER BY tier ASC, gongfa_id ASC
+                """
+            ) as cur:
+                async for row in cur:
+                    gongfa_id = row["gongfa_id"]
+                    tier = int(row["tier"] or 0)
+                    attack_bonus = int(row["attack_bonus"] or 0)
+                    defense_bonus = int(row["defense_bonus"] or 0)
+                    hp_regen = int(row["hp_regen"] or 0)
+                    lingqi_regen = int(row["lingqi_regen"] or 0)
+                    gongfas[gongfa_id] = GongfaDef(
+                        gongfa_id=gongfa_id,
+                        name=row["name"],
+                        tier=tier,
+                        attack_bonus=attack_bonus,
+                        defense_bonus=defense_bonus,
+                        hp_regen=hp_regen,
+                        lingqi_regen=lingqi_regen,
+                        description=row["description"] or "",
+                        mastery_exp=int(row["mastery_exp"] or 200),
+                        dao_yun_cost=int(row["dao_yun_cost"] or 0),
+                        recycle_price=int(row["recycle_price"] or 1000),
+                        lingqi_cost=int(row["lingqi_cost"] or 0) or calc_gongfa_lingqi_cost(
+                            tier,
+                            attack_bonus,
+                            defense_bonus,
+                            hp_regen,
+                            lingqi_regen,
+                        ),
+                    )
+        except Exception:
+            return dict(GONGFA_REGISTRY)
+        return gongfas
+
+    async def admin_list_gongfas(self) -> list[dict[str, Any]]:
+        result = []
+        async with self.db.execute(
+            """
+            SELECT gongfa_id, name, tier, attack_bonus, defense_bonus,
+                   hp_regen, lingqi_regen, description, mastery_exp,
+                   dao_yun_cost, recycle_price, lingqi_cost, enabled
+            FROM gongfas
+            ORDER BY tier ASC, gongfa_id ASC
+            """
+        ) as cur:
+            async for row in cur:
+                result.append(dict(row))
+        return result
+
+    async def admin_has_gongfa_name(self, name: str) -> bool:
+        """检查功法名称是否已存在（不区分大小写，忽略首尾空白）。"""
+        async with self.db.execute(
+            """
+            SELECT 1
+            FROM gongfas
+            WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))
+            LIMIT 1
+            """,
+            (name,),
+        ) as cur:
+            row = await cur.fetchone()
+            return row is not None
+
+    async def admin_create_gongfa(self, data: dict[str, Any]) -> bool:
+        from .constants import calc_gongfa_lingqi_cost
+
+        lingqi_cost = data.get("lingqi_cost")
+        if lingqi_cost is None:
+            lingqi_cost = calc_gongfa_lingqi_cost(
+                int(data["tier"]),
+                int(data.get("attack_bonus", 0)),
+                int(data.get("defense_bonus", 0)),
+                int(data.get("hp_regen", 0)),
+                int(data.get("lingqi_regen", 0)),
+            )
+        cur = await self.db.execute(
+            """
+            INSERT OR IGNORE INTO gongfas (
+                gongfa_id, name, tier, attack_bonus, defense_bonus,
+                hp_regen, lingqi_regen, description, mastery_exp,
+                dao_yun_cost, recycle_price, lingqi_cost, enabled
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["gongfa_id"],
+                data["name"],
+                int(data["tier"]),
+                int(data.get("attack_bonus", 0)),
+                int(data.get("defense_bonus", 0)),
+                int(data.get("hp_regen", 0)),
+                int(data.get("lingqi_regen", 0)),
+                str(data.get("description", "")),
+                int(data.get("mastery_exp", 200)),
+                int(data.get("dao_yun_cost", 0)),
+                int(data.get("recycle_price", 1000)),
+                int(lingqi_cost),
+                int(data.get("enabled", 1)),
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_update_gongfa(self, gongfa_id: str, data: dict[str, Any]) -> bool:
+        from .constants import calc_gongfa_lingqi_cost
+
+        lingqi_cost = data.get("lingqi_cost")
+        if lingqi_cost is None:
+            lingqi_cost = calc_gongfa_lingqi_cost(
+                int(data["tier"]),
+                int(data.get("attack_bonus", 0)),
+                int(data.get("defense_bonus", 0)),
+                int(data.get("hp_regen", 0)),
+                int(data.get("lingqi_regen", 0)),
+            )
+        cur = await self.db.execute(
+            """
+            UPDATE gongfas
+            SET name = ?, tier = ?, attack_bonus = ?, defense_bonus = ?,
+                hp_regen = ?, lingqi_regen = ?, description = ?, mastery_exp = ?,
+                dao_yun_cost = ?, recycle_price = ?, lingqi_cost = ?, enabled = ?
+            WHERE gongfa_id = ?
+            """,
+            (
+                data["name"],
+                int(data["tier"]),
+                int(data.get("attack_bonus", 0)),
+                int(data.get("defense_bonus", 0)),
+                int(data.get("hp_regen", 0)),
+                int(data.get("lingqi_regen", 0)),
+                str(data.get("description", "")),
+                int(data.get("mastery_exp", 200)),
+                int(data.get("dao_yun_cost", 0)),
+                int(data.get("recycle_price", 1000)),
+                int(lingqi_cost),
+                int(data.get("enabled", 1)),
+                gongfa_id,
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_delete_gongfa(self, gongfa_id: str) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM gongfas WHERE gongfa_id = ?",
+            (gongfa_id,),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
 
     async def get_adventure_scenes(self) -> list[dict]:
         """获取所有历练场景。"""

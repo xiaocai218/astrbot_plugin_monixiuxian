@@ -27,6 +27,21 @@ _RE_CHINESE_ONLY = re.compile(
     r"\u3400-\u4dbf\U00020000-\U0002a6df\U0002a700-\U0002b73f"
     r"0-9a-zA-Z]+$"
 )
+_PENDING_DEATH_ALLOWED_TYPES = {
+    "death_confirm_keep",
+    "get_announcements",
+    "get_inventory",
+    "get_market",
+    "get_my_listings",
+    "get_panel",
+    "get_rankings",
+    "get_scenes",
+    "get_shop",
+    "get_world_chat_history",
+    "dungeon_state",
+    "market_fee_preview",
+    "pvp_state",
+}
 
 
 class ConnectionManager:
@@ -461,6 +476,91 @@ async def _review_chat_content(engine: GameEngine, content: str) -> dict:
         return {"allow": True, "reason": ""}
 
 
+async def _push_player_snapshot(
+    engine: GameEngine,
+    ws_manager: ConnectionManager,
+    user_id: str,
+):
+    """主动同步玩家面板与背包。"""
+    panel = await engine.get_panel(user_id)
+    if panel:
+        await ws_manager.send_to_player(user_id, {
+            "type": "state_update",
+            "data": panel,
+        })
+    inventory = await engine.get_inventory(user_id)
+    await ws_manager.send_to_player(user_id, {
+        "type": "inventory",
+        "data": inventory,
+    })
+
+
+async def _broadcast_pvp_result(
+    engine: GameEngine,
+    ws_manager: ConnectionManager,
+    result: dict,
+):
+    """向双方推送 PvP 状态，并在结束时回写副本流。"""
+    session_id = str(result.get("session_id", "")).strip()
+    session_obj = engine.pvp._sessions.get(session_id)
+    if not session_obj:
+        return
+
+    a_id = session_obj.player_a_id
+    b_id = session_obj.player_b_id
+    if result.get("ended"):
+        await ws_manager.send_to_player(a_id, {
+            "type": "pvp_result",
+            "data": result["pvp_state_a"],
+        })
+        await ws_manager.send_to_player(b_id, {
+            "type": "pvp_result",
+            "data": result["pvp_state_b"],
+        })
+        dungeon_result = await engine.dungeon.resolve_pvp_result(session_obj)
+        await _push_player_snapshot(engine, ws_manager, a_id)
+        await _push_player_snapshot(engine, ws_manager, b_id)
+        if dungeon_result and session_obj.dungeon_owner_id:
+            await ws_manager.send_to_player(session_obj.dungeon_owner_id, {
+                "type": "action_result",
+                "action": "dungeon_pvp_result",
+                "data": dungeon_result,
+            })
+        engine.pvp.cleanup_session(session_id)
+        return
+
+    await ws_manager.send_to_player(a_id, {
+        "type": "pvp_update",
+        "data": {"pvp_state": result["pvp_state_a"]},
+    })
+    await ws_manager.send_to_player(b_id, {
+        "type": "pvp_update",
+        "data": {"pvp_state": result["pvp_state_b"]},
+    })
+
+
+def _schedule_pvp_challenge_timeout(
+    engine: GameEngine,
+    ws_manager: ConnectionManager,
+    session_id: str,
+):
+    """在应战倒计时结束后自动判定为放弃。"""
+
+    async def _runner():
+        session = engine.pvp._sessions.get(session_id)
+        if not session:
+            return
+        delay = max(0.0, float(session.countdown_deadline or 0.0) - time.time())
+        if delay > 0:
+            await asyncio.sleep(delay)
+        payload = engine.pvp.expire_challenge(session_id)
+        if not payload:
+            return
+        await _broadcast_pvp_result(engine, ws_manager, payload)
+
+    asyncio.create_task(_runner())
+
+
 async def _handle_message(
     engine: GameEngine,
     user_id: str,
@@ -470,6 +570,12 @@ async def _handle_message(
 ) -> dict | None:
     """处理客户端 WebSocket 消息。"""
     msg_type = msg.get("type", "")
+
+    if engine.has_pending_death(user_id) and msg_type not in _PENDING_DEATH_ALLOWED_TYPES:
+        return {
+            "type": "error",
+            "message": "道陨未决，请先完成携宝重生选择，当前无法执行其他操作",
+        }
 
     if msg_type == "cultivate":
         result = await engine.cultivate(user_id)
@@ -498,7 +604,7 @@ async def _handle_message(
 
     elif msg_type == "adventure":
         result = await engine.adventure(user_id)
-        return {"type": "action_result", "action": "adventure", "data": result}
+        return {"type": "action_result", "action": "dungeon_start", "data": result}
 
     elif msg_type == "get_scenes":
         scenes = await engine.get_adventure_scenes()
@@ -514,8 +620,32 @@ async def _handle_message(
 
     elif msg_type == "use_item":
         item_id = msg.get("data", {}).get("item_id", "")
-        result = await engine.use_item_action(user_id, item_id)
+        raw_count = msg.get("data", {}).get("count", 1)
+        try:
+            count = int(raw_count)
+        except (TypeError, ValueError):
+            return {"type": "error", "message": "使用数量必须是整数"}
+        if count < 1:
+            return {"type": "error", "message": "使用数量至少为1"}
+        result = await engine.use_item_action(user_id, item_id, count)
         return {"type": "action_result", "action": "use_item", "data": result}
+
+    elif msg_type == "confirm_replace_heart_method":
+        data = msg.get("data", {})
+        new_method_id = data.get("new_method_id", "")
+        source_item_id = data.get("source_item_id", "")
+        raw_convert = data.get("convert_to_value", False)
+        if isinstance(raw_convert, str):
+            convert_to_value = raw_convert.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            convert_to_value = bool(raw_convert)
+        result = await engine.confirm_replace_heart_method(
+            user_id,
+            new_method_id,
+            convert_to_value,
+            source_item_id,
+        )
+        return {"type": "action_result", "action": "confirm_replace_heart_method", "data": result}
 
     elif msg_type == "get_panel":
         panel = await engine.get_panel(user_id)
@@ -716,6 +846,131 @@ async def _handle_message(
             return {"type": "error", "message": "kept_ids 必须是列表"}
         result = await engine.confirm_death(user_id, kept_ids)
         return {"type": "action_result", "action": "death_confirm_keep", "data": result}
+
+    # ── 功法遗忘 ─────────────────────────────────────────
+    elif msg_type == "forget_gongfa":
+        slot = msg.get("data", {}).get("slot", "")
+        result = await engine.forget_gongfa(user_id, slot)
+        return {"type": "action_result", "action": "forget_gongfa", "data": result}
+
+    # ── 副本系统 ─────────────────────────────────────────
+    elif msg_type == "dungeon_start":
+        player = await engine.get_player(user_id)
+        if not player:
+            return {"type": "error", "message": "角色不存在"}
+        result = await engine.dungeon.start(player)
+        return {"type": "action_result", "action": "dungeon_start", "data": result}
+
+    elif msg_type == "dungeon_advance":
+        player = await engine.get_player(user_id)
+        if not player:
+            return {"type": "error", "message": "角色不存在"}
+        result = await engine.dungeon.advance(player)
+        if result.get("pvp_notice") and ws_manager and result.get("pvp_opponent_id"):
+            await ws_manager.send_to_player(result["pvp_opponent_id"], {
+                "type": "pvp_challenge_notice",
+                    "data": {
+                        "session_id": result.get("pvp_session_id"),
+                        "countdown_deadline": result["pvp_notice"].get("countdown_deadline", 0),
+                        "challenger_name": result["pvp_notice"].get("challenger_name", "未知修士"),
+                        "layer_name": result["pvp_notice"].get("layer_name", "秘境"),
+                        "source": "dungeon",
+                        "message": "请在 10 秒内决定是否应战；若拒绝或超时，对方将直接夺得本层机缘。",
+                    },
+                })
+            _schedule_pvp_challenge_timeout(engine, ws_manager, result["pvp_session_id"])
+        return {"type": "action_result", "action": "dungeon_advance", "data": result}
+
+    elif msg_type == "dungeon_combat":
+        player = await engine.get_player(user_id)
+        if not player:
+            return {"type": "error", "message": "角色不存在"}
+        action = msg.get("data", {}).get("action", "attack")
+        data = msg.get("data", {})
+        result = await engine.dungeon.combat_action(player, action, data)
+        return {"type": "action_result", "action": "dungeon_combat", "data": result}
+
+    elif msg_type == "dungeon_exit":
+        player = await engine.get_player(user_id)
+        if not player:
+            return {"type": "error", "message": "角色不存在"}
+        result = await engine.dungeon.exit_dungeon(player)
+        return {"type": "action_result", "action": "dungeon_exit", "data": result}
+
+    elif msg_type == "dungeon_state":
+        session = engine.dungeon.get_session(user_id)
+        if session:
+            return {"type": "dungeon_state", "data": session.to_dict()}
+        return {"type": "dungeon_state", "data": None}
+
+    # ── PvP 系统 ──────────────────────────────────────────
+    elif msg_type == "pvp_match":
+        return {
+            "type": "error",
+            "message": "已取消主动切磋，请在副本中遭遇在线玩家",
+        }
+
+    elif msg_type == "pvp_action":
+        session_id = msg.get("data", {}).get("session_id", "")
+        action = msg.get("data", {}).get("action", {})
+        player = await engine.get_player(user_id)
+        result = await engine.pvp.submit_action(session_id, user_id, action, player)
+        if result.get("pvp_state"):
+            return {"type": "pvp_update", "data": result}
+        if result.get("resolved") and ws_manager:
+            await _broadcast_pvp_result(engine, ws_manager, result)
+            return {"type": "noop"}
+        return {"type": "action_result", "action": "pvp_action", "data": result}
+
+    elif msg_type == "pvp_challenge_response":
+        session_id = msg.get("data", {}).get("session_id", "")
+        accept = bool(msg.get("data", {}).get("accept", False))
+        player = await engine.get_player(user_id)
+        result = engine.pvp.respond_challenge(session_id, user_id, accept, player)
+        if result.get("started") and ws_manager:
+            session = engine.pvp.get_session_for_player(user_id)
+            if session:
+                await ws_manager.send_to_player(session.player_a_id, {
+                    "type": "pvp_start",
+                    "data": result["pvp_state_a"],
+                })
+                await ws_manager.send_to_player(session.player_b_id, {
+                    "type": "pvp_start",
+                    "data": result["pvp_state_b"],
+                })
+                await _push_player_snapshot(engine, ws_manager, session.player_a_id)
+                await _push_player_snapshot(engine, ws_manager, session.player_b_id)
+            return {"type": "noop"}
+        if result.get("ended") and ws_manager:
+            await _broadcast_pvp_result(engine, ws_manager, result)
+            return {"type": "noop"}
+        return {"type": "action_result", "action": "pvp_challenge_response", "data": result}
+
+    elif msg_type == "pvp_flee_offer":
+        session_id = msg.get("data", {}).get("session_id", "")
+        items = msg.get("data", {}).get("items", [])
+        player = await engine.get_player(user_id)
+        result = await engine.pvp.submit_flee_request(session_id, user_id, items, player)
+        if result.get("pvp_state_a") and result.get("pvp_state_b") and ws_manager:
+            await _broadcast_pvp_result(engine, ws_manager, result)
+            return {"type": "noop"}
+        return {"type": "action_result", "action": "pvp_flee_offer", "data": result}
+
+    elif msg_type == "pvp_flee_response":
+        session_id = msg.get("data", {}).get("session_id", "")
+        accept = bool(msg.get("data", {}).get("accept", False))
+        player = await engine.get_player(user_id)
+        result = await engine.pvp.respond_flee_request(session_id, user_id, accept, player)
+        if result.get("pvp_state_a") and result.get("pvp_state_b") and ws_manager:
+            await _broadcast_pvp_result(engine, ws_manager, result)
+            return {"type": "noop"}
+        return {"type": "action_result", "action": "pvp_flee_response", "data": result}
+
+    elif msg_type == "pvp_state":
+        session = engine.pvp.get_session_for_player(user_id)
+        if session:
+            return {"type": "pvp_state", "data": session.to_dict(user_id)}
+        return {"type": "pvp_state", "data": None}
 
     else:
         return {"type": "error", "message": f"未知操作: {msg_type}"}

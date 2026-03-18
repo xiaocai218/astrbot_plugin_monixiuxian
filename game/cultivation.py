@@ -6,9 +6,14 @@ import random
 import time
 
 from .constants import (
-    REALM_CONFIG, RealmLevel, MAX_SUB_REALM,
+    REALM_CONFIG, RealmLevel,
     HEART_METHOD_REGISTRY, MASTERY_LEVELS, MASTERY_MAX,
+    GONGFA_REGISTRY, GONGFA_TIER_REALM_REQ,
     has_sub_realm, get_realm_name, get_heart_method_bonus,
+    get_total_gongfa_bonus, can_cultivate_gongfa,
+    get_max_sub_realm, get_player_base_max_lingqi, get_player_base_stats,
+    get_sub_realm_dao_yun_cost, get_breakthrough_dao_yun_cost,
+    is_high_realm,
     DEATH_REALM_START,
 )
 from .models import Player
@@ -37,12 +42,21 @@ async def perform_cultivate(player: Player, cooldown: int = 60) -> dict:
     # 基础经验
     base_min = 10 + player.realm * 5 + player.sub_realm * 2
     base_max = 30 + player.realm * 10 + player.sub_realm * 4
+    if player.realm >= RealmLevel.GOLDEN_CORE:
+        base_min *= 10
+        base_max *= 10
     exp_gained = random.randint(base_min, base_max)
 
     # 心法加成
     hm_bonus = get_heart_method_bonus(player.heart_method, player.heart_method_mastery)
     if hm_bonus["exp_multiplier"] > 0:
         exp_gained = int(exp_gained * (1.0 + hm_bonus["exp_multiplier"]))
+
+    # 丹药修炼速度buff加成
+    from .pills import get_buff_totals
+    buff_totals = get_buff_totals(player)
+    if buff_totals["cultivate_speed"] > 0:
+        exp_gained = int(exp_gained * buff_totals["cultivate_speed"])
 
     player.exp += exp_gained
     player.last_cultivate_time = now
@@ -53,6 +67,23 @@ async def perform_cultivate(player: Player, cooldown: int = 60) -> dict:
     hm_mastery_msg = _accumulate_heart_method_exp(player)
     if hm_mastery_msg:
         extra_msgs.append(hm_mastery_msg)
+
+    # 功法熟练度积累
+    gf_msgs = _accumulate_gongfa_exp(player)
+    extra_msgs.extend(gf_msgs)
+
+    # 功法HP/灵力回复
+    gf_total = get_total_gongfa_bonus(player)
+    if gf_total["hp_regen"] > 0 and player.hp < player.max_hp:
+        heal = min(gf_total["hp_regen"], player.max_hp - player.hp)
+        player.hp += heal
+        extra_msgs.append(f"功法回血+{heal}")
+    if gf_total["lingqi_regen"] > 0:
+        max_lq = get_player_base_max_lingqi(player)
+        actual = min(gf_total["lingqi_regen"], max(0, max_lq - player.lingqi))
+        if actual > 0:
+            player.lingqi += actual
+            extra_msgs.append(f"功法回灵+{actual}")
 
     # 道韵获取（仅化神期及以上心法生效）
     hm = HEART_METHOD_REGISTRY.get(player.heart_method)
@@ -69,26 +100,34 @@ async def perform_cultivate(player: Player, cooldown: int = 60) -> dict:
     sub_level_up = False
 
     # 小境界自动升级
-    if has_sub_realm(player.realm) and player.sub_realm < MAX_SUB_REALM:
+    if has_sub_realm(player.realm) and player.sub_realm < get_max_sub_realm(player.realm):
         sub_exp = realm_cfg.get("sub_exp_to_next", 0)
         if sub_exp > 0 and player.exp >= sub_exp:
-            player.exp -= sub_exp
-            player.sub_realm += 1
-            sub_level_up = True
-            hp_bonus = int(realm_cfg["base_hp"] * 0.08)
-            atk_bonus = int(realm_cfg["base_attack"] * 0.06)
-            def_bonus = int(realm_cfg["base_defense"] * 0.06)
-            lingqi_bonus = max(1, int(realm_cfg.get("base_lingqi", 0) * 0.08))
-            player.max_hp += hp_bonus
-            player.hp = min(player.hp + hp_bonus, player.max_hp)
-            player.attack += atk_bonus
-            player.defense += def_bonus
-            player.lingqi += lingqi_bonus
-            sub_name = get_realm_name(player.realm, player.sub_realm)
-            extra_msgs.append(f"境界提升！当前：{sub_name}")
+            # 高阶境界小境界升级需要道韵
+            dao_cost = get_sub_realm_dao_yun_cost(player.realm, player.sub_realm)
+            if dao_cost > 0 and player.dao_yun < dao_cost:
+                extra_msgs.append(f"道韵不足，需{dao_cost}道韵突破小境界")
+            else:
+                if dao_cost > 0:
+                    player.dao_yun -= dao_cost
+                    extra_msgs.append(f"消耗道韵{dao_cost}")
+                player.exp -= sub_exp
+                player.sub_realm += 1
+                sub_level_up = True
+                hp_bonus = int(realm_cfg["base_hp"] * 0.08)
+                atk_bonus = int(realm_cfg["base_attack"] * 0.06)
+                def_bonus = int(realm_cfg["base_defense"] * 0.06)
+                lingqi_bonus = max(1, int(realm_cfg.get("base_lingqi", 0) * 0.08))
+                player.max_hp += hp_bonus
+                player.hp = min(player.hp + hp_bonus, player.max_hp)
+                player.attack += atk_bonus
+                player.defense += def_bonus
+                player.lingqi += lingqi_bonus
+                sub_name = get_realm_name(player.realm, player.sub_realm)
+                extra_msgs.append(f"境界提升！当前：{sub_name}")
 
     realm_name = get_realm_name(player.realm, player.sub_realm)
-    if has_sub_realm(player.realm) and player.sub_realm < MAX_SUB_REALM:
+    if has_sub_realm(player.realm) and player.sub_realm < get_max_sub_realm(player.realm):
         exp_target = realm_cfg.get("sub_exp_to_next", 0)
     else:
         exp_target = realm_cfg["exp_to_next"]
@@ -125,6 +164,52 @@ def _accumulate_heart_method_exp(player: Player) -> str:
     return ""
 
 
+def _accumulate_gongfa_exp(player: Player) -> list[str]:
+    """积累功法修炼经验，检查是否升阶。返回提示消息列表。"""
+    msgs: list[str] = []
+    for slot in ("gongfa_1", "gongfa_2", "gongfa_3"):
+        gongfa_id = getattr(player, slot, "无")
+        if not gongfa_id or gongfa_id == "无":
+            continue
+        gf = GONGFA_REGISTRY.get(gongfa_id)
+        if not gf:
+            continue
+        mastery_attr = f"{slot}_mastery"
+        exp_attr = f"{slot}_exp"
+        mastery = getattr(player, mastery_attr, 0)
+        if mastery >= MASTERY_MAX:
+            continue
+
+        # 境界不够则不涨熟练度
+        if not can_cultivate_gongfa(player.realm, gf.tier):
+            continue
+
+        # 地阶+功法的大成→圆满需消耗道韵（不够则暂停累积）
+        if gf.tier >= 2 and mastery >= 2 and gf.dao_yun_cost > 0:
+            # 仅在尝试从大成(2)突破到圆满(3)时扣除
+            pass
+
+        gf_exp_gain = random.randint(1, 3)
+        cur_exp = getattr(player, exp_attr, 0) + gf_exp_gain
+        if cur_exp >= gf.mastery_exp:
+            # 大成→圆满道韵校验
+            if gf.tier >= 2 and mastery == 2 and gf.dao_yun_cost > 0:
+                if player.dao_yun < gf.dao_yun_cost:
+                    # 道韵不足，停止在阈值附近（不升级）
+                    cur_exp = gf.mastery_exp - 1
+                    setattr(player, exp_attr, cur_exp)
+                    continue
+                player.dao_yun -= gf.dao_yun_cost
+                msgs.append(f"消耗道韵{gf.dao_yun_cost}，助功法【{gf.name}】突破")
+            cur_exp -= gf.mastery_exp
+            mastery += 1
+            setattr(player, mastery_attr, mastery)
+            new_level = MASTERY_LEVELS[mastery]
+            msgs.append(f"功法【{gf.name}】修炼至{new_level}！")
+        setattr(player, exp_attr, cur_exp)
+    return msgs
+
+
 async def attempt_breakthrough(player: Player, bonus_rate: float = 0.0,
                                 prevent_death: bool = False) -> dict:
     """尝试突破大境界。
@@ -142,7 +227,7 @@ async def attempt_breakthrough(player: Player, bonus_rate: float = 0.0,
                 "new_realm": None, "died": False}
 
     # 有小境界的大境界，必须到圆满才能突破
-    if has_sub_realm(player.realm) and player.sub_realm < MAX_SUB_REALM:
+    if has_sub_realm(player.realm) and player.sub_realm < get_max_sub_realm(player.realm):
         current_name = get_realm_name(player.realm, player.sub_realm)
         return {
             "success": False,
@@ -160,14 +245,28 @@ async def attempt_breakthrough(player: Player, bonus_rate: float = 0.0,
             "died": False,
         }
 
+    # 高阶境界突破需要道韵
+    dao_cost = get_breakthrough_dao_yun_cost(player.realm)
+    if dao_cost > 0 and player.dao_yun < dao_cost:
+        return {
+            "success": False,
+            "message": f"道韵不足，突破需要{dao_cost}道韵，当前{player.dao_yun}",
+            "new_realm": None,
+            "died": False,
+        }
+    if dao_cost > 0:
+        player.dao_yun -= dao_cost
+
     # 死亡判定（元婴期开始）
     death_rate = realm_cfg.get("death_rate", 0.0)
     if death_rate > 0 and not prevent_death:
         if random.random() < death_rate:
+            cost_msg = f"消耗道韵{dao_cost}。\n" if dao_cost > 0 else ""
             return {
                 "success": False,
                 "message": (
                     f"突破失败！天劫降临，道消身殒...\n"
+                    f"{cost_msg}"
                     f"（{int(death_rate * 100)}%概率陨落，可使用保命符规避）"
                 ),
                 "new_realm": None,
@@ -175,34 +274,46 @@ async def attempt_breakthrough(player: Player, bonus_rate: float = 0.0,
             }
 
     # 突破成功率判定
-    rate = min(realm_cfg["breakthrough_rate"] + bonus_rate, 1.0)
+    accumulated_bonus = getattr(player, 'breakthrough_bonus', 0.0)
+    rate = min(realm_cfg["breakthrough_rate"] + bonus_rate + accumulated_bonus, 1.0)
+    rate_percent = int(rate * 100)
 
     if random.random() <= rate:
         player.realm += 1
         player.sub_realm = 0
         player.exp = 0
-        new_cfg = REALM_CONFIG[player.realm]
+        player.breakthrough_bonus = 0.0  # 成功后清零累积加成
         old_hp = player.hp
-        player.max_hp = new_cfg["base_hp"]
+        base_stats = get_player_base_stats(player)
+        player.max_hp = base_stats["max_hp"]
         recover_hp = max(1, int(player.max_hp * 0.25))
         player.hp = min(player.max_hp, old_hp + recover_hp)
-        player.attack = new_cfg["base_attack"]
-        player.defense = new_cfg["base_defense"]
-        player.lingqi = new_cfg.get("base_lingqi", player.lingqi)
+        player.attack = base_stats["attack"]
+        player.defense = base_stats["defense"]
+        player.lingqi = base_stats["max_lingqi"]
         actual_recover = max(0, player.hp - old_hp)
         new_name = get_realm_name(player.realm, player.sub_realm)
+        cost_msg = f"消耗道韵{dao_cost}，" if dao_cost > 0 else ""
         return {
             "success": True,
-            "message": f"突破成功！当前境界：{new_name}，回复{actual_recover}点气血",
+            "message": f"突破成功！{cost_msg}当前境界：{new_name}，回复{actual_recover}点气血（突破概率{rate_percent}%）",
             "new_realm": new_name,
             "died": False,
         }
     else:
         penalty = player.exp // 4
         player.exp -= penalty
+        # 失败后增加累积加成，每次+5%，最高20%
+        if accumulated_bonus < 0.2:
+            player.breakthrough_bonus = min(accumulated_bonus + 0.05, 0.2)
+            new_bonus_percent = int(player.breakthrough_bonus * 100)
+            bonus_msg = f"，下次突破成功率+{new_bonus_percent}%"
+        else:
+            bonus_msg = "，累积加成已达上限20%"
+        cost_msg = f"消耗道韵{dao_cost}，" if dao_cost > 0 else ""
         return {
             "success": False,
-            "message": f"突破失败！损失{penalty}点经验",
+            "message": f"突破失败！{cost_msg}损失{penalty}点经验（突破概率{rate_percent}%{bonus_msg}）",
             "new_realm": None,
             "died": False,
         }

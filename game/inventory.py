@@ -5,8 +5,10 @@ from __future__ import annotations
 from .constants import (
     ITEM_REGISTRY, EQUIPMENT_REGISTRY, EQUIPMENT_TIER_NAMES,
     HEART_METHOD_REGISTRY, HEART_METHOD_QUALITY_NAMES, MASTERY_LEVELS, REALM_CONFIG,
+    GONGFA_REGISTRY, GONGFA_TIER_NAMES,
     NON_RECYCLABLE_ITEMS,
     can_equip, get_daily_recycle_price, parse_heart_method_manual_id,
+    parse_stored_heart_method_item_id, parse_gongfa_scroll_id, get_player_base_max_lingqi,
 )
 from .models import Player
 
@@ -20,13 +22,16 @@ async def add_item(player: Player, item_id: str, count: int = 1) -> dict:
     return {"success": True, "message": f"获得 {item.name} x{count}"}
 
 
-async def use_item(player: Player, item_id: str) -> dict:
+async def use_item(player: Player, item_id: str, count: int = 1) -> dict:
     """使用消耗品。
 
     Returns:
         {"success": bool, "message": str, "effect": dict | None}
     """
-    if player.inventory.get(item_id, 0) <= 0:
+    if count < 1:
+        return {"success": False, "message": "使用数量至少为1", "effect": None}
+
+    if player.inventory.get(item_id, 0) < count:
         return {"success": False, "message": "物品不足", "effect": None}
 
     item = ITEM_REGISTRY.get(item_id)
@@ -39,6 +44,18 @@ async def use_item(player: Player, item_id: str) -> dict:
     if item.item_type != "consumable":
         return {"success": False, "message": "该物品不可使用", "effect": None}
 
+    # 突破丹特殊检查：突破率100%时无法使用（支持新旧丹药）
+    if "breakthrough_bonus" in item.effect and "_temp_buff" not in item.effect:
+        from .constants import REALM_CONFIG
+        realm_cfg = REALM_CONFIG.get(player.realm, {})
+        base_rate = realm_cfg.get("breakthrough_rate", 0.0)
+        accumulated_bonus = getattr(player, 'breakthrough_bonus', 0.0)
+        pill_bonus = item.effect.get("breakthrough_bonus", 0.0)
+        prepared_pill_bonus = pill_bonus if getattr(player, 'breakthrough_pill_count', 0) > 0 else 0.0
+        current_rate = base_rate + accumulated_bonus + prepared_pill_bonus
+        if current_rate >= 1.0:
+            return {"success": False, "message": "当前突破成功率已达100%，无需服用破境丹", "effect": None}
+
     # 心法秘籍：使用前先做境界/重复修炼校验，避免误消耗
     if "learn_heart_method" in item.effect:
         method_id = str(item.effect.get("learn_heart_method", ""))
@@ -50,15 +67,66 @@ async def use_item(player: Player, item_id: str) -> dict:
             return {"success": False, "message": f"【{hm.name}】需达到{realm_name}方可修炼，当前境界不足", "effect": None}
         if player.heart_method == method_id:
             return {"success": False, "message": f"你已在修炼【{hm.name}】", "effect": None}
+        old_hm = HEART_METHOD_REGISTRY.get(player.heart_method)
+        if old_hm and old_hm.method_id != method_id and player.heart_method_mastery >= 1:
+            mastery_name = MASTERY_LEVELS[min(player.heart_method_mastery, len(MASTERY_LEVELS) - 1)]
+            return {
+                "success": False,
+                "needs_confirmation": True,
+                "old_method_id": old_hm.method_id,
+                "old_method_name": old_hm.name,
+                "old_mastery": player.heart_method_mastery,
+                "old_mastery_name": mastery_name,
+                "new_method_id": method_id,
+                "new_method_name": hm.name,
+                "source_item_id": item_id,
+                "message": f"你当前修炼的【{old_hm.name}】已达{mastery_name}，是否转换为心法值？",
+                "effect": None,
+            }
 
-    player.inventory[item_id] -= 1
+    # 功法卷轴：使用前校验空槽位和重复装备
+    if "learn_gongfa" in item.effect:
+        gongfa_id = str(item.effect.get("learn_gongfa", ""))
+        gf = GONGFA_REGISTRY.get(gongfa_id)
+        if not gf:
+            return {"success": False, "message": "该功法卷轴数据异常", "effect": None}
+        # 检查是否已装备
+        for slot in ("gongfa_1", "gongfa_2", "gongfa_3"):
+            if getattr(player, slot, "无") == gongfa_id:
+                return {"success": False, "message": f"你已装备了【{gf.name}】", "effect": None}
+        # 检查空槽位
+        has_empty = False
+        for slot in ("gongfa_1", "gongfa_2", "gongfa_3"):
+            slot_value = getattr(player, slot, "无")
+            if not slot_value or slot_value == "无":
+                has_empty = True
+                break
+        if not has_empty:
+            return {"success": False, "message": "功法槽位已满，请先遗忘一个功法", "effect": None}
+
+    stored_method_id = parse_stored_heart_method_item_id(item_id)
+    if stored_method_id:
+        player.stored_heart_methods.pop(stored_method_id, None)
+
+    # 批量使用仅支持突破丹类（含新旧）
+    is_breakthrough = "breakthrough_bonus" in item.effect and "_temp_buff" not in item.effect
+    actual_count = count if is_breakthrough else 1
+    player.inventory[item_id] -= actual_count
     if player.inventory[item_id] <= 0:
         del player.inventory[item_id]
 
-    effect_msg = _apply_effect(player, item.effect)
+    # 临时buff类丹药走buff系统
+    if item.effect.get("_temp_buff"):
+        from .pills import apply_pill_buff
+        effect_msg = apply_pill_buff(player, item_id)
+    elif is_breakthrough and actual_count > 1:
+        effect_msg = _apply_effect_batch(player, item.effect, actual_count)
+    else:
+        effect_msg = _apply_effect(player, item.effect)
+
     return {
         "success": True,
-        "message": f"使用了 {item.name}。{effect_msg}",
+        "message": f"使用了 {actual_count}个{item.name}。{effect_msg}" if actual_count > 1 else f"使用了 {item.name}。{effect_msg}",
         "effect": item.effect,
     }
 
@@ -168,6 +236,9 @@ async def recycle_item(player: Player, item_id: str, count: int = 1) -> dict:
 def _apply_effect(player: Player, effect: dict) -> str:
     """应用物品效果到玩家，返回描述文本。"""
     messages = []
+    if "heal_full" in effect:
+        player.hp = player.max_hp
+        messages.append("生命值完全恢复")
     if "heal_hp" in effect:
         heal = effect["heal_hp"]
         player.hp = min(player.hp + heal, player.max_hp)
@@ -176,10 +247,41 @@ def _apply_effect(player: Player, effect: dict) -> str:
         bonus = effect["exp_bonus"]
         player.exp += bonus
         messages.append(f"获得{bonus}点经验")
-    if "attack_boost" in effect:
+    if "attack_boost" in effect and "_temp_buff" not in effect:
         boost = effect["attack_boost"]
+        player.permanent_attack_bonus = getattr(player, "permanent_attack_bonus", 0) + boost
         player.attack += boost
         messages.append(f"攻击力永久增加{boost}")
+    if "defense_boost" in effect and "_temp_buff" not in effect:
+        boost = effect["defense_boost"]
+        player.permanent_defense_bonus = getattr(player, "permanent_defense_bonus", 0) + boost
+        player.defense += boost
+        messages.append(f"防御力永久增加{boost}")
+    if "lingqi_boost" in effect and "_temp_buff" not in effect:
+        boost = effect["lingqi_boost"]
+        player.permanent_lingqi_bonus = getattr(player, "permanent_lingqi_bonus", 0) + boost
+        player.lingqi = min(get_player_base_max_lingqi(player), player.lingqi + boost)
+        messages.append(f"灵气上限永久增加{boost}")
+    if "dao_yun_boost" in effect:
+        boost = effect["dao_yun_boost"]
+        player.dao_yun += boost
+        messages.append(f"道韵永久增加{boost}")
+    if "max_hp_boost" in effect and "_temp_buff" not in effect:
+        boost = effect["max_hp_boost"]
+        player.permanent_max_hp_bonus = getattr(player, "permanent_max_hp_bonus", 0) + boost
+        player.max_hp += boost
+        player.hp = min(player.hp + boost, player.max_hp)
+        messages.append(f"生命上限永久增加{boost}")
+    if "clear_debuffs" in effect:
+        active_buffs = getattr(player, 'active_buffs', []) or []
+        cleared = sum(1 for buff in active_buffs if buff.get("side_effects"))
+        for buff in active_buffs:
+            if buff.get("side_effects"):
+                buff["side_effects"] = {}
+        if cleared:
+            messages.append(f"清除了{cleared}个丹药副作用")
+        else:
+            messages.append("当前无可清除的丹药副作用")
     if "learn_heart_method" in effect:
         method_id = str(effect["learn_heart_method"])
         hm = HEART_METHOD_REGISTRY.get(method_id)
@@ -226,7 +328,38 @@ def _apply_effect(player: Player, effect: dict) -> str:
                     f"吸收预存心法值{absorbed_value}，当前进度{player.heart_method_exp}/{hm.mastery_exp}"
                     f"（剩余心法值{player.heart_method_value}）"
                 )
-    # breakthrough_bonus 在突破时由引擎处理，此处不做
+    if "breakthrough_bonus" in effect:
+        bonus = effect["breakthrough_bonus"]
+        player.breakthrough_pill_count = getattr(player, 'breakthrough_pill_count', 0) + 1
+        messages.append(f"服用破境丹，下次突破成功率+{int(bonus * 100)}%（已备{player.breakthrough_pill_count}颗）")
+    if "learn_gongfa" in effect:
+        gongfa_id = str(effect["learn_gongfa"])
+        gf = GONGFA_REGISTRY.get(gongfa_id)
+        if gf:
+            # 找到第一个空槽位装入
+            placed = False
+            for slot in ("gongfa_1", "gongfa_2", "gongfa_3"):
+                slot_value = getattr(player, slot, "无")
+                if not slot_value or slot_value == "无":
+                    setattr(player, slot, gongfa_id)
+                    setattr(player, f"{slot}_mastery", 0)
+                    setattr(player, f"{slot}_exp", 0)
+                    tier_name = GONGFA_TIER_NAMES.get(gf.tier, "未知")
+                    messages.append(f"习得{tier_name}功法【{gf.name}】（入门）")
+                    placed = True
+                    break
+            if not placed:
+                messages.append("功法槽位已满")
+    return "，".join(messages) if messages else ""
+
+
+def _apply_effect_batch(player: Player, effect: dict, count: int) -> str:
+    """批量应用物品效果（仅支持突破丹）。"""
+    messages = []
+    if "breakthrough_bonus" in effect:
+        bonus = effect["breakthrough_bonus"]
+        player.breakthrough_pill_count = getattr(player, 'breakthrough_pill_count', 0) + count
+        messages.append(f"服用{count}颗破境丹，下次突破成功率+{int(bonus * 100)}%（已备{player.breakthrough_pill_count}颗）")
     return "，".join(messages) if messages else ""
 
 
@@ -264,6 +397,7 @@ async def get_inventory_display(player: Player) -> list[dict]:
 
 def get_inventory_display_sync(player: Player) -> list[dict]:
     """获取背包展示数据（同步版，供管理员详情使用）。"""
+    from .pills import PILL_REGISTRY, PILL_TIER_NAMES, PILL_GRADE_NAMES
     result = []
     for item_id, count in player.inventory.items():
         item = ITEM_REGISTRY.get(item_id)
@@ -286,6 +420,18 @@ def get_inventory_display_sync(player: Player) -> list[dict]:
             entry["defense"] = eq.defense
             entry["element"] = eq.element
             entry["element_damage"] = eq.element_damage
+        # 丹药品阶详情
+        pill = PILL_REGISTRY.get(item_id)
+        if pill:
+            entry["pill_tier"] = pill.tier
+            entry["pill_tier_name"] = PILL_TIER_NAMES.get(pill.tier, "")
+            entry["pill_grade"] = pill.grade
+            entry["pill_grade_name"] = PILL_GRADE_NAMES.get(pill.grade, "")
+            entry["is_temp"] = pill.is_temp
+            if pill.is_temp:
+                entry["duration"] = pill.duration
+            if pill.side_effect_desc:
+                entry["side_effect_desc"] = pill.side_effect_desc
         result.append(entry)
     return result
 
@@ -309,9 +455,16 @@ def find_item_ids_by_name(name: str, query_type: str | None = None) -> list[str]
         if qtype == "equipment":
             return item_type == "equipment" or item_id in EQUIPMENT_REGISTRY
         if qtype == "heart_method":
-            return parse_heart_method_manual_id(item_id) is not None
+            return (
+                parse_heart_method_manual_id(item_id) is not None
+                or parse_stored_heart_method_item_id(item_id) is not None
+            )
         if qtype == "item":
-            return item_type != "equipment" and parse_heart_method_manual_id(item_id) is None
+            return (
+                item_type != "equipment"
+                and parse_heart_method_manual_id(item_id) is None
+                and parse_stored_heart_method_item_id(item_id) is None
+            )
         return False
 
     result: list[str] = []

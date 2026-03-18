@@ -14,14 +14,21 @@ from .constants import (
     REALM_CONFIG, ITEM_REGISTRY, CHECKIN_PILL_WEIGHTS,
     EQUIPMENT_REGISTRY, EQUIPMENT_TIER_NAMES, EquipmentTier,
     HEART_METHOD_REGISTRY, HEART_METHOD_QUALITY_NAMES, MASTERY_LEVELS,
-    get_heart_method_bonus, get_heart_method_manual_id, parse_heart_method_manual_id,
+    GONGFA_REGISTRY, GONGFA_TIER_NAMES, MASTERY_MAX,
+    get_heart_method_bonus, get_heart_method_manual_id, get_gongfa_scroll_id,
+    get_stored_heart_method_item_id, parse_heart_method_manual_id,
+    parse_stored_heart_method_item_id,
+    get_total_gongfa_bonus, can_cultivate_gongfa,
     get_realm_name, has_sub_realm, can_equip, get_realm_heart_methods,
-    MAX_SUB_REALM, RealmLevel,
+    get_player_base_max_lingqi, get_player_base_stats, get_realm_base_stats, calc_gongfa_lingqi_cost,
+    get_max_sub_realm, get_sub_realm_dao_yun_cost, is_high_realm,
+    RealmLevel,
 )
-from .adventure import attempt_adventure
 from .cultivation import attempt_breakthrough, perform_cultivate
 from .data_manager import DataManager
 from .auth import AuthManager
+from .dungeon import DungeonManager
+from .pvp import PvPManager
 from .inventory import (
     add_item,
     equip_item,
@@ -60,29 +67,57 @@ class GameEngine:
         self._name_reviewer: Callable[[str], Awaitable[dict | tuple | bool]] | None = None
         self._chat_reviewer: Callable[[str], Awaitable[dict]] | None = None
         self.auth: AuthManager | None = None
-        self._pending_deaths: dict[str, dict] = {}  # {user_id: death_snapshot}  # 由外部设置
+        self._pending_deaths: dict[str, dict] = {}
+        self.dungeon = DungeonManager(self)
+        self.pvp = PvPManager(self)
 
     async def initialize(self):
         """加载所有玩家数据到内存。"""
         # 启动时先从独立心法表加载定义，再进入玩家数据归一化流程
-        from .constants import set_heart_method_registry, set_equipment_registry
+        from .constants import set_heart_method_registry, set_equipment_registry, set_gongfa_registry
+        from .pills import clean_expired_buffs
 
         equipments = await self._data_manager.load_weapons()
         set_equipment_registry(equipments)
         heart_methods = await self._data_manager.load_heart_methods()
         set_heart_method_registry(heart_methods)
+        gongfas = await self._data_manager.load_gongfas()
+        set_gongfa_registry(gongfas)
 
         self._players = await self._data_manager.load_all_players()
         normalized = False
         # 构建道号索引
         for uid, player in self._players.items():
             self._name_index[player.name] = uid
-            base_lingqi = REALM_CONFIG.get(player.realm, {}).get("base_lingqi", 50)
+            realm_stats = get_realm_base_stats(player.realm, player.sub_realm)
+            if getattr(player, "permanent_max_hp_bonus", 0) <= 0 and player.max_hp > realm_stats["max_hp"]:
+                player.permanent_max_hp_bonus = player.max_hp - realm_stats["max_hp"]
+                normalized = True
+            if getattr(player, "permanent_attack_bonus", 0) <= 0 and player.attack > realm_stats["attack"]:
+                player.permanent_attack_bonus = player.attack - realm_stats["attack"]
+                normalized = True
+            if getattr(player, "permanent_defense_bonus", 0) <= 0 and player.defense > realm_stats["defense"]:
+                player.permanent_defense_bonus = player.defense - realm_stats["defense"]
+                normalized = True
+            if getattr(player, "permanent_lingqi_bonus", 0) <= 0 and player.lingqi > realm_stats["max_lingqi"]:
+                player.permanent_lingqi_bonus = player.lingqi - realm_stats["max_lingqi"]
+                normalized = True
+
+            max_lingqi = get_player_base_max_lingqi(player)
             if player.lingqi <= 0 or (player.lingqi == 50 and player.realm > 0):
-                player.lingqi = base_lingqi
+                player.lingqi = max_lingqi
+                normalized = True
+            elif player.lingqi > max_lingqi:
+                player.lingqi = max_lingqi
                 normalized = True
             heart_fix = self._auto_unequip_invalid_heart_method(player, convert_ratio=0.6, force=False)
-            if heart_fix.get("removed_name"):
+            removed_gongfas = self._auto_unequip_invalid_gongfa(player)
+            if heart_fix.get("removed_name") or removed_gongfas:
+                normalized = True
+            if clean_expired_buffs(player):
+                normalized = True
+            # 清理过期心法道具
+            if self._clean_expired_heart_methods(player):
                 normalized = True
         if normalized:
             await self._data_manager.save_all_players(self._players)
@@ -278,6 +313,9 @@ class GameEngine:
         realm_cfg = REALM_CONFIG[player.realm]
         base_min = 10 + player.realm * 5 + player.sub_realm * 2
         base_max = 30 + player.realm * 10 + player.sub_realm * 4
+        if player.realm >= RealmLevel.GOLDEN_CORE:
+            base_min *= 10
+            base_max *= 10
         avg_exp_per_min = (base_min + base_max) // 2
         total_exp = avg_exp_per_min * duration_min
 
@@ -305,6 +343,51 @@ class GameEngine:
                     f"心法【{hm.name}】修炼至{MASTERY_LEVELS[player.heart_method_mastery]}！"
                 )
 
+        # 挂机期间功法经验（每分钟1点/功法，境界不够则不涨）
+        for slot in ("gongfa_1", "gongfa_2", "gongfa_3"):
+            gongfa_id = getattr(player, slot, "无")
+            if not gongfa_id or gongfa_id == "无":
+                continue
+            gf = GONGFA_REGISTRY.get(gongfa_id)
+            if not gf:
+                continue
+            if not can_cultivate_gongfa(player.realm, gf.tier):
+                continue
+            mastery_attr = f"{slot}_mastery"
+            exp_attr = f"{slot}_exp"
+            mastery = getattr(player, mastery_attr, 0)
+            if mastery >= MASTERY_MAX:
+                continue
+            player_exp = getattr(player, exp_attr, 0) + duration_min
+            while player_exp >= gf.mastery_exp and mastery < MASTERY_MAX:
+                if gf.tier >= 2 and mastery == 2 and gf.dao_yun_cost > 0:
+                    if player.dao_yun < gf.dao_yun_cost:
+                        player_exp = gf.mastery_exp - 1
+                        break
+                    player.dao_yun -= gf.dao_yun_cost
+                    extra_msgs.append(f"消耗道韵{gf.dao_yun_cost}，助功法【{gf.name}】突破")
+                player_exp -= gf.mastery_exp
+                mastery += 1
+                if mastery <= MASTERY_MAX:
+                    from .constants import MASTERY_LEVELS
+                    extra_msgs.append(f"功法【{gf.name}】修炼至{MASTERY_LEVELS[mastery]}！")
+            setattr(player, mastery_attr, mastery)
+            setattr(player, exp_attr, max(0, int(player_exp)))
+
+        # 挂机期间功法回血/回灵
+        gf_total = get_total_gongfa_bonus(player)
+        if gf_total["hp_regen"] > 0 and player.hp < player.max_hp:
+            heal = min(gf_total["hp_regen"] * duration_min, player.max_hp - player.hp)
+            player.hp += heal
+            extra_msgs.append(f"功法回血+{heal}")
+        if gf_total["lingqi_regen"] > 0:
+            regen = gf_total["lingqi_regen"] * duration_min
+            max_lq = get_player_base_max_lingqi(player)
+            actual = min(regen, max(0, max_lq - player.lingqi))
+            if actual > 0:
+                player.lingqi += actual
+                extra_msgs.append(f"功法回灵+{actual}")
+
         # 挂机期间道韵（仅化神期及以上心法生效）
         if hm and hm.realm >= RealmLevel.DEITY_TRANSFORM and hm_bonus["dao_yun_rate"] > 0:
             dao_gain = int(duration_min * hm_bonus["dao_yun_rate"] * 0.3)
@@ -316,9 +399,17 @@ class GameEngine:
         sub_level_ups = 0
         if has_sub_realm(player.realm):
             sub_exp = realm_cfg.get("sub_exp_to_next", 0)
+            max_sr = get_max_sub_realm(player.realm)
             while (sub_exp > 0
-                   and player.sub_realm < MAX_SUB_REALM
+                   and player.sub_realm < max_sr
                    and player.exp >= sub_exp):
+                # 高阶境界小境界升级需要道韵
+                dao_cost = get_sub_realm_dao_yun_cost(player.realm, player.sub_realm)
+                if dao_cost > 0 and player.dao_yun < dao_cost:
+                    break
+                if dao_cost > 0:
+                    player.dao_yun -= dao_cost
+                    extra_msgs.append(f"消耗道韵{dao_cost}")
                 player.exp -= sub_exp
                 player.sub_realm += 1
                 sub_level_ups += 1
@@ -377,7 +468,7 @@ class GameEngine:
         return {"success": True, "message": msg}
 
     async def adventure(self, user_id: str) -> dict:
-        """历练操作：随机场景 + 难度匹配 + 战斗结算。"""
+        """历练操作：改为进入秘境副本探索。"""
         player = self._players.get(user_id)
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
@@ -385,60 +476,22 @@ class GameEngine:
         if player.realm < RealmLevel.QI_REFINING:
             return {"success": False, "message": "修为尚浅，至少需要练气期才能历练"}
 
-        # 冷却检查
-        cooldown = self._checkin_config.get("adventure_cooldown", 1800)
-        now = time.time()
-        remaining = cooldown - (now - player.last_adventure_time)
-        if remaining > 0:
-            mins = int(remaining) // 60
-            secs = int(remaining) % 60
-            return {"success": False, "message": f"历练冷却中，还需等待{mins}分{secs}秒"}
-
-        # 随机选场景
-        scene = await self._data_manager.get_random_scene()
-        if not scene:
-            return {"success": False, "message": "历练场景数据异常，请联系管理员"}
-
-        # 敌人境界匹配: 85% 同级, 10% 低一级, 5% 高一级
-        roll = random.randint(1, 100)
-        if roll <= 5:
-            difficulty = "hard"
-        elif roll <= 15 and player.realm > RealmLevel.QI_REFINING:
-            difficulty = "easy"
-        else:
-            difficulty = "normal"
-
-        result = await attempt_adventure(player, scene, difficulty)
-
-        if result.get("died"):
-            death_items = await self.prepare_death(user_id)
-            result["death_items"] = death_items
-        else:
-            unequipped = self._auto_unequip_invalid_equipment(player)
-            if unequipped:
-                removed = "、".join(unequipped)
-                result["unequipped"] = unequipped
-                result["message"] = (
-                    f"{result.get('message', '')}\n"
-                    f"境界变化后自动卸下不符合境界的装备：{removed}"
-                ).strip()
-            player.last_adventure_time = now
-            await self._save_player(player)
-
-        return result
+        return await self.dungeon.start(player)
 
     async def get_adventure_scenes(self) -> list[dict]:
         """获取所有历练场景列表。"""
         return await self._data_manager.get_adventure_scenes()
 
     async def _reload_runtime_registries(self):
-        """从数据库重载装备与心法定义到运行时注册表。"""
-        from .constants import set_equipment_registry, set_heart_method_registry
+        """从数据库重载装备与心法与功法定义到运行时注册表。"""
+        from .constants import set_equipment_registry, set_heart_method_registry, set_gongfa_registry
 
         equipments = await self._data_manager.load_weapons()
         set_equipment_registry(equipments)
         heart_methods = await self._data_manager.load_heart_methods()
         set_heart_method_registry(heart_methods)
+        gongfas = await self._data_manager.load_gongfas()
+        set_gongfa_registry(gongfas)
 
     async def _normalize_players_after_registry_change(self):
         """当定义表变化后，归一化玩家装备/心法状态。"""
@@ -446,7 +499,8 @@ class GameEngine:
         for player in self._players.values():
             removed = self._auto_unequip_invalid_equipment(player)
             heart_fix = self._auto_unequip_invalid_heart_method(player, convert_ratio=0.0, force=False)
-            if removed or heart_fix.get("removed_name"):
+            removed_gongfas = self._auto_unequip_invalid_gongfa(player)
+            if removed or heart_fix.get("removed_name") or removed_gongfas:
                 changed = True
         if changed:
             await self._data_manager.save_all_players(self._players)
@@ -627,6 +681,109 @@ class GameEngine:
         await self._reload_runtime_registries()
         await self._normalize_players_after_registry_change()
         return {"success": True, "message": "心法已删除"}
+
+    async def admin_list_gongfas(self) -> list[dict]:
+        rows = await self._data_manager.admin_list_gongfas()
+        result = []
+        for row in rows:
+            item = dict(row)
+            tier = int(item.get("tier", 0))
+            item["tier_name"] = GONGFA_TIER_NAMES.get(tier, str(tier))
+            item["enabled"] = 1 if int(item.get("enabled", 1)) else 0
+            result.append(item)
+        return result
+
+    async def admin_create_gongfa(self, payload: dict) -> dict:
+        gongfa_id = str(payload.get("gongfa_id", "")).strip()
+        if not re.fullmatch(r"[a-z0-9_]{3,64}", gongfa_id):
+            return {"success": False, "message": "功法ID仅支持3-64位小写字母/数字/下划线"}
+        data = {
+            "gongfa_id": gongfa_id,
+            "name": str(payload.get("name", "")).strip(),
+            "tier": int(payload.get("tier", 0)),
+            "attack_bonus": int(payload.get("attack_bonus", 0)),
+            "defense_bonus": int(payload.get("defense_bonus", 0)),
+            "hp_regen": int(payload.get("hp_regen", 0)),
+            "lingqi_regen": int(payload.get("lingqi_regen", 0)),
+            "description": str(payload.get("description", "")),
+            "mastery_exp": int(payload.get("mastery_exp", 200)),
+            "dao_yun_cost": int(payload.get("dao_yun_cost", 0)),
+            "recycle_price": int(payload.get("recycle_price", 1000)),
+            "lingqi_cost": int(payload.get("lingqi_cost", 0) or 0),
+            "enabled": self._normalize_enabled_flag(payload.get("enabled", 1)),
+        }
+        if not data["name"]:
+            return {"success": False, "message": "功法名称不能为空"}
+        if data["tier"] not in {0, 1, 2, 3}:
+            return {"success": False, "message": "品阶值无效（0-3）"}
+        if data["mastery_exp"] <= 0:
+            return {"success": False, "message": "修炼阶段经验阈值必须大于0"}
+        if data["lingqi_cost"] <= 0:
+            data["lingqi_cost"] = calc_gongfa_lingqi_cost(
+                data["tier"],
+                data["attack_bonus"],
+                data["defense_bonus"],
+                data["hp_regen"],
+                data["lingqi_regen"],
+            )
+        if await self._data_manager.admin_has_gongfa_name(data["name"]):
+            return {"success": False, "message": f"功法名称「{data['name']}」已存在，禁止重名"}
+        ok = await self._data_manager.admin_create_gongfa(data)
+        if not ok:
+            return {"success": False, "message": "功法ID已存在"}
+        await self._reload_runtime_registries()
+        await self._normalize_players_after_registry_change()
+        return {"success": True, "message": "功法已新增"}
+
+    async def admin_update_gongfa(self, gongfa_id: str, payload: dict) -> dict:
+        gongfa_id = str(gongfa_id or "").strip()
+        if not gongfa_id:
+            return {"success": False, "message": "缺少功法ID"}
+        data = {
+            "name": str(payload.get("name", "")).strip(),
+            "tier": int(payload.get("tier", 0)),
+            "attack_bonus": int(payload.get("attack_bonus", 0)),
+            "defense_bonus": int(payload.get("defense_bonus", 0)),
+            "hp_regen": int(payload.get("hp_regen", 0)),
+            "lingqi_regen": int(payload.get("lingqi_regen", 0)),
+            "description": str(payload.get("description", "")),
+            "mastery_exp": int(payload.get("mastery_exp", 200)),
+            "dao_yun_cost": int(payload.get("dao_yun_cost", 0)),
+            "recycle_price": int(payload.get("recycle_price", 1000)),
+            "lingqi_cost": int(payload.get("lingqi_cost", 0) or 0),
+            "enabled": self._normalize_enabled_flag(payload.get("enabled", 1)),
+        }
+        if not data["name"]:
+            return {"success": False, "message": "功法名称不能为空"}
+        if data["tier"] not in {0, 1, 2, 3}:
+            return {"success": False, "message": "品阶值无效（0-3）"}
+        if data["mastery_exp"] <= 0:
+            return {"success": False, "message": "修炼阶段经验阈值必须大于0"}
+        if data["lingqi_cost"] <= 0:
+            data["lingqi_cost"] = calc_gongfa_lingqi_cost(
+                data["tier"],
+                data["attack_bonus"],
+                data["defense_bonus"],
+                data["hp_regen"],
+                data["lingqi_regen"],
+            )
+        ok = await self._data_manager.admin_update_gongfa(gongfa_id, data)
+        if not ok:
+            return {"success": False, "message": "功法不存在"}
+        await self._reload_runtime_registries()
+        await self._normalize_players_after_registry_change()
+        return {"success": True, "message": "功法已更新"}
+
+    async def admin_delete_gongfa(self, gongfa_id: str) -> dict:
+        gongfa_id = str(gongfa_id or "").strip()
+        if not gongfa_id:
+            return {"success": False, "message": "缺少功法ID"}
+        ok = await self._data_manager.admin_delete_gongfa(gongfa_id)
+        if not ok:
+            return {"success": False, "message": "功法不存在"}
+        await self._reload_runtime_registries()
+        await self._normalize_players_after_registry_change()
+        return {"success": True, "message": "功法已删除"}
 
     async def admin_list_weapons(self) -> list[dict]:
         from .constants import EQUIPMENT_TIER_NAMES
@@ -938,13 +1095,11 @@ class GameEngine:
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
 
-        # 检查是否有破境丹的加成
+        # 检查是否有已服用的突破丹
         bonus = 0.0
-        if player.inventory.get("breakthrough_pill", 0) > 0:
-            player.inventory["breakthrough_pill"] -= 1
-            if player.inventory["breakthrough_pill"] <= 0:
-                del player.inventory["breakthrough_pill"]
+        if getattr(player, 'breakthrough_pill_count', 0) > 0:
             bonus = 0.2
+            player.breakthrough_pill_count -= 1
 
         # 检查是否有保命符
         prevent_death = False
@@ -964,13 +1119,13 @@ class GameEngine:
             await self._save_player(player)
         return result
 
-    async def use_item_action(self, user_id: str, item_id: str) -> dict:
+    async def use_item_action(self, user_id: str, item_id: str, count: int = 1) -> dict:
         """使用物品。"""
         player = self._players.get(user_id)
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
 
-        result = await use_item(player, item_id)
+        result = await use_item(player, item_id, count)
         if result["success"]:
             await self._save_player(player)
         return result
@@ -1046,8 +1201,77 @@ class GameEngine:
             await self._save_player(player)
         return result
 
+    # ── 功法遗忘 ─────────────────────────────────────────
+    async def forget_gongfa(self, user_id: str, slot: str) -> dict:
+        """遗忘指定槽位的功法，返回功法卷轴。slot: 'gongfa_1' | 'gongfa_2' | 'gongfa_3'。"""
+        player = self._players.get(user_id)
+        if not player:
+            return {"success": False, "message": "你还没有角色，请先创建"}
+
+        if slot not in ("gongfa_1", "gongfa_2", "gongfa_3"):
+            return {"success": False, "message": "无效的功法槽位"}
+
+        gongfa_id = getattr(player, slot, "无")
+        if not gongfa_id or gongfa_id == "无":
+            return {"success": False, "message": "该槽位没有装备功法"}
+
+        gf = GONGFA_REGISTRY.get(gongfa_id)
+        name = gf.name if gf else gongfa_id
+
+        # 返回功法卷轴到背包
+        scroll_id = get_gongfa_scroll_id(gongfa_id)
+        player.inventory[scroll_id] = player.inventory.get(scroll_id, 0) + 1
+
+        # 重置功法槽位和熟练度
+        setattr(player, slot, "无")
+        setattr(player, f"{slot}_mastery", 0)
+        setattr(player, f"{slot}_exp", 0)
+        await self._save_player(player)
+        return {"success": True, "message": f"你已遗忘功法【{name}】，获得功法卷轴"}
+
+    def _auto_unequip_invalid_gongfa(self, player) -> list[str]:
+        """自动卸下不在注册表中的功法，返回被卸下的功法名列表。"""
+        removed = []
+        for slot in ("gongfa_1", "gongfa_2", "gongfa_3"):
+            gid = getattr(player, slot, "无")
+            if gid and gid != "无" and gid not in GONGFA_REGISTRY:
+                removed.append(gid)
+                setattr(player, slot, "无")
+                setattr(player, f"{slot}_mastery", 0)
+                setattr(player, f"{slot}_exp", 0)
+        return removed
+
+    def _clean_expired_heart_methods(self, player: Player) -> bool:
+        """清理过期的心法道具，返回是否有清理。"""
+        if not hasattr(player, "stored_heart_methods") or not isinstance(player.stored_heart_methods, dict):
+            player.stored_heart_methods = {}
+            return False
+        current_time = time.time()
+        changed = False
+        kept: dict[str, float] = {}
+        for mid, expire_time in player.stored_heart_methods.items():
+            try:
+                expire_at = float(expire_time)
+            except (TypeError, ValueError):
+                expire_at = 0.0
+            item_id = get_stored_heart_method_item_id(mid)
+            if current_time > expire_at:
+                if item_id in player.inventory:
+                    player.inventory.pop(item_id, None)
+                    changed = True
+                changed = True
+                continue
+            kept[mid] = expire_at
+            if player.inventory.get(item_id, 0) <= 0:
+                player.inventory[item_id] = 1
+                changed = True
+        if kept != player.stored_heart_methods:
+            player.stored_heart_methods = kept
+            changed = True
+        return changed
+
     async def learn_heart_method(self, user_id: str, method_id: str) -> dict:
-        """修炼心法。更换心法会重置修炼进度。"""
+        """修炼心法。更换心法时若达到小成以上需用户确认。"""
         player = self._players.get(user_id)
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
@@ -1066,12 +1290,25 @@ class GameEngine:
             mastery_name = MASTERY_LEVELS[min(player.heart_method_mastery, len(MASTERY_LEVELS) - 1)]
             return {"success": False, "message": f"你已在修炼【{hm.name}】（{mastery_name}）"}
 
-        old_name = None
         old_hm = HEART_METHOD_REGISTRY.get(player.heart_method)
-        if old_hm:
-            old_name = old_hm.name
 
-        # 更换心法：重置进度
+        # 若旧心法达到小成以上，需要用户确认
+        if old_hm and player.heart_method_mastery >= 1:
+            mastery_name = MASTERY_LEVELS[min(player.heart_method_mastery, len(MASTERY_LEVELS) - 1)]
+            return {
+                "success": False,
+                "needs_confirmation": True,
+                "old_method_id": old_hm.method_id,
+                "old_method_name": old_hm.name,
+                "old_mastery": player.heart_method_mastery,
+                "old_mastery_name": mastery_name,
+                "new_method_id": method_id,
+                "new_method_name": hm.name,
+                "message": f"你当前修炼的【{old_hm.name}】已达{mastery_name}，是否转换为心法值？"
+            }
+
+        # 直接替换（旧心法未达小成或无旧心法）
+        old_name = old_hm.name if old_hm else None
         player.heart_method = method_id
         player.heart_method_mastery = 0
         player.heart_method_exp = 0
@@ -1082,6 +1319,98 @@ class GameEngine:
         if old_name:
             msg += f"\n（放弃了【{old_name}】的修炼进度）"
         return {"success": True, "message": msg}
+
+    async def confirm_replace_heart_method(
+        self,
+        user_id: str,
+        new_method_id: str,
+        convert_to_value: bool,
+        source_item_id: str,
+    ) -> dict:
+        """确认替换心法。convert_to_value=True转换为心法值，False保留为心法道具。"""
+        player = self._players.get(user_id)
+        if not player:
+            return {"success": False, "message": "你还没有角色，请先创建"}
+
+        new_hm = HEART_METHOD_REGISTRY.get(new_method_id)
+        if not new_hm:
+            return {"success": False, "message": "无效的心法"}
+        if new_hm.realm > player.realm:
+            realm_name = REALM_CONFIG.get(new_hm.realm, {}).get("name", "未知境界")
+            return {"success": False, "message": f"【{new_hm.name}】需达到{realm_name}方可修炼，当前境界不足"}
+        if player.heart_method == new_method_id:
+            return {"success": False, "message": f"你已在修炼【{new_hm.name}】"}
+
+        item = ITEM_REGISTRY.get(source_item_id)
+        if not item or item.item_type != "consumable":
+            return {"success": False, "message": "心法秘籍不存在或已失效"}
+        item_method_id = str(item.effect.get("learn_heart_method", ""))
+        if item_method_id != new_method_id:
+            return {"success": False, "message": "确认数据已失效，请重新使用秘籍"}
+        if player.inventory.get(source_item_id, 0) <= 0:
+            return {"success": False, "message": "心法秘籍已不存在，请重新检查背包"}
+
+        old_hm = HEART_METHOD_REGISTRY.get(player.heart_method)
+        if not old_hm or old_hm.method_id == new_method_id or player.heart_method_mastery < 1:
+            return {"success": False, "message": "当前心法未达小成，无需确认"}
+
+        old_name = old_hm.name
+        old_mastery = player.heart_method_mastery
+        old_exp = player.heart_method_exp
+        old_method_id = old_hm.method_id
+        stored_source_method_id = parse_stored_heart_method_item_id(source_item_id)
+
+        player.inventory[source_item_id] -= 1
+        if player.inventory[source_item_id] <= 0:
+            del player.inventory[source_item_id]
+        if stored_source_method_id:
+            player.stored_heart_methods.pop(stored_source_method_id, None)
+
+        from .inventory import _calc_heart_method_convert_points
+
+        player.heart_method_value = max(0, int(getattr(player, "heart_method_value", 0)))
+        messages: list[str] = []
+
+        if convert_to_value:
+            convert_points = _calc_heart_method_convert_points(old_hm, old_mastery, old_exp, new_hm)
+            player.heart_method_value += convert_points
+            if convert_points > 0:
+                messages.append(f"转化【{old_name}】为{convert_points}点心法值")
+            else:
+                messages.append(f"转化【{old_name}】未获得可用心法值")
+        else:
+            expire_time = time.time() + 3 * 24 * 3600
+            stored_item_id = get_stored_heart_method_item_id(old_method_id)
+            if old_method_id not in player.stored_heart_methods:
+                player.stored_heart_methods[old_method_id] = expire_time
+                player.inventory[stored_item_id] = player.inventory.get(stored_item_id, 0) + 1
+                messages.append(f"保留【{old_name}】为心法道具（三天期限）")
+            else:
+                if player.inventory.get(stored_item_id, 0) <= 0:
+                    player.inventory[stored_item_id] = 1
+                messages.append(f"保留【{old_name}】为心法道具（沿用原过期时间）")
+
+        player.heart_method = new_method_id
+        player.heart_method_mastery = 0
+        player.heart_method_exp = 0
+
+        absorbed_value = 0
+        if new_hm.realm == player.realm and player.heart_method_value > 0:
+            absorb_cap = max(1, int(new_hm.mastery_exp * 0.6))
+            absorbed_value = min(player.heart_method_value, absorb_cap)
+            player.heart_method_exp = min(new_hm.mastery_exp - 1, player.heart_method_exp + absorbed_value)
+            player.heart_method_value -= absorbed_value
+
+        await self._save_player(player)
+
+        quality_name = HEART_METHOD_QUALITY_NAMES.get(new_hm.quality, "")
+        messages.append(f"开始修炼{quality_name}心法【{new_hm.name}】（入门）")
+        if absorbed_value > 0:
+            messages.append(
+                f"吸收预存心法值{absorbed_value}，当前进度{player.heart_method_exp}/{new_hm.mastery_exp}"
+                f"（剩余心法值{player.heart_method_value}）"
+            )
+        return {"success": True, "message": "，".join(messages)}
 
     async def learn_heart_method_by_name(self, user_id: str, name: str) -> dict:
         """通过心法名修炼（聊天指令用）。"""
@@ -1124,6 +1453,10 @@ class GameEngine:
         if pending:
             panel["pending_death_items"] = pending.get("items", [])
         return panel
+
+    def has_pending_death(self, user_id: str) -> bool:
+        """是否存在待确认的道陨重生选择。"""
+        return user_id in self._pending_deaths
 
     async def get_inventory(self, user_id: str) -> list[dict]:
         """获取背包展示数据。"""
@@ -1170,6 +1503,8 @@ class GameEngine:
                 continue
             # 检查是否是心法秘籍
             method_id = parse_heart_method_manual_id(item.item_id)
+            if not method_id:
+                method_id = parse_stored_heart_method_item_id(item.item_id)
             if method_id:
                 hm = HEART_METHOD_REGISTRY.get(method_id)
                 if hm:
@@ -1326,16 +1661,17 @@ class GameEngine:
 
     async def _handle_player_death(self, user_id: str, player: Player):
         """处理角色陨落：重置为凡人，清空背包和灵石。"""
-        realm_cfg = REALM_CONFIG[0]
         player.death_count += 1
         player.realm = 0
         player.sub_realm = 0
         player.exp = 0
-        player.hp = realm_cfg["base_hp"]
-        player.max_hp = realm_cfg["base_hp"]
-        player.attack = realm_cfg["base_attack"]
-        player.defense = realm_cfg["base_defense"]
-        player.lingqi = realm_cfg.get("base_lingqi", 50)
+        base_stats = get_player_base_stats(player)
+        player.hp = base_stats["max_hp"]
+        player.max_hp = base_stats["max_hp"]
+        player.attack = base_stats["attack"]
+        player.defense = base_stats["defense"]
+        player.lingqi = base_stats["max_lingqi"]
+        player.dao_yun = 0
         player.spirit_stones = 0
         player.heart_method = "无"
         player.heart_method_mastery = 0
@@ -1345,6 +1681,15 @@ class GameEngine:
         player.last_adventure_time = 0.0
         player.weapon = "无"
         player.armor = "无"
+        player.gongfa_1 = "无"
+        player.gongfa_2 = "无"
+        player.gongfa_3 = "无"
+        player.gongfa_1_mastery = 0
+        player.gongfa_1_exp = 0
+        player.gongfa_2_mastery = 0
+        player.gongfa_2_exp = 0
+        player.gongfa_3_mastery = 0
+        player.gongfa_3_exp = 0
         player.inventory.clear()
         # 赠送一点基础物品以便重新开始
         player.inventory["healing_pill"] = 1
@@ -1409,6 +1754,22 @@ class GameEngine:
                     tier_name=EQUIPMENT_TIER_NAMES.get(eq.tier, "未知"),
                     slot=eq.slot,
                 ))
+
+        # 已装备的功法
+        for gf_slot in ("gongfa_1", "gongfa_2", "gongfa_3"):
+            gongfa_id = getattr(player, gf_slot, "无")
+            if gongfa_id and gongfa_id != "无":
+                gf = GONGFA_REGISTRY.get(gongfa_id)
+                if gf:
+                    items.append(make_snapshot_item(
+                        gongfa_id,
+                        "gongfa",
+                        name=gf.name,
+                        count=1,
+                        description=gf.description,
+                        tier_name=GONGFA_TIER_NAMES.get(gf.tier, "未知"),
+                        gongfa_slot=gf_slot,
+                    ))
 
         # 背包物品
         for item_id, count in player.inventory.items():
@@ -1475,6 +1836,20 @@ class GameEngine:
                     player.heart_method_mastery = 0
                     player.heart_method_exp = 0
                     player.heart_method_value = 0
+            elif ktype == "gongfa":
+                # 恢复功法到原槽位（若槽位已被占用则找第一个空槽）
+                target_slot = str(ki.get("gongfa_slot", "")).strip() or "gongfa_1"
+                if target_slot not in {"gongfa_1", "gongfa_2", "gongfa_3"}:
+                    target_slot = "gongfa_1"
+                if getattr(player, target_slot, "无") != "无":
+                    for s in ("gongfa_1", "gongfa_2", "gongfa_3"):
+                        if getattr(player, s, "无") == "无":
+                            target_slot = s
+                            break
+                if getattr(player, target_slot, "无") == "无" and item_id in GONGFA_REGISTRY:
+                    setattr(player, target_slot, item_id)
+                    setattr(player, f"{target_slot}_mastery", 0)
+                    setattr(player, f"{target_slot}_exp", 0)
             elif ktype in ("weapon", "armor"):
                 # 装备放入背包（死亡后境界归零，可能无法穿戴）
                 player.inventory[item_id] = player.inventory.get(item_id, 0) + 1
@@ -1651,11 +2026,11 @@ class GameEngine:
         return {"success": True, "message": f"已删除 {deleted} 名玩家", "deleted": deleted}
 
     async def update_player_data(self, user_id: str, updates: dict) -> dict:
-        """管理员修改玩家数据。updates 可包含 realm/exp/hp/max_hp/attack/defense/spirit_stones/lingqi。"""
+        """管理员修改玩家数据。"""
         player = self._players.get(user_id)
         if not player:
             return {"success": False, "message": "玩家不存在"}
-        allowed = {"realm", "sub_realm", "exp", "hp", "max_hp", "attack", "defense", "spirit_stones", "lingqi", "name"}
+        allowed = {"realm", "sub_realm", "exp", "hp", "max_hp", "attack", "defense", "spirit_stones", "lingqi", "dao_yun", "name"}
         realm_changed = False
         old_realm = int(player.realm)
         for key, value in updates.items():

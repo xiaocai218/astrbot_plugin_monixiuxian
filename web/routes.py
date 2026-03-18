@@ -657,6 +657,63 @@ def create_router(
             return JSONResponse(result, status_code=400)
         return result
 
+    # ── 功法管理 ────────────────────────────────────────────
+    @router.post("/api/admin/gongfas/list")
+    async def admin_list_gongfas(request: Request):
+        """管理员接口：功法列表。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        gongfas = await engine.admin_list_gongfas()
+        return {"success": True, "gongfas": gongfas}
+
+    @router.post("/api/admin/gongfas/create")
+    async def admin_create_gongfa(request: Request):
+        """管理员接口：新增功法。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        payload = body.get("gongfa", {})
+        if not isinstance(payload, dict):
+            return JSONResponse({"success": False, "message": "参数 gongfa 无效"}, status_code=400)
+        result = await engine.admin_create_gongfa(payload)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    @router.post("/api/admin/gongfas/update")
+    async def admin_update_gongfa(request: Request):
+        """管理员接口：更新功法。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        gongfa_id = str(body.get("gongfa_id", "")).strip()
+        payload = body.get("gongfa", {})
+        if not gongfa_id:
+            return JSONResponse({"success": False, "message": "缺少 gongfa_id"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"success": False, "message": "参数 gongfa 无效"}, status_code=400)
+        result = await engine.admin_update_gongfa(gongfa_id, payload)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    @router.post("/api/admin/gongfas/delete")
+    async def admin_delete_gongfa(request: Request):
+        """管理员接口：删除功法。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        gongfa_id = str(body.get("gongfa_id", "")).strip()
+        result = await engine.admin_delete_gongfa(gongfa_id)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
     @router.post("/api/admin/weapons/list")
     async def admin_list_weapons(request: Request):
         """管理员接口：武器/护甲列表。"""
@@ -866,6 +923,7 @@ def create_router(
             online = len(engine._ws_manager._connections)
         weapon_count = len(await engine.admin_list_weapons())
         heart_method_count = len(await engine.admin_list_heart_methods())
+        gongfa_count = len(await engine.admin_list_gongfas())
         scene_count = len(await engine.admin_list_adventure_scenes())
         announcement_count = len(await engine.admin_list_announcements())
         return {
@@ -876,6 +934,7 @@ def create_router(
                 "admin_account": required_admin_account,
                 "weapons_total": weapon_count,
                 "heart_methods_total": heart_method_count,
+                "gongfas_total": gongfa_count,
                 "scenes_total": scene_count,
                 "announcements_total": announcement_count,
             },

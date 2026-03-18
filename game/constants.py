@@ -19,12 +19,14 @@ class RealmLevel(IntEnum):
     MAHAYANA = 8         # 大乘期
 
 
-# 有小境界的大境界范围（练气~元婴，每个10层）
+# 有小境界的大境界范围
 SUB_REALM_MIN = RealmLevel.QI_REFINING
-SUB_REALM_MAX = RealmLevel.NASCENT_SOUL
-MAX_SUB_REALM = 9  # 0=一层, 9=十层(圆满)
+SUB_REALM_MAX = RealmLevel.MAHAYANA
+MAX_SUB_REALM = 9  # 练气~元婴: 0=一层, 9=十层(圆满)
+MAX_HIGH_SUB_REALM = 3  # 化神~大乘: 0=初期, 3=圆满
 
 SUB_REALM_NAMES = ["一层", "二层", "三层", "四层", "五层", "六层", "七层", "八层", "九层", "圆满"]
+HIGH_SUB_REALM_NAMES = ["初期", "中期", "后期", "圆满"]
 
 # 元婴期开始，突破大境界有死亡概率
 DEATH_REALM_START = RealmLevel.NASCENT_SOUL
@@ -93,9 +95,10 @@ REALM_CONFIG: dict[int, dict] = {
     },
     RealmLevel.DEITY_TRANSFORM: {
         "name": "化神期",
-        "has_sub_realm": False,
+        "has_sub_realm": True,
+        "high_realm": True,
         "exp_to_next": 50000,
-        "sub_exp_to_next": 0,
+        "sub_exp_to_next": 12500,
         "base_hp": 12000,
         "base_attack": 1200,
         "base_defense": 600,
@@ -105,9 +108,10 @@ REALM_CONFIG: dict[int, dict] = {
     },
     RealmLevel.VOID_MERGE: {
         "name": "合虚期",
-        "has_sub_realm": False,
+        "has_sub_realm": True,
+        "high_realm": True,
         "exp_to_next": 150000,
-        "sub_exp_to_next": 0,
+        "sub_exp_to_next": 37500,
         "base_hp": 30000,
         "base_attack": 3000,
         "base_defense": 1500,
@@ -117,9 +121,10 @@ REALM_CONFIG: dict[int, dict] = {
     },
     RealmLevel.TRIBULATION: {
         "name": "渡劫期",
-        "has_sub_realm": False,
+        "has_sub_realm": True,
+        "high_realm": True,
         "exp_to_next": 500000,
-        "sub_exp_to_next": 0,
+        "sub_exp_to_next": 125000,
         "base_hp": 80000,
         "base_attack": 8000,
         "base_defense": 4000,
@@ -129,9 +134,10 @@ REALM_CONFIG: dict[int, dict] = {
     },
     RealmLevel.MAHAYANA: {
         "name": "大乘期",
-        "has_sub_realm": False,
+        "has_sub_realm": True,
+        "high_realm": True,
         "exp_to_next": 999999999,
-        "sub_exp_to_next": 0,
+        "sub_exp_to_next": 250000,
         "base_hp": 200000,
         "base_attack": 20000,
         "base_defense": 10000,
@@ -196,6 +202,10 @@ ITEM_REGISTRY: dict[str, ItemDef] = {
         effect={"prevent_death": True},
     ),
 }
+
+# ── 注册 200 种新丹药到 ITEM_REGISTRY ──
+from .pills import get_pill_item_defs as _get_pill_item_defs  # noqa: E402
+ITEM_REGISTRY.update(_get_pill_item_defs())
 
 # 签到丹药权重表：(item_id, weight)
 CHECKIN_PILL_WEIGHTS: list[tuple[str, int]] = [
@@ -443,6 +453,11 @@ def get_recycle_base_price(item_id: str) -> int | None:
             return max(lo, min(hi, int((eq.attack + eq.defense) * multiplier)))
         return 5
 
+    # 临时心法道具不可回收
+    stored_hm_id = parse_stored_heart_method_item_id(item_id)
+    if stored_hm_id:
+        return None
+
     # 心法秘籍
     hm_id = parse_heart_method_manual_id(item_id)
     if hm_id:
@@ -450,6 +465,14 @@ def get_recycle_base_price(item_id: str) -> int | None:
         if hm:
             return int(20 * (1 + hm.realm * 0.8))
         return 20
+
+    # 功法卷轴
+    gf_id = parse_gongfa_scroll_id(item_id)
+    if gf_id:
+        gf = GONGFA_REGISTRY.get(gf_id)
+        if gf:
+            return gf.recycle_price
+        return 1000
 
     # 注册表中存在的其他物品兜底
     if item_id in ITEM_REGISTRY:
@@ -697,11 +720,17 @@ for _hm_list in (
 
 
 HEART_METHOD_MANUAL_PREFIX = "heart_manual_"
+STORED_HEART_METHOD_PREFIX = "stored_heart_manual_"
 
 
 def get_heart_method_manual_id(method_id: str) -> str:
     """将心法ID转换为秘籍物品ID。"""
     return f"{HEART_METHOD_MANUAL_PREFIX}{method_id}"
+
+
+def get_stored_heart_method_item_id(method_id: str) -> str:
+    """将临时保留心法ID转换为道具物品ID。"""
+    return f"{STORED_HEART_METHOD_PREFIX}{method_id}"
 
 
 def parse_heart_method_manual_id(item_id: str) -> str | None:
@@ -711,14 +740,25 @@ def parse_heart_method_manual_id(item_id: str) -> str | None:
     return item_id[len(HEART_METHOD_MANUAL_PREFIX):] or None
 
 
+def parse_stored_heart_method_item_id(item_id: str) -> str | None:
+    """从临时心法道具ID解析心法ID。"""
+    if not item_id.startswith(STORED_HEART_METHOD_PREFIX):
+        return None
+    return item_id[len(STORED_HEART_METHOD_PREFIX):] or None
+
+
 def _refresh_heart_method_manual_items():
     """根据当前 HEART_METHOD_REGISTRY 重新生成心法秘籍定义。"""
-    to_remove = [item_id for item_id in ITEM_REGISTRY if item_id.startswith(HEART_METHOD_MANUAL_PREFIX)]
+    to_remove = [
+        item_id for item_id in ITEM_REGISTRY
+        if item_id.startswith(HEART_METHOD_MANUAL_PREFIX) or item_id.startswith(STORED_HEART_METHOD_PREFIX)
+    ]
     for item_id in to_remove:
         ITEM_REGISTRY.pop(item_id, None)
 
     for hm in HEART_METHOD_REGISTRY.values():
         manual_id = get_heart_method_manual_id(hm.method_id)
+        stored_manual_id = get_stored_heart_method_item_id(hm.method_id)
         realm_name = REALM_CONFIG.get(hm.realm, {}).get("name", "未知境界")
         quality_name = HEART_METHOD_QUALITY_NAMES.get(hm.quality, "普通")
         ITEM_REGISTRY[manual_id] = ItemDef(
@@ -726,6 +766,13 @@ def _refresh_heart_method_manual_items():
             name=f"{hm.name}秘籍",
             item_type="consumable",
             description=f"可领悟{quality_name}心法【{hm.name}】（{realm_name}）",
+            effect={"learn_heart_method": hm.method_id},
+        )
+        ITEM_REGISTRY[stored_manual_id] = ItemDef(
+            item_id=stored_manual_id,
+            name=f"{hm.name}秘籍（临时）",
+            item_type="consumable",
+            description=f"保留的{quality_name}心法【{hm.name}】（{realm_name}），三日内有效，不可回收",
             effect={"learn_heart_method": hm.method_id},
         )
 
@@ -769,18 +816,528 @@ def get_realm_heart_methods(realm: int) -> list[HeartMethodDef]:
 _refresh_heart_method_manual_items()
 
 
+# ──────────────────── 功法系统 ────────────────────
+
+
+class GongfaTier(IntEnum):
+    """功法品阶。"""
+    HUANG = 0   # 黄阶
+    XUAN = 1    # 玄阶
+    DI = 2      # 地阶
+    TIAN = 3    # 天阶
+
+
+GONGFA_TIER_NAMES: dict[int, str] = {
+    GongfaTier.HUANG: "黄阶",
+    GongfaTier.XUAN: "玄阶",
+    GongfaTier.DI: "地阶",
+    GongfaTier.TIAN: "天阶",
+}
+
+# 修炼熟练度所需最低境界（装备无限制）
+GONGFA_TIER_REALM_REQ: dict[int, int] = {
+    GongfaTier.HUANG: 0,   # 凡人即可修炼
+    GongfaTier.XUAN: 1,    # 练气期
+    GongfaTier.DI: 3,      # 金丹期
+    GongfaTier.TIAN: 6,    # 合虚期
+}
+
+
+@dataclass
+class GongfaDef:
+    """功法定义。"""
+    gongfa_id: str
+    name: str
+    tier: int             # GongfaTier
+    attack_bonus: int
+    defense_bonus: int
+    hp_regen: int
+    lingqi_regen: int
+    description: str = ""
+    mastery_exp: int = 200
+    dao_yun_cost: int = 0
+    recycle_price: int = 1000
+    lingqi_cost: int = 0  # 战斗中施展功法消耗的灵气
+
+
+def calc_gongfa_lingqi_cost(tier: int, atk: int, dfn: int, hp_r: int, lq_r: int) -> int:
+    """根据功法品阶和属性计算施法耗灵。"""
+    tier_base = {0: 10, 1: 25, 2: 50, 3: 100}
+    max_stat = max(int(atk), int(dfn), int(hp_r), int(lq_r))
+    return int(tier_base.get(int(tier), 10) + max_stat * 0.5)
+
+
+def _gf(gongfa_id: str, name: str, tier: int,
+         atk: int, dfn: int, hp_r: int, lq_r: int,
+         desc: str = "", mastery_exp: int = 200,
+         dao_yun_cost: int = 0, recycle_price: int = 1000) -> GongfaDef:
+    """功法定义快捷构造。lingqi_cost 根据品阶和属性自动计算。"""
+    lingqi_cost = calc_gongfa_lingqi_cost(tier, atk, dfn, hp_r, lq_r)
+    return GongfaDef(
+        gongfa_id=gongfa_id, name=name, tier=tier,
+        attack_bonus=atk, defense_bonus=dfn,
+        hp_regen=hp_r, lingqi_regen=lq_r,
+        description=desc, mastery_exp=mastery_exp,
+        dao_yun_cost=dao_yun_cost, recycle_price=recycle_price,
+        lingqi_cost=lingqi_cost,
+    )
+
+
+# 15 种属性组合模板：
+# 单属性(4): atk, def, hp, lq
+# 双属性(6): atk+def, atk+hp, atk+lq, def+hp, def+lq, hp+lq
+# 三属性(4): atk+def+hp, atk+def+lq, atk+hp+lq, def+hp+lq
+# 四属性(1): atk+def+hp+lq
+
+# ── 黄阶功法（60 本）── 15 组合 × 4 变体 ──────────────────
+_GF_HUANG: list[GongfaDef] = [
+    # 单攻 ×4
+    _gf("gf_h_a01", "烈阳拳", 0, 25, 0, 0, 0, "以烈阳之力催动拳法", 200, 0, 1000),
+    _gf("gf_h_a02", "劈风掌", 0, 22, 0, 0, 0, "掌风如刃劈开空气", 200, 0, 1100),
+    _gf("gf_h_a03", "碎石指", 0, 20, 0, 0, 0, "指力惊人可碎顽石", 200, 0, 1000),
+    _gf("gf_h_a04", "奔雷腿", 0, 18, 0, 0, 0, "腿法迅捷如奔雷", 200, 0, 1200),
+    # 单防 ×4
+    _gf("gf_h_d01", "铁壁功", 0, 0, 25, 0, 0, "修炼铜皮铁骨之法", 200, 0, 1000),
+    _gf("gf_h_d02", "金钟罩", 0, 0, 22, 0, 0, "体表凝聚金钟护体", 200, 0, 1100),
+    _gf("gf_h_d03", "磐石诀", 0, 0, 20, 0, 0, "身坚如磐石不动", 200, 0, 1000),
+    _gf("gf_h_d04", "龟甲术", 0, 0, 18, 0, 0, "效法玄龟防御之术", 200, 0, 1200),
+    # 单血 ×4
+    _gf("gf_h_h01", "长春功", 0, 0, 0, 25, 0, "温养身体恢复气血", 200, 0, 1000),
+    _gf("gf_h_h02", "续命诀", 0, 0, 0, 22, 0, "续命回春之法", 200, 0, 1100),
+    _gf("gf_h_h03", "活血散", 0, 0, 0, 20, 0, "活血化瘀调理内伤", 200, 0, 1000),
+    _gf("gf_h_h04", "回春术", 0, 0, 0, 18, 0, "春风化雨修复肉身", 200, 0, 1200),
+    # 单灵 ×4
+    _gf("gf_h_l01", "聚灵功", 0, 0, 0, 0, 25, "汇聚灵气充盈经脉", 200, 0, 1000),
+    _gf("gf_h_l02", "引气诀", 0, 0, 0, 0, 22, "引导灵气归于丹田", 200, 0, 1100),
+    _gf("gf_h_l03", "蓄灵术", 0, 0, 0, 0, 20, "蓄积灵气以备不时", 200, 0, 1000),
+    _gf("gf_h_l04", "养灵法", 0, 0, 0, 0, 18, "温养灵气缓缓恢复", 200, 0, 1200),
+    # 攻防 ×4
+    _gf("gf_h_ad01", "刚柔并济", 0, 18, 15, 0, 0, "刚猛与柔韧交替", 200, 0, 1300),
+    _gf("gf_h_ad02", "攻守兼备", 0, 15, 18, 0, 0, "攻中带守守中有攻", 200, 0, 1300),
+    _gf("gf_h_ad03", "虎鹤双形", 0, 20, 15, 0, 0, "虎形攻鹤形守", 200, 0, 1400),
+    _gf("gf_h_ad04", "龙蛇功", 0, 16, 16, 0, 0, "龙蛇之力兼攻兼守", 200, 0, 1200),
+    # 攻血 ×4
+    _gf("gf_h_ah01", "战意凝血", 0, 18, 0, 15, 0, "战意愈强气血愈旺", 200, 0, 1300),
+    _gf("gf_h_ah02", "血战之法", 0, 15, 0, 18, 0, "越战越勇气血翻涌", 200, 0, 1300),
+    _gf("gf_h_ah03", "猛虎吞天", 0, 20, 0, 15, 0, "虎啸生风气血激荡", 200, 0, 1400),
+    _gf("gf_h_ah04", "赤焰拳", 0, 16, 0, 16, 0, "赤焰燃身回复气血", 200, 0, 1200),
+    # 攻灵 ×4
+    _gf("gf_h_al01", "灵攻诀", 0, 18, 0, 0, 15, "以灵气催动攻击", 200, 0, 1300),
+    _gf("gf_h_al02", "破灵拳", 0, 15, 0, 0, 18, "拳势中蕴含灵力", 200, 0, 1300),
+    _gf("gf_h_al03", "灵刃术", 0, 20, 0, 0, 15, "凝聚灵气为刃出击", 200, 0, 1400),
+    _gf("gf_h_al04", "御灵攻", 0, 16, 0, 0, 16, "驾御灵气进攻敌手", 200, 0, 1200),
+    # 防血 ×4
+    _gf("gf_h_dh01", "铁甲回春", 0, 0, 18, 15, 0, "铁甲护身回春养血", 200, 0, 1300),
+    _gf("gf_h_dh02", "金身续命", 0, 0, 15, 18, 0, "金身不坏续命回春", 200, 0, 1300),
+    _gf("gf_h_dh03", "玄武功", 0, 0, 20, 15, 0, "玄武镇守回复气血", 200, 0, 1400),
+    _gf("gf_h_dh04", "坚甲养身", 0, 0, 16, 16, 0, "坚甲护体养身固本", 200, 0, 1200),
+    # 防灵 ×4
+    _gf("gf_h_dl01", "灵盾术", 0, 0, 18, 0, 15, "灵气凝盾抵御攻击", 200, 0, 1300),
+    _gf("gf_h_dl02", "护灵功", 0, 0, 15, 0, 18, "护体之余滋养灵气", 200, 0, 1300),
+    _gf("gf_h_dl03", "灵甲诀", 0, 0, 20, 0, 15, "灵甲凝聚防御极高", 200, 0, 1400),
+    _gf("gf_h_dl04", "蓄灵防", 0, 0, 16, 0, 16, "蓄灵护体两不相误", 200, 0, 1200),
+    # 血灵 ×4
+    _gf("gf_h_hl01", "生生不息", 0, 0, 0, 18, 15, "气血灵力相生不息", 200, 0, 1300),
+    _gf("gf_h_hl02", "灵血双修", 0, 0, 0, 15, 18, "灵血同修相辅相成", 200, 0, 1300),
+    _gf("gf_h_hl03", "回灵养血", 0, 0, 0, 20, 15, "回灵养血双管齐下", 200, 0, 1400),
+    _gf("gf_h_hl04", "灵血诀", 0, 0, 0, 16, 16, "灵气与气血相互转化", 200, 0, 1200),
+    # 攻防血 ×4
+    _gf("gf_h_adh01", "三才功", 0, 15, 15, 15, 0, "天地人三才合一", 200, 0, 1500),
+    _gf("gf_h_adh02", "战场生存", 0, 18, 15, 15, 0, "战场上攻守兼顾", 200, 0, 1600),
+    _gf("gf_h_adh03", "铁血战法", 0, 15, 18, 15, 0, "铁血交融战意高涨", 200, 0, 1600),
+    _gf("gf_h_adh04", "龙虎回春", 0, 15, 15, 18, 0, "龙虎之力滋养气血", 200, 0, 1600),
+    # 攻防灵 ×4
+    _gf("gf_h_adl01", "灵战功", 0, 15, 15, 0, 15, "灵气强化攻防", 200, 0, 1500),
+    _gf("gf_h_adl02", "灵武合一", 0, 18, 15, 0, 15, "灵力与武技合一", 200, 0, 1600),
+    _gf("gf_h_adl03", "御灵护体", 0, 15, 18, 0, 15, "御灵之力强化防御", 200, 0, 1600),
+    _gf("gf_h_adl04", "灵攻灵守", 0, 15, 15, 0, 18, "灵力攻守一体", 200, 0, 1600),
+    # 攻血灵 ×4
+    _gf("gf_h_ahl01", "血灵攻", 0, 15, 0, 15, 15, "气血灵力催动攻击", 200, 0, 1500),
+    _gf("gf_h_ahl02", "战灵养血", 0, 18, 0, 15, 15, "以战养灵以灵养血", 200, 0, 1600),
+    _gf("gf_h_ahl03", "烈焰涅槃", 0, 15, 0, 18, 15, "烈焰焚身涅槃重生", 200, 0, 1600),
+    _gf("gf_h_ahl04", "攻灵双修", 0, 15, 0, 15, 18, "攻击与灵力同修", 200, 0, 1600),
+    # 防血灵 ×4
+    _gf("gf_h_dhl01", "万防之体", 0, 0, 15, 15, 15, "全面防御恢复之法", 200, 0, 1500),
+    _gf("gf_h_dhl02", "铁壁回灵", 0, 0, 18, 15, 15, "铁壁防御灵力回转", 200, 0, 1600),
+    _gf("gf_h_dhl03", "续命养灵", 0, 0, 15, 18, 15, "续命回春灵力充盈", 200, 0, 1600),
+    _gf("gf_h_dhl04", "护体蓄灵", 0, 0, 15, 15, 18, "护体之余蓄积灵气", 200, 0, 1600),
+    # 四属性 ×4
+    _gf("gf_h_all01", "太极功", 0, 15, 15, 15, 15, "阴阳调和四象归一", 200, 0, 2000),
+    _gf("gf_h_all02", "混元初功", 0, 18, 16, 16, 16, "混元之气初入门径", 200, 0, 2000),
+    _gf("gf_h_all03", "五行基功", 0, 16, 18, 16, 16, "五行之力均衡修炼", 200, 0, 2000),
+    _gf("gf_h_all04", "均衡之道", 0, 16, 16, 18, 16, "均衡发展面面俱到", 200, 0, 2000),
+]
+
+# ── 玄阶功法（45 本）── 15 组合 × 3 变体 ──────────────────
+_GF_XUAN: list[GongfaDef] = [
+    # 单攻 ×3
+    _gf("gf_x_a01", "落日斩", 1, 70, 0, 0, 0, "日落西山斩杀敌手", 500, 0, 3000),
+    _gf("gf_x_a02", "穿云掌", 1, 60, 0, 0, 0, "掌力穿云破雾", 500, 0, 3500),
+    _gf("gf_x_a03", "惊雷指", 1, 55, 0, 0, 0, "指尖蕴含雷电之力", 500, 0, 4000),
+    # 单防 ×3
+    _gf("gf_x_d01", "玄铁甲", 1, 0, 70, 0, 0, "玄铁凝聚不可破", 500, 0, 3000),
+    _gf("gf_x_d02", "天罡护体", 1, 0, 60, 0, 0, "天罡正气护体周全", 500, 0, 3500),
+    _gf("gf_x_d03", "金身诀", 1, 0, 55, 0, 0, "金身不坏坚如磐石", 500, 0, 4000),
+    # 单血 ×3
+    _gf("gf_x_h01", "九转还阳", 1, 0, 0, 70, 0, "九转还阳恢复气血", 500, 0, 3000),
+    _gf("gf_x_h02", "大还丹法", 1, 0, 0, 60, 0, "修炼大还丹之法", 500, 0, 3500),
+    _gf("gf_x_h03", "造化回春", 1, 0, 0, 55, 0, "造化之力回春养血", 500, 0, 4000),
+    # 单灵 ×3
+    _gf("gf_x_l01", "天灵诀", 1, 0, 0, 0, 70, "天地灵气汇聚一身", 500, 0, 3000),
+    _gf("gf_x_l02", "灵脉贯通", 1, 0, 0, 0, 60, "灵脉贯通灵力奔涌", 500, 0, 3500),
+    _gf("gf_x_l03", "蓄灵大法", 1, 0, 0, 0, 55, "蓄积天地灵气之大法", 500, 0, 4000),
+    # 攻防 ×3
+    _gf("gf_x_ad01", "阴阳双剑", 1, 50, 40, 0, 0, "阴阳剑气攻守一体", 500, 0, 4500),
+    _gf("gf_x_ad02", "天地双极", 1, 45, 45, 0, 0, "天地两极力量平衡", 500, 0, 4500),
+    _gf("gf_x_ad03", "矛盾合一", 1, 55, 40, 0, 0, "矛与盾合而为一", 500, 0, 5000),
+    # 攻血 ×3
+    _gf("gf_x_ah01", "血战八方", 1, 50, 0, 40, 0, "越战气血越旺盛", 500, 0, 4500),
+    _gf("gf_x_ah02", "不灭战魂", 1, 45, 0, 45, 0, "战魂不灭气血长存", 500, 0, 4500),
+    _gf("gf_x_ah03", "浴血奋战", 1, 55, 0, 40, 0, "浴血之中愈战愈强", 500, 0, 5000),
+    # 攻灵 ×3
+    _gf("gf_x_al01", "灵刃破空", 1, 50, 0, 0, 40, "灵气凝刃破空而出", 500, 0, 4500),
+    _gf("gf_x_al02", "御灵之击", 1, 45, 0, 0, 45, "灵力催动毁灭一击", 500, 0, 4500),
+    _gf("gf_x_al03", "风雷灵攻", 1, 55, 0, 0, 40, "风雷灵力融合攻击", 500, 0, 5000),
+    # 防血 ×3
+    _gf("gf_x_dh01", "不动如山", 1, 0, 50, 40, 0, "稳如泰山气血充盈", 500, 0, 4500),
+    _gf("gf_x_dh02", "铁血金刚", 1, 0, 45, 45, 0, "金刚护体铁血不屈", 500, 0, 4500),
+    _gf("gf_x_dh03", "神龟吐纳", 1, 0, 55, 40, 0, "神龟吐纳养身固本", 500, 0, 5000),
+    # 防灵 ×3
+    _gf("gf_x_dl01", "灵盾天成", 1, 0, 50, 0, 40, "天成灵盾坚不可摧", 500, 0, 4500),
+    _gf("gf_x_dl02", "护灵大法", 1, 0, 45, 0, 45, "大法护灵防御无双", 500, 0, 4500),
+    _gf("gf_x_dl03", "灵壁术", 1, 0, 55, 0, 40, "灵力凝壁抵挡万法", 500, 0, 5000),
+    # 血灵 ×3
+    _gf("gf_x_hl01", "双修大法", 1, 0, 0, 50, 40, "气血灵力双修大法", 500, 0, 4500),
+    _gf("gf_x_hl02", "灵血交融", 1, 0, 0, 45, 45, "灵力与气血互相滋养", 500, 0, 4500),
+    _gf("gf_x_hl03", "凤凰涅槃", 1, 0, 0, 55, 40, "凤凰浴火重生之法", 500, 0, 5000),
+    # 攻防血 ×3
+    _gf("gf_x_adh01", "天人三合", 1, 40, 40, 40, 0, "天人合一三才归位", 500, 0, 5500),
+    _gf("gf_x_adh02", "无畏战法", 1, 50, 40, 40, 0, "无畏勇士攻守兼顾", 500, 0, 5500),
+    _gf("gf_x_adh03", "百战不殆", 1, 40, 50, 40, 0, "百战老兵从容不迫", 500, 0, 6000),
+    # 攻防灵 ×3
+    _gf("gf_x_adl01", "灵武双全", 1, 40, 40, 0, 40, "灵力与武技双修", 500, 0, 5500),
+    _gf("gf_x_adl02", "灵攻灵守", 1, 50, 40, 0, 40, "灵力催动攻守之道", 500, 0, 5500),
+    _gf("gf_x_adl03", "御灵之道", 1, 40, 50, 0, 40, "驾御灵力精通战法", 500, 0, 6000),
+    # 攻血灵 ×3
+    _gf("gf_x_ahl01", "战灵回血", 1, 40, 0, 40, 40, "战中灵气回血", 500, 0, 5500),
+    _gf("gf_x_ahl02", "猛攻续灵", 1, 50, 0, 40, 40, "猛攻之余灵力续命", 500, 0, 5500),
+    _gf("gf_x_ahl03", "灵血攻势", 1, 40, 0, 50, 40, "灵血涌动攻势如潮", 500, 0, 6000),
+    # 防血灵 ×3
+    _gf("gf_x_dhl01", "万全之策", 1, 0, 40, 40, 40, "防御回复面面俱到", 500, 0, 5500),
+    _gf("gf_x_dhl02", "固若金汤", 1, 0, 50, 40, 40, "固若金汤守护周全", 500, 0, 5500),
+    _gf("gf_x_dhl03", "灵龟之盾", 1, 0, 40, 50, 40, "灵龟护身气血灵力充盈", 500, 0, 6000),
+    # 四属性 ×3
+    _gf("gf_x_all01", "玄门正功", 1, 40, 40, 40, 40, "玄门正宗四象归位", 500, 0, 6000),
+    _gf("gf_x_all02", "万象归宗", 1, 45, 45, 40, 40, "万象归宗均衡发展", 500, 0, 6000),
+    _gf("gf_x_all03", "太清真功", 1, 40, 40, 45, 45, "太清道人所传真功", 500, 0, 6000),
+]
+
+# ── 地阶功法（30 本）── 15 组合 × 2 变体 ──────────────────
+_GF_DI: list[GongfaDef] = [
+    # 单攻 ×2
+    _gf("gf_d_a01", "天崩地裂斩", 2, 180, 0, 0, 0, "一斩之下天崩地裂", 1500, 50, 10000),
+    _gf("gf_d_a02", "灭世拳", 2, 160, 0, 0, 0, "拳势足以灭世", 1500, 60, 12000),
+    # 单防 ×2
+    _gf("gf_d_d01", "不灭金身", 2, 0, 180, 0, 0, "修成不灭金身", 1500, 50, 10000),
+    _gf("gf_d_d02", "万劫护体", 2, 0, 160, 0, 0, "万劫之下护体不破", 1500, 60, 12000),
+    # 单血 ×2
+    _gf("gf_d_h01", "不死天功", 2, 0, 0, 180, 0, "不死之身天赐神功", 1500, 50, 10000),
+    _gf("gf_d_h02", "造化回生", 2, 0, 0, 160, 0, "造化之力起死回生", 1500, 60, 12000),
+    # 单灵 ×2
+    _gf("gf_d_l01", "天地灵引", 2, 0, 0, 0, 180, "引天地灵气入体", 1500, 50, 10000),
+    _gf("gf_d_l02", "灵脉至尊", 2, 0, 0, 0, 160, "灵脉之力汇于至尊", 1500, 60, 12000),
+    # 攻防 ×2
+    _gf("gf_d_ad01", "乾坤双极", 2, 130, 100, 0, 0, "乾坤两极力量交汇", 1500, 70, 14000),
+    _gf("gf_d_ad02", "太极阴阳", 2, 110, 120, 0, 0, "阴阳交替攻守自如", 1500, 70, 14000),
+    # 攻血 ×2
+    _gf("gf_d_ah01", "血战苍穹", 2, 130, 0, 100, 0, "血战苍穹意志不屈", 1500, 70, 14000),
+    _gf("gf_d_ah02", "战魂不灭", 2, 110, 0, 120, 0, "战魂不灭生生不息", 1500, 70, 14000),
+    # 攻灵 ×2
+    _gf("gf_d_al01", "灵破万法", 2, 130, 0, 0, 100, "灵力催动破万法", 1500, 80, 15000),
+    _gf("gf_d_al02", "天灵攻势", 2, 110, 0, 0, 120, "天灵之力攻无不克", 1500, 80, 15000),
+    # 防血 ×2
+    _gf("gf_d_dh01", "金刚不坏", 2, 0, 130, 100, 0, "金刚之体坚不可摧", 1500, 70, 14000),
+    _gf("gf_d_dh02", "万古长青", 2, 0, 110, 120, 0, "万古长青不朽之身", 1500, 70, 14000),
+    # 防灵 ×2
+    _gf("gf_d_dl01", "灵壁万钧", 2, 0, 130, 0, 100, "灵力凝壁重若万钧", 1500, 80, 15000),
+    _gf("gf_d_dl02", "玄灵护法", 2, 0, 110, 0, 120, "玄灵护法抵挡万邪", 1500, 80, 15000),
+    # 血灵 ×2
+    _gf("gf_d_hl01", "灵血同源", 2, 0, 0, 130, 100, "灵血同源滋养肉身", 1500, 80, 15000),
+    _gf("gf_d_hl02", "双修至尊", 2, 0, 0, 110, 120, "气血灵力双修至尊", 1500, 80, 15000),
+    # 攻防血 ×2
+    _gf("gf_d_adh01", "三才大阵", 2, 110, 100, 100, 0, "天地人三才大阵", 1500, 90, 17000),
+    _gf("gf_d_adh02", "无极战法", 2, 120, 110, 100, 0, "无极之力战法通天", 1500, 90, 17000),
+    # 攻防灵 ×2
+    _gf("gf_d_adl01", "灵武至尊", 2, 110, 100, 0, 100, "灵武双修至尊之境", 1500, 90, 17000),
+    _gf("gf_d_adl02", "御灵战神", 2, 120, 110, 0, 100, "御灵战神攻守无双", 1500, 90, 17000),
+    # 攻血灵 ×2
+    _gf("gf_d_ahl01", "天战回灵", 2, 110, 0, 100, 100, "天战之中灵力回转", 1500, 90, 18000),
+    _gf("gf_d_ahl02", "破军灵血", 2, 120, 0, 110, 100, "破军之势灵血交融", 1500, 90, 18000),
+    # 防血灵 ×2
+    _gf("gf_d_dhl01", "万法归宗", 2, 0, 110, 100, 100, "万法归宗全面防御", 1500, 100, 18000),
+    _gf("gf_d_dhl02", "天盾灵壁", 2, 0, 120, 110, 100, "天盾灵壁坚不可摧", 1500, 100, 18000),
+    # 四属性 ×2
+    _gf("gf_d_all01", "天地造化功", 2, 110, 100, 100, 100, "天地造化均衡之道", 1500, 100, 20000),
+    _gf("gf_d_all02", "混沌真功", 2, 120, 110, 110, 100, "混沌之力真功大成", 1500, 100, 20000),
+]
+
+# ── 天阶功法（15 本）── 15 组合 × 1 变体 ──────────────────
+_GF_TIAN: list[GongfaDef] = [
+    _gf("gf_t_a01", "鸿蒙灭世", 3, 400, 0, 0, 0, "鸿蒙之力灭世无敌", 4000, 200, 30000),
+    _gf("gf_t_d01", "太古神甲", 3, 0, 400, 0, 0, "太古神甲万法不侵", 4000, 200, 30000),
+    _gf("gf_t_h01", "不死仙体", 3, 0, 0, 400, 0, "修成不死仙体长生不灭", 4000, 200, 30000),
+    _gf("gf_t_l01", "万灵归宗", 3, 0, 0, 0, 400, "万灵之气归于一身", 4000, 200, 30000),
+    _gf("gf_t_ad01", "乾坤大挪移", 3, 300, 250, 0, 0, "乾坤逆转攻守无敌", 4000, 250, 40000),
+    _gf("gf_t_ah01", "血神战法", 3, 300, 0, 250, 0, "血神降世战力滔天", 4000, 250, 40000),
+    _gf("gf_t_al01", "灵主天诀", 3, 300, 0, 0, 250, "灵力之主天诀无上", 4000, 300, 45000),
+    _gf("gf_t_dh01", "万劫不灭体", 3, 0, 300, 250, 0, "万劫不灭铁血长存", 4000, 250, 40000),
+    _gf("gf_t_dl01", "天灵护法", 3, 0, 300, 0, 250, "天灵护法抵挡万邪", 4000, 300, 45000),
+    _gf("gf_t_hl01", "造化之源", 3, 0, 0, 300, 250, "造化之源气血灵力无穷", 4000, 300, 45000),
+    _gf("gf_t_adh01", "太上三才", 3, 280, 260, 260, 0, "太上三才天地人合一", 4000, 350, 50000),
+    _gf("gf_t_adl01", "天元灵战", 3, 280, 260, 0, 260, "天元之力灵战无双", 4000, 350, 50000),
+    _gf("gf_t_ahl01", "灵血战神", 3, 280, 0, 260, 260, "灵血交融战神降临", 4000, 400, 55000),
+    _gf("gf_t_dhl01", "万法归真", 3, 0, 280, 260, 260, "万法归真不灭之体", 4000, 400, 55000),
+    _gf("gf_t_all01", "鸿蒙大道", 3, 280, 260, 260, 260, "鸿蒙大道万法归一", 4000, 500, 60000),
+]
+
+# 功法注册表
+GONGFA_REGISTRY: dict[str, GongfaDef] = {}
+for _gf_list in (_GF_HUANG, _GF_XUAN, _GF_DI, _GF_TIAN):
+    for _g in _gf_list:
+        GONGFA_REGISTRY[_g.gongfa_id] = _g
+
+
+GONGFA_SCROLL_PREFIX = "gongfa_scroll_"
+
+
+def get_gongfa_scroll_id(gongfa_id: str) -> str:
+    """将功法ID转换为卷轴物品ID。"""
+    return f"{GONGFA_SCROLL_PREFIX}{gongfa_id}"
+
+
+def parse_gongfa_scroll_id(item_id: str) -> str | None:
+    """从卷轴物品ID解析功法ID。"""
+    if not item_id.startswith(GONGFA_SCROLL_PREFIX):
+        return None
+    return item_id[len(GONGFA_SCROLL_PREFIX):] or None
+
+
+def _refresh_gongfa_scroll_items():
+    """根据当前 GONGFA_REGISTRY 重新生成功法卷轴定义。"""
+    to_remove = [item_id for item_id in ITEM_REGISTRY if item_id.startswith(GONGFA_SCROLL_PREFIX)]
+    for item_id in to_remove:
+        ITEM_REGISTRY.pop(item_id, None)
+
+    for gf in GONGFA_REGISTRY.values():
+        scroll_id = get_gongfa_scroll_id(gf.gongfa_id)
+        tier_name = GONGFA_TIER_NAMES.get(gf.tier, "未知")
+        parts = []
+        if gf.attack_bonus:
+            parts.append(f"攻+{gf.attack_bonus}")
+        if gf.defense_bonus:
+            parts.append(f"防+{gf.defense_bonus}")
+        if gf.hp_regen:
+            parts.append(f"血+{gf.hp_regen}")
+        if gf.lingqi_regen:
+            parts.append(f"灵+{gf.lingqi_regen}")
+        stat_str = "/".join(parts) if parts else "无加成"
+        ITEM_REGISTRY[scroll_id] = ItemDef(
+            item_id=scroll_id,
+            name=f"{gf.name}卷轴",
+            item_type="consumable",
+            description=f"{tier_name}功法【{gf.name}】卷轴（{stat_str}）",
+            effect={"learn_gongfa": gf.gongfa_id},
+        )
+
+
+def set_gongfa_registry(gongfas: dict[str, GongfaDef]):
+    """替换功法注册表（供数据库加载后同步到运行时）。"""
+    GONGFA_REGISTRY.clear()
+    GONGFA_REGISTRY.update(dict(gongfas))
+    _refresh_gongfa_scroll_items()
+
+
+def can_learn_gongfa() -> bool:
+    """装备无限制，任何境界都能装备任何品阶的功法。"""
+    return True
+
+
+def can_cultivate_gongfa(realm: int, tier: int) -> bool:
+    """检查境界是否满足修炼熟练度的要求。"""
+    min_realm = GONGFA_TIER_REALM_REQ.get(tier, 0)
+    return realm >= min_realm
+
+
+def get_gongfa_bonus(gongfa_id: str, mastery: int, realm: int) -> dict:
+    """计算功法加成（含境界缩放和精通倍率）。
+
+    公式：effective = base * (1 + 0.1 * realm) * MASTERY_MULTIPLIERS[mastery]
+
+    Returns:
+        {attack_bonus, defense_bonus, hp_regen, lingqi_regen, mastery_name}
+    """
+    gf = GONGFA_REGISTRY.get(gongfa_id)
+    if not gf:
+        return {
+            "attack_bonus": 0, "defense_bonus": 0,
+            "hp_regen": 0, "lingqi_regen": 0,
+            "mastery_name": "",
+        }
+    realm_scale = 1.0 + 0.1 * realm
+    mastery_mult = MASTERY_MULTIPLIERS[min(mastery, MASTERY_MAX)]
+    factor = realm_scale * mastery_mult
+    return {
+        "attack_bonus": int(gf.attack_bonus * factor),
+        "defense_bonus": int(gf.defense_bonus * factor),
+        "hp_regen": int(gf.hp_regen * factor),
+        "lingqi_regen": int(gf.lingqi_regen * factor),
+        "mastery_name": MASTERY_LEVELS[min(mastery, MASTERY_MAX)],
+    }
+
+
+def get_total_gongfa_bonus(player) -> dict:
+    """汇总 3 个槽位的功法效果。"""
+    total = {"attack_bonus": 0, "defense_bonus": 0, "hp_regen": 0, "lingqi_regen": 0}
+    for slot in ("gongfa_1", "gongfa_2", "gongfa_3"):
+        gongfa_id = getattr(player, slot, "无")
+        if not gongfa_id or gongfa_id == "无":
+            continue
+        mastery = getattr(player, f"{slot}_mastery", 0)
+        bonus = get_gongfa_bonus(gongfa_id, mastery, player.realm)
+        total["attack_bonus"] += bonus["attack_bonus"]
+        total["defense_bonus"] += bonus["defense_bonus"]
+        total["hp_regen"] += bonus["hp_regen"]
+        total["lingqi_regen"] += bonus["lingqi_regen"]
+    return total
+
+
+_refresh_gongfa_scroll_items()
+
+
 def has_sub_realm(realm: int) -> bool:
     """该大境界是否有小境界。"""
     cfg = REALM_CONFIG.get(realm)
     return bool(cfg and cfg.get("has_sub_realm"))
 
 
+def is_high_realm(realm: int) -> bool:
+    """是否为高阶大境界（化神~大乘，4层小境界）。"""
+    cfg = REALM_CONFIG.get(realm)
+    return bool(cfg and cfg.get("high_realm"))
+
+
+def get_max_sub_realm(realm: int) -> int:
+    """获取该大境界的最大小境界索引。"""
+    if is_high_realm(realm):
+        return MAX_HIGH_SUB_REALM
+    if has_sub_realm(realm):
+        return MAX_SUB_REALM
+    return 0
+
+
+def get_sub_realm_dao_yun_cost(realm: int, sub_realm: int) -> int:
+    """获取从 sub_realm 升到 sub_realm+1 所需道韵（仅化神~大乘）。
+    化神：500/800/1000/1200，合虚：2400/2600/2800/3000，
+    渡劫：6000/6400/6800/7200，大乘：14400/15200/16000/16800。"""
+    if not is_high_realm(realm):
+        return 0
+
+    realm_offset = realm - RealmLevel.DEITY_TRANSFORM
+    costs_map = {
+        0: [500, 800, 1000, 1200],      # 化神
+        1: [2400, 2600, 2800, 3000],    # 合虚
+        2: [6000, 6400, 6800, 7200],    # 渡劫
+        3: [14400, 15200, 16000, 16800] # 大乘
+    }
+    costs = costs_map.get(realm_offset, [])
+    return costs[sub_realm] if sub_realm < len(costs) else 0
+
+
+def get_breakthrough_dao_yun_cost(realm: int) -> int:
+    """获取从 realm 突破到 realm+1 所需道韵（仅化神~渡劫）。"""
+    if not is_high_realm(realm) or realm >= RealmLevel.MAHAYANA:
+        return 0
+    return get_sub_realm_dao_yun_cost(realm, 3)
+
+
 def get_realm_name(realm: int, sub_realm: int = 0) -> str:
-    """获取完整境界名称，如 '练气期·三层'。"""
+    """获取完整境界名称，如 '练气期·三层' 或 '化神期·中期'。"""
     cfg = REALM_CONFIG.get(realm)
     if not cfg:
         return "未知"
     name = cfg["name"]
-    if cfg.get("has_sub_realm") and 0 <= sub_realm <= MAX_SUB_REALM:
-        name += "·" + SUB_REALM_NAMES[sub_realm]
+    if cfg.get("has_sub_realm"):
+        if cfg.get("high_realm"):
+            if 0 <= sub_realm <= MAX_HIGH_SUB_REALM:
+                name += "·" + HIGH_SUB_REALM_NAMES[sub_realm]
+        elif 0 <= sub_realm <= MAX_SUB_REALM:
+            name += "·" + SUB_REALM_NAMES[sub_realm]
     return name
+
+
+def get_max_lingqi_by_realm(realm: int, sub_realm: int = 0) -> int:
+    """根据境界与小境界计算灵气上限。"""
+    cfg = REALM_CONFIG.get(realm, {})
+    base_lingqi = int(cfg.get("base_lingqi", 50))
+    if not has_sub_realm(realm):
+        return base_lingqi
+    max_sr = get_max_sub_realm(realm)
+    sub_realm = max(0, min(max_sr, int(sub_realm)))
+    lingqi_step = max(1, int(base_lingqi * 0.08))
+    return base_lingqi + lingqi_step * sub_realm
+
+
+def get_realm_base_stats(realm: int, sub_realm: int = 0) -> dict[str, int]:
+    """根据境界与小境界计算基础属性。"""
+    cfg = REALM_CONFIG.get(realm, {})
+    base_hp = int(cfg.get("base_hp", 100))
+    base_attack = int(cfg.get("base_attack", 10))
+    base_defense = int(cfg.get("base_defense", 5))
+    base_lingqi = int(cfg.get("base_lingqi", 50))
+    if not has_sub_realm(realm):
+        return {
+            "max_hp": base_hp,
+            "attack": base_attack,
+            "defense": base_defense,
+            "max_lingqi": base_lingqi,
+        }
+    max_sr = get_max_sub_realm(realm)
+    sub_realm = max(0, min(max_sr, int(sub_realm)))
+    hp_step = int(base_hp * 0.08)
+    atk_step = int(base_attack * 0.06)
+    def_step = int(base_defense * 0.06)
+    lingqi_step = max(1, int(base_lingqi * 0.08))
+    return {
+        "max_hp": base_hp + hp_step * sub_realm,
+        "attack": base_attack + atk_step * sub_realm,
+        "defense": base_defense + def_step * sub_realm,
+        "max_lingqi": base_lingqi + lingqi_step * sub_realm,
+    }
+
+
+def get_player_base_stats(player) -> dict[str, int]:
+    """根据玩家当前境界与永久丹药加成计算基础属性。"""
+    stats = get_realm_base_stats(player.realm, player.sub_realm)
+    stats["max_hp"] += max(0, int(getattr(player, "permanent_max_hp_bonus", 0)))
+    stats["attack"] += max(0, int(getattr(player, "permanent_attack_bonus", 0)))
+    stats["defense"] += max(0, int(getattr(player, "permanent_defense_bonus", 0)))
+    stats["max_lingqi"] += max(0, int(getattr(player, "permanent_lingqi_bonus", 0)))
+    return stats
+
+
+def get_player_base_max_lingqi(player) -> int:
+    """根据玩家当前境界与永久灵气加成计算灵气上限。"""
+    return get_player_base_stats(player)["max_lingqi"]
+
+
+# ── 副本（历练）常量 ──────────────────────────────────────
+LAYER_PASS_RATES = [0.80, 0.72, 0.64, 0.56, 0.50]
+LAYER_REWARD_TYPES = ["spirit_stones", "equipment", "pills", "heart_method", "gongfa"]
+LAYER_NAMES = ["灵石秘境", "兵器洞府", "丹药福地", "心法秘阁", "功法圣殿"]
+DANGER_WEIGHTS = {"disaster": 80, "monster": 15, "enemy": 5}
+DISASTER_OUTCOMES = {"hp_damage": 90, "realm_drop": 7, "death": 3}
+FLEE_BASE_RATES = [0.70, 0.60, 0.50, 0.40, 0.30]
+# (概率, 属性比) — "realm_up" 表示高1大境界
+ENEMY_TIERS: list[tuple] = [(0.90, 0.70), (0.09, 1.50), (0.01, "realm_up")]
+COMBAT_MAX_ROUNDS = 30
+PVP_ROUND_TIMEOUT = 30  # 秒

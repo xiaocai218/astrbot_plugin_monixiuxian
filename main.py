@@ -20,7 +20,7 @@ _MISSING = object()
 CMD_PREFIX = "修仙"
 
 
-@register("astrbot_plugin_xiuxian", "xiuxian-dev", "修仙文字RPG游戏，支持聊天指令和网页界面", "0.3.1")
+@register("astrbot_plugin_xiuxian", "xiuxian-dev", "修仙文字RPG游戏，支持聊天指令和网页界面", "0.3.4")
 class XiuxianPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -353,8 +353,7 @@ class XiuxianPlugin(Star):
         ("挂机 <分钟>", "挂机修炼(1~60分钟)"),
         ("结算", "领取挂机修炼收益"),
         ("取消挂机", "随时取消挂机并放弃本次收益"),
-        ("历练", "外出历练（有冷却）"),
-        ("历练场景", "查看历练场景列表"),
+        ("历练", "进入秘境副本历练"),
         ("突破", "尝试突破当前境界"),
         ("背包", "查看背包物品"),
         ("使用 <物品名>", "使用消耗品"),
@@ -474,33 +473,18 @@ class XiuxianPlugin(Star):
 
     @xiuxian_group.command("历练")
     async def do_adventure(self, event: AstrMessageEvent):
-        """外出历练。"""
+        """进入秘境副本历练。"""
         player_id = self._resolve_player_id(event)
         if not player_id:
             yield event.plain_result(f"你还未登录，请先 {self._cmd('登录 <密钥>')}")
             return
         result = await self._engine.adventure(player_id)
-        if result["success"]:
-            img_bytes = renderer.render_adventure(result)
-            img_path = self._render_image_path(img_bytes, "adventure")
-            if img_path:
-                yield event.image_result(img_path)
-                return
         yield event.plain_result(result["message"])
 
     @xiuxian_group.command("历练场景")
     async def show_scenes(self, event: AstrMessageEvent):
-        """查看历练场景列表。"""
-        scenes = await self._engine.get_adventure_scenes()
-        if not scenes:
-            yield event.plain_result("暂无历练场景数据")
-            return
-        img_bytes = renderer.render_scenes(scenes)
-        img_path = self._render_image_path(img_bytes, "scenes")
-        if not img_path:
-            yield event.plain_result("场景列表渲染失败")
-            return
-        yield event.image_result(img_path)
+        """提示旧版历练场景已停用。"""
+        yield event.plain_result("旧版历练场景已停用，历练现已改为 Web 端的秘境副本探索。")
 
     @xiuxian_group.command("突破")
     async def breakthrough(self, event: AstrMessageEvent):

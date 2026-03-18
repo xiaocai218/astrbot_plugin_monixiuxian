@@ -8,8 +8,12 @@ from .constants import (
     REALM_CONFIG, ITEM_REGISTRY, CHECKIN_PILL_WEIGHTS,
     HEART_METHOD_REGISTRY, HeartMethodQuality, get_heart_method_manual_id,
     EQUIPMENT_REGISTRY, EQUIPMENT_TIER_NAMES, EquipmentTier,
-    MAX_SUB_REALM, RealmLevel, has_sub_realm,
+    GONGFA_REGISTRY, GONGFA_TIER_NAMES, GongfaTier, MASTERY_LEVELS, MASTERY_MAX,
+    get_gongfa_scroll_id, get_total_gongfa_bonus, can_cultivate_gongfa,
+    get_player_base_max_lingqi, get_realm_base_stats,
+    RealmLevel, has_sub_realm,
     get_realm_name, get_equip_bonus, get_heart_method_bonus,
+    get_max_sub_realm,
 )
 from .inventory import add_item
 from .models import Player
@@ -26,6 +30,9 @@ async def attempt_adventure(player: Player, scene: dict, difficulty: str) -> dic
     """
     diff_labels = {"easy": "轻松", "normal": "正常", "hard": "困难"}
     diff_label = diff_labels.get(difficulty, "正常")
+
+    # 记录开始时是否满血
+    is_full_hp = player.hp >= player.max_hp
 
     enemy_realm = _resolve_enemy_realm(player.realm, difficulty)
     battle = _build_battle_context(player, enemy_realm, difficulty)
@@ -51,18 +58,21 @@ async def attempt_adventure(player: Player, scene: dict, difficulty: str) -> dic
         await _apply_victory_rewards(player, result, battle["enemy_scale"])
         return result
 
-    # 战败：依据战力差距决定受伤/跌境/死亡概率
-    if battle["power_ratio"] < 0.7:
-        lose_weights = [50, 49, 1]  # 受伤, 跌境, 死亡(1%)
-    elif battle["power_ratio"] < 0.9:
-        lose_weights = [60, 39, 1]
+    # 战败：满血开始则只受伤，否则正常判定
+    if is_full_hp:
+        lose_outcome = "injured"
     else:
-        lose_weights = [73, 26, 1]
-    lose_outcome = random.choices(
-        ["injured", "injured_realm_down", "death"],
-        weights=lose_weights,
-        k=1,
-    )[0]
+        if battle["power_ratio"] < 0.7:
+            lose_weights = [50, 49, 1]  # 受伤, 跌境, 死亡(1%)
+        elif battle["power_ratio"] < 0.9:
+            lose_weights = [60, 39, 1]
+        else:
+            lose_weights = [73, 26, 1]
+        lose_outcome = random.choices(
+            ["injured", "injured_realm_down", "death"],
+            weights=lose_weights,
+            k=1,
+        )[0]
     result["outcome"] = lose_outcome
     if lose_outcome == "injured":
         _apply_injured(player, result, battle["enemy_attack"])
@@ -90,10 +100,14 @@ def _resolve_enemy_realm(player_realm: int, difficulty: str) -> int:
 
 def _build_battle_context(player: Player, enemy_realm: int, difficulty: str) -> dict:
     """构建战斗上下文，输出胜率和敌方属性。"""
+    from .pills import get_effective_combat_stats
+
+    effective_stats = get_effective_combat_stats(player)
     equip_bonus = get_equip_bonus(player.weapon, player.armor)
     hm_bonus = get_heart_method_bonus(player.heart_method, player.heart_method_mastery)
-    player_atk = max(1, player.attack + equip_bonus["attack"] + hm_bonus["attack_bonus"])
-    player_def = max(1, player.defense + equip_bonus["defense"] + hm_bonus["defense_bonus"])
+    gf_bonus = get_total_gongfa_bonus(player)
+    player_atk = max(1, effective_stats["attack"] + equip_bonus["attack"] + hm_bonus["attack_bonus"] + gf_bonus["attack_bonus"])
+    player_def = max(1, effective_stats["defense"] + equip_bonus["defense"] + hm_bonus["defense_bonus"] + gf_bonus["defense_bonus"])
 
     enemy_cfg = REALM_CONFIG.get(enemy_realm, REALM_CONFIG[RealmLevel.QI_REFINING])
     diff_scale = {"easy": 0.9, "normal": 1.0, "hard": 1.12}.get(difficulty, 1.0)
@@ -104,7 +118,7 @@ def _build_battle_context(player: Player, enemy_realm: int, difficulty: str) -> 
     enemy_defense = max(1, int(enemy_cfg["base_defense"] * enemy_scale))
     enemy_hp = max(1, int(enemy_cfg["base_hp"] * (0.9 + (enemy_scale - 1.0) * 0.6)))
 
-    player_power = player_atk * 1.25 + player_def * 0.95 + player.hp * 0.08
+    player_power = player_atk * 1.25 + player_def * 0.95 + effective_stats["hp"] * 0.08
     enemy_power = enemy_attack * 1.2 + enemy_defense * 1.0 + enemy_hp * 0.08
     ratio = player_power / max(1.0, enemy_power)
 
@@ -172,6 +186,19 @@ async def _apply_victory_rewards(player: Player, result: dict, enemy_scale: floa
             f"心法秘籍 +【{hm_drop['manual_name']}】（{hm_drop['realm_name']}·普通）"
         )
 
+    gf_drop = await _apply_gongfa_drop(player)
+    if gf_drop:
+        result["gongfa_drop"] = gf_drop
+        reward_lines.append(
+            f"功法卷轴 +{gf_drop['tier_name']}【{gf_drop['name']}】"
+        )
+
+    # 功法熟练度 + HP/灵力战后回复
+    gf_mastery_msgs = _apply_gongfa_mastery(player)
+    gf_regen_msgs = _apply_gongfa_regen(player)
+    reward_lines.extend(gf_mastery_msgs)
+    reward_lines.extend(gf_regen_msgs)
+
     combo_desc = "+".join(["1"] * combo_size)
     result["outcome"] = "reward_combo"
     result["combo_size"] = combo_size
@@ -202,7 +229,21 @@ def _apply_exp(player: Player, enemy_scale: float) -> int:
 
 
 async def _apply_pill(player: Player) -> str:
-    """获得丹药。"""
+    """获得丹药（使用新丹药系统，历练掉落凡阶/黄阶）。"""
+    from .pills import (
+        pick_random_pill,
+    )
+    # 历练掉落：凡阶/黄阶，无垢概率极低
+    adventure_tier_weights = {0: 7000, 1: 3000}
+    adventure_grade_weights = {
+        0: {0: 7000, 1: 2900, 2: 100},
+        1: {0: 7000, 1: 2900, 2: 100},
+    }
+    pill = pick_random_pill(random.Random(), adventure_tier_weights, adventure_grade_weights)
+    if pill:
+        await add_item(player, pill.pill_id)
+        return pill.name
+    # fallback：旧丹药
     weighted_items = []
     for item_id, weight in CHECKIN_PILL_WEIGHTS:
         if item_id in ITEM_REGISTRY and int(weight) > 0:
@@ -268,16 +309,20 @@ async def _apply_heart_method_drop(player: Player, enemy_scale: float) -> dict |
 
 def _apply_injured(player: Player, result: dict, enemy_attack: int):
     """战败受伤，伤害受敌方攻击和玩家防御影响。"""
-    mitigation = 120 / (120 + max(1, player.defense))
+    from .pills import get_effective_combat_stats
+
+    effective_stats = get_effective_combat_stats(player)
+    mitigation = 120 / (120 + max(1, effective_stats["defense"]))
     damage = max(1, int(enemy_attack * random.uniform(0.85, 1.25) * mitigation))
-    damage = min(damage, max(1, int(player.max_hp * 0.65)))
-    player.hp = max(1, player.hp - damage)
+    damage = min(damage, max(1, int(effective_stats["max_hp"] * 0.65)))
+    new_effective_hp = max(1, effective_stats["hp"] - damage)
+    player.hp = max(1, min(player.max_hp, new_effective_hp - effective_stats["hp_delta"]))
     scene = result["scene_name"]
     cat = result["category"]
     result["damage"] = damage
     result["message"] = (
         f"在【{cat}·{scene}】中不敌强敌，受伤{damage}点，"
-        f"当前HP：{player.hp}/{player.max_hp}"
+        f"当前HP：{new_effective_hp}/{effective_stats['max_hp']}"
     )
 
 
@@ -291,13 +336,13 @@ def _drop_realm_steps(player: Player, steps: int) -> int:
                 player.sub_realm -= 1
             elif player.realm > RealmLevel.MORTAL:
                 player.realm -= 1
-                player.sub_realm = MAX_SUB_REALM if has_sub_realm(player.realm) else 0
+                player.sub_realm = get_max_sub_realm(player.realm) if has_sub_realm(player.realm) else 0
             else:
                 break
         else:
             if player.realm > RealmLevel.MORTAL:
                 player.realm -= 1
-                player.sub_realm = MAX_SUB_REALM if has_sub_realm(player.realm) else 0
+                player.sub_realm = get_max_sub_realm(player.realm) if has_sub_realm(player.realm) else 0
             else:
                 break
         dropped += 1
@@ -306,38 +351,28 @@ def _drop_realm_steps(player: Player, steps: int) -> int:
 
 def _rebuild_stats_by_realm(player: Player):
     """根据当前(大境界/小境界)重建基础属性。"""
-    cfg = REALM_CONFIG.get(player.realm, {})
-    base_hp = int(cfg.get("base_hp", player.max_hp))
-    base_atk = int(cfg.get("base_attack", player.attack))
-    base_def = int(cfg.get("base_defense", player.defense))
-    base_lingqi = int(cfg.get("base_lingqi", player.lingqi))
-
     if has_sub_realm(player.realm):
-        player.sub_realm = max(0, min(MAX_SUB_REALM, int(player.sub_realm)))
-        hp_step = int(base_hp * 0.08)
-        atk_step = int(base_atk * 0.06)
-        def_step = int(base_def * 0.06)
-        lingqi_step = max(1, int(base_lingqi * 0.08))
-        player.max_hp = base_hp + hp_step * player.sub_realm
-        player.attack = base_atk + atk_step * player.sub_realm
-        player.defense = base_def + def_step * player.sub_realm
-        player.lingqi = base_lingqi + lingqi_step * player.sub_realm
+        player.sub_realm = max(0, min(get_max_sub_realm(player.realm), int(player.sub_realm)))
     else:
         player.sub_realm = 0
-        player.max_hp = base_hp
-        player.attack = base_atk
-        player.defense = base_def
-        player.lingqi = base_lingqi
-
+    base_stats = get_realm_base_stats(player.realm, player.sub_realm)
+    player.max_hp = base_stats["max_hp"] + getattr(player, "permanent_max_hp_bonus", 0)
+    player.attack = base_stats["attack"] + getattr(player, "permanent_attack_bonus", 0)
+    player.defense = base_stats["defense"] + getattr(player, "permanent_defense_bonus", 0)
+    player.lingqi = base_stats["max_lingqi"] + getattr(player, "permanent_lingqi_bonus", 0)
     player.hp = min(player.hp, player.max_hp)
 
 
 def _apply_injured_realm_down(player: Player, result: dict, enemy_attack: int):
     """受伤 + 必定跌境（触发则一定掉境界）。"""
-    mitigation = 100 / (100 + max(1, player.defense))
+    from .pills import get_effective_combat_stats
+
+    effective_stats = get_effective_combat_stats(player)
+    mitigation = 100 / (100 + max(1, effective_stats["defense"]))
     damage = max(1, int(enemy_attack * random.uniform(1.0, 1.4) * mitigation))
-    damage = min(damage, max(1, int(player.max_hp * 0.85)))
-    player.hp = max(1, player.hp - damage)
+    damage = min(damage, max(1, int(effective_stats["max_hp"] * 0.85)))
+    new_effective_hp = max(1, effective_stats["hp"] - damage)
+    player.hp = max(1, min(player.max_hp, new_effective_hp - effective_stats["hp_delta"]))
     result["damage"] = damage
 
     scene = result["scene_name"]
@@ -357,3 +392,84 @@ def _apply_injured_realm_down(player: Player, result: dict, enemy_attack: int):
         f"在【{cat}·{scene}】中血战逃生，受伤{damage}点，"
         f"修为跌落{max(1, actual_drop)}层：{old_name} → {new_name}！"
     )
+
+
+_GONGFA_DROP_BASE_RATE = 0.12
+
+
+async def _apply_gongfa_drop(player: Player) -> dict | None:
+    """12% 基础概率掉落黄阶或玄阶功法卷轴。"""
+    if random.random() >= _GONGFA_DROP_BASE_RATE:
+        return None
+
+    candidates = [gf for gf in GONGFA_REGISTRY.values() if gf.tier <= GongfaTier.XUAN]
+    if not candidates:
+        return None
+    gf = random.choice(candidates)
+    scroll_id = get_gongfa_scroll_id(gf.gongfa_id)
+    scroll_item = ITEM_REGISTRY.get(scroll_id)
+    if not scroll_item:
+        return None
+    await add_item(player, scroll_id)
+    return {
+        "gongfa_id": gf.gongfa_id,
+        "scroll_id": scroll_id,
+        "name": gf.name,
+        "tier": gf.tier,
+        "tier_name": GONGFA_TIER_NAMES.get(gf.tier, "黄阶"),
+    }
+
+
+def _apply_gongfa_mastery(player: Player) -> list[str]:
+    """战后功法熟练度增长 random(3,8)/功法。"""
+    msgs: list[str] = []
+    for slot in ("gongfa_1", "gongfa_2", "gongfa_3"):
+        gongfa_id = getattr(player, slot, "无")
+        if not gongfa_id or gongfa_id == "无":
+            continue
+        gf = GONGFA_REGISTRY.get(gongfa_id)
+        if not gf:
+            continue
+        mastery_attr = f"{slot}_mastery"
+        exp_attr = f"{slot}_exp"
+        mastery = getattr(player, mastery_attr, 0)
+        if mastery >= MASTERY_MAX:
+            continue
+        if not can_cultivate_gongfa(player.realm, gf.tier):
+            continue
+
+        gf_exp_gain = random.randint(3, 8)
+        cur_exp = getattr(player, exp_attr, 0) + gf_exp_gain
+        if cur_exp >= gf.mastery_exp:
+            # 地阶+功法的大成→圆满需消耗道韵（不够则暂停累积）
+            if gf.tier >= 2 and mastery == 2 and gf.dao_yun_cost > 0:
+                if player.dao_yun < gf.dao_yun_cost:
+                    cur_exp = gf.mastery_exp - 1
+                    setattr(player, exp_attr, cur_exp)
+                    continue
+                player.dao_yun -= gf.dao_yun_cost
+                msgs.append(f"消耗道韵{gf.dao_yun_cost}，助功法【{gf.name}】突破")
+            cur_exp -= gf.mastery_exp
+            mastery += 1
+            setattr(player, mastery_attr, mastery)
+            new_level = MASTERY_LEVELS[mastery]
+            msgs.append(f"功法【{gf.name}】修炼至{new_level}！")
+        setattr(player, exp_attr, cur_exp)
+    return msgs
+
+
+def _apply_gongfa_regen(player: Player) -> list[str]:
+    """战后功法HP/灵力回复。"""
+    msgs: list[str] = []
+    gf_total = get_total_gongfa_bonus(player)
+    if gf_total["hp_regen"] > 0 and player.hp < player.max_hp:
+        heal = min(gf_total["hp_regen"], player.max_hp - player.hp)
+        player.hp += heal
+        msgs.append(f"功法回血+{heal}")
+    if gf_total["lingqi_regen"] > 0:
+        max_lq = get_player_base_max_lingqi(player)
+        actual = min(gf_total["lingqi_regen"], max(0, max_lq - player.lingqi))
+        if actual > 0:
+            player.lingqi += actual
+            msgs.append(f"功法回灵+{actual}")
+    return msgs

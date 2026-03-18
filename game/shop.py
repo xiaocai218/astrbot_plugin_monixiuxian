@@ -15,10 +15,14 @@ from .constants import (
     HEART_METHOD_MANUAL_PREFIX,
     HEART_METHOD_QUALITY_NAMES,
     HEART_METHOD_REGISTRY,
+    GONGFA_REGISTRY,
+    GONGFA_TIER_NAMES,
+    GONGFA_SCROLL_PREFIX,
     ITEM_REGISTRY,
     REALM_CONFIG,
     get_daily_recycle_price,
     get_heart_method_manual_id,
+    get_gongfa_scroll_id,
 )
 from .inventory import add_item
 
@@ -27,14 +31,16 @@ if TYPE_CHECKING:
 
 # ── 常量 ──────────────────────────────────────────────────────
 
-SHOP_ITEM_COUNT = 9
+SHOP_ITEM_COUNT = 12
 SHOP_ITEM_DAILY_LIMIT = 20
 SHOP_PRICE_MULTIPLIER = 50
 
 TYPE_WEIGHTS: dict[str, int] = {
-    "consumable": 350,
-    "equipment": 400,
-    "heart_method": 250,
+    "consumable": 150,
+    "pill": 250,
+    "equipment": 250,
+    "heart_method": 200,
+    "gongfa": 150,
 }
 
 TIER_WEIGHTS: dict[int, int] = {
@@ -55,6 +61,12 @@ HM_QUALITY_PRICE_MULTIPLIER: dict[int, int] = {
     0: 1,     # 普通 — 原价
     1: 5,     # 史诗 — 5倍
     2: 25,    # 传说 — 25倍
+}
+
+GONGFA_TIER_WEIGHTS: dict[int, int] = {
+    1: 500,   # 玄阶 — 多
+    2: 350,   # 地阶
+    3: 1,     # 天阶 — 极稀
 }
 
 # ── 辅助 ──────────────────────────────────────────────────────
@@ -104,7 +116,10 @@ def generate_daily_items(target_date: date | None = None) -> list[dict]:
 
     consumables = [
         it for it in ITEM_REGISTRY.values()
-        if it.item_type == "consumable" and not it.item_id.startswith(HEART_METHOD_MANUAL_PREFIX)
+        if it.item_type == "consumable"
+        and not it.item_id.startswith(HEART_METHOD_MANUAL_PREFIX)
+        and not it.item_id.startswith(GONGFA_SCROLL_PREFIX)
+        and not it.item_id.startswith("pill_")
     ]
     heart_manual_ids = {
         get_heart_method_manual_id(hm.method_id)
@@ -133,6 +148,37 @@ def generate_daily_items(target_date: date | None = None) -> list[dict]:
                 price=price,
                 description=chosen.description,
                 daily_limit=SHOP_ITEM_DAILY_LIMIT,
+            ))
+
+        elif cat == "pill":
+            from .pills import (
+                pick_random_pill, SHOP_PILL_TIER_WEIGHTS, SHOP_PILL_GRADE_WEIGHTS,
+                PILL_TIER_NAMES, PILL_GRADE_NAMES,
+            )
+            pill = pick_random_pill(rng, SHOP_PILL_TIER_WEIGHTS, SHOP_PILL_GRADE_WEIGHTS)
+            if not pill:
+                continue
+            iid = pill.pill_id
+            if iid in seen_ids:
+                continue
+            tier_name = PILL_TIER_NAMES.get(pill.tier, "")
+            grade_name = PILL_GRADE_NAMES.get(pill.grade, "")
+            items.append(_build_item_dict(
+                item_id=iid,
+                name=pill.name,
+                item_type="pill",
+                price=pill.price,
+                description=pill.description,
+                daily_limit=SHOP_ITEM_DAILY_LIMIT,
+                extra={
+                    "pill_tier": pill.tier,
+                    "pill_tier_name": tier_name,
+                    "pill_grade": pill.grade,
+                    "pill_grade_name": grade_name,
+                    "is_temp": pill.is_temp,
+                    "duration": pill.duration,
+                    "side_effect_desc": pill.side_effect_desc,
+                },
             ))
 
         elif cat == "equipment":
@@ -194,6 +240,45 @@ def generate_daily_items(target_date: date | None = None) -> list[dict]:
                     "attack_bonus": hm.attack_bonus,
                     "defense_bonus": hm.defense_bonus,
                     "exp_multiplier": hm.exp_multiplier,
+                },
+            ))
+
+        elif cat == "gongfa":
+            gf_tier = _weighted_choice(rng, GONGFA_TIER_WEIGHTS)
+            candidates = [gf for gf in GONGFA_REGISTRY.values() if gf.tier == gf_tier]
+            if not candidates:
+                continue
+            gf = rng.choice(candidates)
+            iid = get_gongfa_scroll_id(gf.gongfa_id)
+            if iid in seen_ids:
+                continue
+            price = gf.recycle_price * SHOP_PRICE_MULTIPLIER
+            tier_name = GONGFA_TIER_NAMES.get(gf.tier, "未知")
+            parts = []
+            if gf.attack_bonus:
+                parts.append(f"攻+{gf.attack_bonus}")
+            if gf.defense_bonus:
+                parts.append(f"防+{gf.defense_bonus}")
+            if gf.hp_regen:
+                parts.append(f"血+{gf.hp_regen}")
+            if gf.lingqi_regen:
+                parts.append(f"灵+{gf.lingqi_regen}")
+            stat_str = "/".join(parts) if parts else ""
+            items.append(_build_item_dict(
+                item_id=iid,
+                name=f"{gf.name}卷轴",
+                item_type="gongfa",
+                price=price,
+                description=gf.description,
+                daily_limit=SHOP_ITEM_DAILY_LIMIT,
+                extra={
+                    "tier": gf.tier,
+                    "tier_name": tier_name,
+                    "attack_bonus": gf.attack_bonus,
+                    "defense_bonus": gf.defense_bonus,
+                    "hp_regen": gf.hp_regen,
+                    "lingqi_regen": gf.lingqi_regen,
+                    "stat_str": stat_str,
                 },
             ))
 
