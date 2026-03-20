@@ -15,6 +15,7 @@ from .constants import (
     ENEMY_TIERS, COMBAT_MAX_ROUNDS,
     get_realm_name, get_equip_bonus, get_heart_method_bonus,
     get_total_gongfa_bonus, get_player_base_max_lingqi,
+    get_nearest_realm_level, get_next_realm_level,
 )
 from .models import Player
 
@@ -349,8 +350,8 @@ class DungeonManager:
             # 基于境界基础防御计算天灾伤害减免
             dmg_ratio = random.uniform(0.15, 0.35)
             min_ratio = random.uniform(0.01, 0.03)
-            realm_cfg = REALM_CONFIG.get(player.realm,
-                                          REALM_CONFIG[RealmLevel.MORTAL])
+            fallback_realm = get_nearest_realm_level(RealmLevel.MORTAL)
+            realm_cfg = REALM_CONFIG.get(player.realm) or REALM_CONFIG.get(fallback_realm, {})
             base_def = realm_cfg["base_defense"]
             equip_bonus = get_equip_bonus(player.weapon, player.armor)
             hm_bonus = get_heart_method_bonus(player.heart_method,
@@ -488,9 +489,10 @@ class DungeonManager:
             if roll < cumulative:
                 if tier_scale == "realm_up":
                     # 高1大境界
-                    enemy_realm = min(player.realm + 1, RealmLevel.MAHAYANA)
-                    cfg = REALM_CONFIG.get(enemy_realm,
-                                           REALM_CONFIG[RealmLevel.QI_REFINING])
+                    current_realm = get_nearest_realm_level(player.realm)
+                    enemy_realm = get_next_realm_level(current_realm) or current_realm
+                    fallback_realm = get_nearest_realm_level(RealmLevel.QI_REFINING)
+                    cfg = REALM_CONFIG.get(enemy_realm) or REALM_CONFIG.get(fallback_realm, {})
                     e_atk = int(cfg["base_attack"] * random.uniform(0.9, 1.1))
                     e_def = int(cfg["base_defense"] * random.uniform(0.9, 1.1))
                     e_hp = int(cfg["base_hp"] * random.uniform(0.9, 1.1))

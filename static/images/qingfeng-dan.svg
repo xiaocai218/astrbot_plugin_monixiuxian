@@ -1,0 +1,113 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bgGlow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(256 246) rotate(90) scale(170)">
+      <stop offset="0" stop-color="#82FFF2" stop-opacity="0.34"/>
+      <stop offset="0.52" stop-color="#43D8C9" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#43D8C9" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="orbBody" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(212 196) rotate(48) scale(178 184)">
+      <stop offset="0" stop-color="#F5FFFF"/>
+      <stop offset="0.12" stop-color="#D9FFFB"/>
+      <stop offset="0.28" stop-color="#A6F4EC"/>
+      <stop offset="0.52" stop-color="#4BCFC8"/>
+      <stop offset="0.76" stop-color="#177A86"/>
+      <stop offset="1" stop-color="#062C3D"/>
+    </radialGradient>
+
+    <radialGradient id="orbCore" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(244 230) rotate(90) scale(110)">
+      <stop offset="0" stop-color="#DFFFFB" stop-opacity="0.95"/>
+      <stop offset="0.35" stop-color="#89F4E8" stop-opacity="0.58"/>
+      <stop offset="0.72" stop-color="#1B9AA0" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#1B9AA0" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="upperGloss" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(214 182) rotate(38) scale(76 92)">
+      <stop offset="0" stop-color="white" stop-opacity="0.96"/>
+      <stop offset="0.38" stop-color="#E8FFFF" stop-opacity="0.54"/>
+      <stop offset="1" stop-color="white" stop-opacity="0"/>
+    </radialGradient>
+
+    <radialGradient id="lowerBounce" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(274 326) rotate(-90) scale(72 94)">
+      <stop offset="0" stop-color="#CFFFF7" stop-opacity="0.42"/>
+      <stop offset="1" stop-color="#CFFFF7" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="rimLight" x1="162" y1="170" x2="358" y2="356" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F6FFFE"/>
+      <stop offset="0.24" stop-color="#B8FFF7"/>
+      <stop offset="0.56" stop-color="#5CD8D0"/>
+      <stop offset="0.82" stop-color="#0D7480"/>
+      <stop offset="1" stop-color="#053C52"/>
+    </linearGradient>
+
+    <linearGradient id="ringInk" x1="182" y1="236" x2="336" y2="302" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E8FFFF" stop-opacity="0.95"/>
+      <stop offset="0.48" stop-color="#AEFFF5" stop-opacity="0.82"/>
+      <stop offset="1" stop-color="#62DAD0" stop-opacity="0.7"/>
+    </linearGradient>
+
+    <filter id="bigGlow" x="-35%" y="-35%" width="170%" height="170%">
+      <feGaussianBlur stdDeviation="22" result="blur"/>
+      <feBlend mode="screen" in="SourceGraphic" in2="blur"/>
+    </filter>
+
+    <filter id="softSmoke" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="12"/>
+    </filter>
+
+    <filter id="orbShadow" x="-30%" y="-30%" width="160%" height="180%">
+      <feDropShadow dx="0" dy="22" stdDeviation="24" flood-color="#03131C" flood-opacity="0.44"/>
+    </filter>
+
+    <filter id="innerShadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6" result="blur"/>
+      <feOffset dy="8" result="offsetBlur"/>
+      <feComposite in="offsetBlur" in2="SourceAlpha" operator="arithmetic" k2="-1" k3="1" result="innerShadow"/>
+      <feColorMatrix in="innerShadow" type="matrix" values="0 0 0 0 0.01 0 0 0 0 0.19 0 0 0 0 0.24 0 0 0 0.7 0"/>
+      <feComposite in2="SourceGraphic" operator="over"/>
+    </filter>
+  </defs>
+
+  <ellipse cx="256" cy="250" rx="176" ry="176" fill="url(#bgGlow)" filter="url(#bigGlow)"/>
+
+  <g opacity="0.72" filter="url(#softSmoke)">
+    <path d="M116 250C76 210 74 158 118 128C162 98 222 118 230 162C236 194 224 220 200 240C234 232 258 240 276 264" stroke="white" stroke-opacity="0.54" stroke-width="22" stroke-linecap="round"/>
+    <path d="M396 254C436 214 438 162 394 132C350 102 290 122 282 166C276 198 288 224 312 244C278 236 254 244 236 268" stroke="white" stroke-opacity="0.5" stroke-width="22" stroke-linecap="round"/>
+    <path d="M180 386C150 410 152 446 194 456C238 466 284 452 294 420" stroke="white" stroke-opacity="0.34" stroke-width="18" stroke-linecap="round"/>
+    <path d="M332 388C362 412 360 446 318 456C274 466 228 452 218 420" stroke="white" stroke-opacity="0.34" stroke-width="18" stroke-linecap="round"/>
+  </g>
+
+  <g filter="url(#orbShadow)">
+    <circle cx="256" cy="256" r="108" fill="#0C4F63" fill-opacity="0.18" filter="url(#bigGlow)"/>
+    <circle cx="256" cy="256" r="100" fill="url(#orbBody)" stroke="url(#rimLight)" stroke-width="10"/>
+    <circle cx="256" cy="256" r="94" fill="url(#orbCore)" opacity="0.9"/>
+    <circle cx="256" cy="256" r="100" fill="transparent" filter="url(#innerShadow)"/>
+
+    <ellipse cx="226" cy="192" rx="66" ry="52" fill="url(#upperGloss)"/>
+    <ellipse cx="286" cy="318" rx="70" ry="42" fill="url(#lowerBounce)"/>
+
+    <path d="M178 270C190 314 228 344 274 350C310 354 342 340 360 314C346 344 316 368 278 374C220 382 172 340 166 284C166 278 170 274 178 270Z" fill="#042838" fill-opacity="0.28"/>
+    <path d="M192 188C222 154 282 144 328 170C352 184 368 204 374 232C360 206 342 190 314 180C270 164 222 170 192 188Z" fill="#E2FFFF" fill-opacity="0.18"/>
+
+    <path d="M194 232C216 214 286 214 318 238" stroke="url(#ringInk)" stroke-width="8" stroke-linecap="round"/>
+    <path d="M186 286C220 258 298 262 328 294" stroke="url(#ringInk)" stroke-width="8" stroke-linecap="round"/>
+
+    <path d="M196 230C226 242 240 254 246 270" stroke="#9CF7EC" stroke-opacity="0.46" stroke-width="2.8" stroke-linecap="round"/>
+    <path d="M316 238C288 246 276 258 270 274" stroke="#9CF7EC" stroke-opacity="0.4" stroke-width="2.8" stroke-linecap="round"/>
+    <path d="M188 286C222 298 240 314 246 330" stroke="#8DEEE2" stroke-opacity="0.36" stroke-width="2.8" stroke-linecap="round"/>
+    <path d="M326 294C296 300 278 314 272 332" stroke="#8DEEE2" stroke-opacity="0.34" stroke-width="2.8" stroke-linecap="round"/>
+
+    <ellipse cx="205" cy="184" rx="18" ry="12" fill="white" fill-opacity="0.82"/>
+    <ellipse cx="233" cy="162" rx="10" ry="7" fill="white" fill-opacity="0.62"/>
+    <circle cx="307" cy="205" r="6" fill="white" fill-opacity="0.34"/>
+  </g>
+
+  <g opacity="0.78" filter="url(#softSmoke)">
+    <ellipse cx="164" cy="162" rx="52" ry="26" fill="white" fill-opacity="0.44"/>
+    <ellipse cx="354" cy="154" rx="58" ry="28" fill="white" fill-opacity="0.42"/>
+    <ellipse cx="116" cy="258" rx="34" ry="22" fill="white" fill-opacity="0.38"/>
+    <ellipse cx="394" cy="256" rx="36" ry="24" fill="white" fill-opacity="0.38"/>
+    <ellipse cx="256" cy="392" rx="96" ry="24" fill="white" fill-opacity="0.24"/>
+  </g>
+</svg>

@@ -21,7 +21,7 @@ _MISSING = object()
 CMD_PREFIX = "修仙"
 
 
-@register("astrbot_plugin_xiuxian", "xiuxian-dev", "修仙文字RPG游戏，支持聊天指令和网页界面", "0.3.4")
+@register("astrbot_plugin_xiuxian", "xiuxian-dev", "修仙文字RPG游戏，支持聊天指令和网页界面", "0.5.2")
 class XiuxianPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
@@ -846,10 +846,9 @@ class XiuxianPlugin(Star):
             yield event.plain_result(msg)
             return
         port = self._get_cfg_int("web_port", 8088)
-        yield event.plain_result(
-            f"修仙世界网页版：http://<服务器IP>:{port}\n"
-            f"在浏览器中打开即可游玩"
-        )
+        default_msg = f"修仙世界网页版：http://<服务器IP>:{port}\n在浏览器中打开即可游玩"
+        template = str(self._get_cfg("web_link_message", default_msg))
+        yield event.plain_result(template.replace("{port}", str(port)))
 
     @xiuxian_group.command("登录")
     async def chat_login(self, event: AstrMessageEvent, key: str = ""):

@@ -13,7 +13,8 @@ from .constants import (
     get_player_base_max_lingqi, get_realm_base_stats,
     RealmLevel, has_sub_realm,
     get_realm_name, get_equip_bonus, get_heart_method_bonus,
-    get_max_sub_realm,
+    get_max_sub_realm, get_nearest_realm_level, get_next_realm_level,
+    get_previous_realm_level,
 )
 from .inventory import add_item
 from .models import Player
@@ -89,13 +90,18 @@ async def attempt_adventure(player: Player, scene: dict, difficulty: str) -> dic
 
 def _resolve_enemy_realm(player_realm: int, difficulty: str) -> int:
     """根据难度匹配敌方境界。"""
-    delta = {"easy": -1, "normal": 0, "hard": 1}.get(difficulty, 0)
-    realm = player_realm + delta
-    if realm < RealmLevel.QI_REFINING:
-        realm = RealmLevel.QI_REFINING
-    if realm > RealmLevel.MAHAYANA:
-        realm = RealmLevel.MAHAYANA
-    return realm
+    current = get_nearest_realm_level(player_realm)
+    min_enemy_realm = get_next_realm_level(RealmLevel.MORTAL)
+    if min_enemy_realm is not None and current < min_enemy_realm:
+        current = min_enemy_realm
+    if difficulty == "easy":
+        prev_realm = get_previous_realm_level(current)
+        if prev_realm is not None and (min_enemy_realm is None or prev_realm >= min_enemy_realm):
+            return prev_realm
+        return current
+    if difficulty == "hard":
+        return get_next_realm_level(current) or current
+    return current
 
 
 def _build_battle_context(player: Player, enemy_realm: int, difficulty: str) -> dict:
@@ -109,7 +115,8 @@ def _build_battle_context(player: Player, enemy_realm: int, difficulty: str) -> 
     player_atk = max(1, effective_stats["attack"] + equip_bonus["attack"] + hm_bonus["attack_bonus"] + gf_bonus["attack_bonus"])
     player_def = max(1, effective_stats["defense"] + equip_bonus["defense"] + hm_bonus["defense_bonus"] + gf_bonus["defense_bonus"])
 
-    enemy_cfg = REALM_CONFIG.get(enemy_realm, REALM_CONFIG[RealmLevel.QI_REFINING])
+    fallback_realm = get_nearest_realm_level(RealmLevel.QI_REFINING)
+    enemy_cfg = REALM_CONFIG.get(enemy_realm) or REALM_CONFIG.get(fallback_realm, {})
     diff_scale = {"easy": 0.9, "normal": 1.0, "hard": 1.12}.get(difficulty, 1.0)
     jitter = random.uniform(0.92, 1.08)
     enemy_scale = diff_scale * jitter
@@ -331,20 +338,26 @@ def _drop_realm_steps(player: Player, steps: int) -> int:
     dropped = 0
     target = max(1, int(steps))
     while dropped < target:
+        player.realm = get_nearest_realm_level(player.realm)
+        if has_sub_realm(player.realm):
+            player.sub_realm = max(0, min(int(player.sub_realm), get_max_sub_realm(player.realm)))
+        else:
+            player.sub_realm = 0
         if has_sub_realm(player.realm):
             if player.sub_realm > 0:
                 player.sub_realm -= 1
-            elif player.realm > RealmLevel.MORTAL:
-                player.realm -= 1
-                player.sub_realm = get_max_sub_realm(player.realm) if has_sub_realm(player.realm) else 0
             else:
-                break
+                prev_realm = get_previous_realm_level(player.realm)
+                if prev_realm is None:
+                    break
+                player.realm = prev_realm
+                player.sub_realm = get_max_sub_realm(player.realm) if has_sub_realm(player.realm) else 0
         else:
-            if player.realm > RealmLevel.MORTAL:
-                player.realm -= 1
-                player.sub_realm = get_max_sub_realm(player.realm) if has_sub_realm(player.realm) else 0
-            else:
+            prev_realm = get_previous_realm_level(player.realm)
+            if prev_realm is None:
                 break
+            player.realm = prev_realm
+            player.sub_realm = get_max_sub_realm(player.realm) if has_sub_realm(player.realm) else 0
         dropped += 1
     return dropped
 

@@ -88,7 +88,7 @@ def create_router(
         """按路径和 UA 选择限流阈值。"""
         if path in {"/api/register", "/api/login", "/api/admin/login"}:
             limit, window = auth_limit
-        elif path in {"/api/rankings", "/api/status", "/api/adventure-scenes"}:
+        elif path in {"/api/rankings", "/api/status", "/api/adventure-scenes", "/api/realm-names"}:
             limit, window = public_limit
         elif path.startswith("/api/admin/"):
             limit, window = admin_limit
@@ -710,6 +710,74 @@ def create_router(
             return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
         gongfa_id = str(body.get("gongfa_id", "")).strip()
         result = await engine.admin_delete_gongfa(gongfa_id)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    # ---- 境界管理 CRUD ----
+
+    @router.get("/api/realm-names")
+    async def get_realm_names():
+        """公开接口：获取境界等级→名称映射。"""
+        names = await engine.get_realm_names()
+        return {"success": True, "realm_names": names}
+
+    @router.post("/api/admin/realms/list")
+    async def admin_list_realms(request: Request):
+        """管理员接口：境界配置列表。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        realms = await engine.admin_list_realms()
+        return {"success": True, "realms": realms}
+
+    @router.post("/api/admin/realms/create")
+    async def admin_create_realm(request: Request):
+        """管理员接口：新增境界。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        payload = body.get("realm", {})
+        if not isinstance(payload, dict):
+            return JSONResponse({"success": False, "message": "参数 realm 无效"}, status_code=400)
+        result = await engine.admin_create_realm(payload)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    @router.post("/api/admin/realms/update")
+    async def admin_update_realm(request: Request):
+        """管理员接口：更新境界配置。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        try:
+            level = int(body.get("level", -1))
+        except (TypeError, ValueError):
+            return JSONResponse({"success": False, "message": "缺少 level"}, status_code=400)
+        payload = body.get("realm", {})
+        if not isinstance(payload, dict):
+            return JSONResponse({"success": False, "message": "参数 realm 无效"}, status_code=400)
+        result = await engine.admin_update_realm(level, payload)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    @router.post("/api/admin/realms/delete")
+    async def admin_delete_realm(request: Request):
+        """管理员接口：删除境界。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        try:
+            level = int(body.get("level", -1))
+        except (TypeError, ValueError):
+            return JSONResponse({"success": False, "message": "缺少 level"}, status_code=400)
+        result = await engine.admin_delete_realm(level)
         if not result.get("success"):
             return JSONResponse(result, status_code=400)
         return result

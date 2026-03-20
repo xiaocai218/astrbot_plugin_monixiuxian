@@ -23,6 +23,7 @@ from .constants import (
     get_realm_name, has_sub_realm, can_equip, get_realm_heart_methods,
     get_player_base_max_lingqi, get_player_base_stats, get_realm_base_stats, calc_gongfa_lingqi_cost,
     get_max_sub_realm, get_sub_realm_dao_yun_cost, is_high_realm,
+    get_nearest_realm_level,
     RealmLevel,
 )
 from .cultivation import attempt_breakthrough, perform_cultivate
@@ -79,9 +80,11 @@ class GameEngine:
     async def initialize(self):
         """加载所有玩家数据到内存。"""
         # 启动时先从独立心法表加载定义，再进入玩家数据归一化流程
-        from .constants import set_heart_method_registry, set_equipment_registry, set_gongfa_registry
+        from .constants import set_heart_method_registry, set_equipment_registry, set_gongfa_registry, set_realm_config
         from .pills import clean_expired_buffs
 
+        realms = await self._data_manager.load_realms()
+        set_realm_config(realms)
         equipments = await self._data_manager.load_weapons()
         set_equipment_registry(equipments)
         heart_methods = await self._data_manager.load_heart_methods()
@@ -94,6 +97,8 @@ class GameEngine:
         # 构建道号索引
         for uid, player in self._players.items():
             self._name_index[player.name] = uid
+            if self._normalize_player_realm_progress(player):
+                normalized = True
             realm_stats = get_realm_base_stats(player.realm, player.sub_realm)
             if getattr(player, "permanent_max_hp_bonus", 0) <= 0 and player.max_hp > realm_stats["max_hp"]:
                 player.permanent_max_hp_bonus = player.max_hp - realm_stats["max_hp"]
@@ -144,14 +149,66 @@ class GameEngine:
             changed = True
         return changed
 
+    @staticmethod
+    def _normalize_player_realm_progress(player: Player) -> bool:
+        """将玩家境界进度纠正到当前已配置的合法范围内。"""
+        changed = False
+        normalized_realm = get_nearest_realm_level(getattr(player, "realm", 0) or 0)
+        if player.realm != normalized_realm:
+            player.realm = normalized_realm
+            changed = True
+
+        current_sub = int(getattr(player, "sub_realm", 0) or 0)
+        if has_sub_realm(player.realm):
+            normalized_sub = max(0, min(current_sub, get_max_sub_realm(player.realm)))
+        else:
+            normalized_sub = 0
+        if player.sub_realm != normalized_sub:
+            player.sub_realm = normalized_sub
+            changed = True
+        return changed
+
+    @staticmethod
+    def _sync_player_base_stats(player: Player) -> bool:
+        """按当前境界重新同步玩家基础属性，不改变永久加成。"""
+        changed = False
+        base_stats = get_player_base_stats(player)
+        new_max_hp = max(1, int(base_stats["max_hp"]))
+        new_attack = max(0, int(base_stats["attack"]))
+        new_defense = max(0, int(base_stats["defense"]))
+        new_max_lingqi = max(0, int(base_stats["max_lingqi"]))
+
+        if player.max_hp != new_max_hp:
+            player.max_hp = new_max_hp
+            changed = True
+        if player.attack != new_attack:
+            player.attack = new_attack
+            changed = True
+        if player.defense != new_defense:
+            player.defense = new_defense
+            changed = True
+
+        hp = max(0, min(player.max_hp, int(getattr(player, "hp", 0) or 0)))
+        if player.hp != hp:
+            player.hp = hp
+            changed = True
+
+        lingqi = max(0, min(new_max_lingqi, int(getattr(player, "lingqi", 0) or 0)))
+        if player.lingqi != lingqi:
+            player.lingqi = lingqi
+            changed = True
+        return changed
+
     async def get_or_create_player(self, user_id: str, name: str) -> Player:
         """获取或创建玩家。"""
         if user_id in self._players:
             return self._players[user_id]
-        realm_cfg = REALM_CONFIG[0]
+        start_realm = get_nearest_realm_level(RealmLevel.MORTAL)
+        realm_cfg = REALM_CONFIG.get(start_realm, {})
         player = Player(
             user_id=user_id,
             name=name,
+            realm=start_realm,
             hp=realm_cfg["base_hp"],
             max_hp=realm_cfg["base_hp"],
             attack=realm_cfg["base_attack"],
@@ -332,7 +389,16 @@ class GameEngine:
         duration_min = max(1, int(duration_sec / 60))
 
         # 经验公式：取修炼单次经验的平均值 × 分钟数
-        realm_cfg = REALM_CONFIG[player.realm]
+        normalized_realm = get_nearest_realm_level(player.realm)
+        if normalized_realm != player.realm:
+            player.realm = normalized_realm
+        if has_sub_realm(player.realm):
+            player.sub_realm = max(0, min(int(player.sub_realm), get_max_sub_realm(player.realm)))
+        else:
+            player.sub_realm = 0
+        realm_cfg = REALM_CONFIG.get(player.realm)
+        if not realm_cfg:
+            return {"success": False, "message": "当前境界配置无效，无法结算挂机修炼"}
         base_min = 10 + player.realm * 5 + player.sub_realm * 2
         base_max = 30 + player.realm * 10 + player.sub_realm * 4
         if player.realm >= RealmLevel.GOLDEN_CORE:
@@ -526,9 +592,11 @@ class GameEngine:
         return await self._data_manager.get_adventure_scenes()
 
     async def _reload_runtime_registries(self):
-        """从数据库重载装备与心法与功法定义到运行时注册表。"""
-        from .constants import set_equipment_registry, set_heart_method_registry, set_gongfa_registry
+        """从数据库重载境界、装备、心法、功法定义到运行时注册表。"""
+        from .constants import set_equipment_registry, set_heart_method_registry, set_gongfa_registry, set_realm_config
 
+        realms = await self._data_manager.load_realms()
+        set_realm_config(realms)
         equipments = await self._data_manager.load_weapons()
         set_equipment_registry(equipments)
         heart_methods = await self._data_manager.load_heart_methods()
@@ -537,14 +605,16 @@ class GameEngine:
         set_gongfa_registry(gongfas)
 
     async def _normalize_players_after_registry_change(self):
-        """当定义表变化后，归一化玩家装备/心法状态。"""
+        """当定义表变化后，归一化玩家境界与装备/心法状态。"""
         changed = False
         for player in self._players.values():
+            realm_changed = self._normalize_player_realm_progress(player)
+            stats_changed = self._sync_player_base_stats(player)
             removed = self._auto_unequip_invalid_equipment(player)
             heart_fix = self._auto_unequip_invalid_heart_method(player, convert_ratio=0.0, force=False)
             removed_gongfas = self._auto_unequip_invalid_gongfa(player)
             hp_changed = self._clamp_player_hp(player)
-            if removed or heart_fix.get("removed_name") or removed_gongfas or hp_changed:
+            if realm_changed or stats_changed or removed or heart_fix.get("removed_name") or removed_gongfas or hp_changed:
                 changed = True
         if changed:
             await self._data_manager.save_all_players(self._players)
@@ -828,6 +898,86 @@ class GameEngine:
         await self._reload_runtime_registries()
         await self._normalize_players_after_registry_change()
         return {"success": True, "message": "功法已删除"}
+
+    # ---- 境界管理 CRUD ----
+
+    async def admin_list_realms(self) -> list[dict]:
+        return await self._data_manager.admin_list_realms()
+
+    async def admin_create_realm(self, payload: dict) -> dict:
+        try:
+            level = int(payload.get("level", -1))
+        except (TypeError, ValueError):
+            return {"success": False, "message": "境界等级必须为整数"}
+        if level < 0:
+            return {"success": False, "message": "境界等级不能为负数"}
+        name = str(payload.get("name", "")).strip()
+        if not name:
+            return {"success": False, "message": "境界名称不能为空"}
+        if await self._data_manager.admin_has_realm_name(name):
+            return {"success": False, "message": f"境界名称「{name}」已存在，禁止重名"}
+        data = {
+            "level": level,
+            "name": name,
+            "has_sub_realm": self._normalize_enabled_flag(payload.get("has_sub_realm", 0)),
+            "high_realm": self._normalize_enabled_flag(payload.get("high_realm", 0)),
+            "exp_to_next": max(0, int(payload.get("exp_to_next", 100))),
+            "sub_exp_to_next": max(0, int(payload.get("sub_exp_to_next", 0))),
+            "base_hp": max(1, int(payload.get("base_hp", 100))),
+            "base_attack": max(0, int(payload.get("base_attack", 10))),
+            "base_defense": max(0, int(payload.get("base_defense", 5))),
+            "base_lingqi": max(1, int(payload.get("base_lingqi", 50))),
+            "breakthrough_rate": max(0.0, min(1.0, float(payload.get("breakthrough_rate", 1.0)))),
+            "death_rate": max(0.0, min(1.0, float(payload.get("death_rate", 0.0)))),
+            "sub_dao_yun_costs": str(payload.get("sub_dao_yun_costs", "")),
+            "breakthrough_dao_yun_cost": max(0, int(payload.get("breakthrough_dao_yun_cost", 0))),
+        }
+        ok = await self._data_manager.admin_create_realm(data)
+        if not ok:
+            return {"success": False, "message": f"境界等级 {level} 已存在"}
+        await self._reload_runtime_registries()
+        await self._normalize_players_after_registry_change()
+        return {"success": True, "message": "境界已新增"}
+
+    async def admin_update_realm(self, level: int, payload: dict) -> dict:
+        name = str(payload.get("name", "")).strip()
+        if not name:
+            return {"success": False, "message": "境界名称不能为空"}
+        if await self._data_manager.admin_has_realm_name(name, exclude_level=level):
+            return {"success": False, "message": f"境界名称「{name}」已存在，禁止重名"}
+        data = {
+            "name": name,
+            "has_sub_realm": self._normalize_enabled_flag(payload.get("has_sub_realm", 0)),
+            "high_realm": self._normalize_enabled_flag(payload.get("high_realm", 0)),
+            "exp_to_next": max(0, int(payload.get("exp_to_next", 100))),
+            "sub_exp_to_next": max(0, int(payload.get("sub_exp_to_next", 0))),
+            "base_hp": max(1, int(payload.get("base_hp", 100))),
+            "base_attack": max(0, int(payload.get("base_attack", 10))),
+            "base_defense": max(0, int(payload.get("base_defense", 5))),
+            "base_lingqi": max(1, int(payload.get("base_lingqi", 50))),
+            "breakthrough_rate": max(0.0, min(1.0, float(payload.get("breakthrough_rate", 1.0)))),
+            "death_rate": max(0.0, min(1.0, float(payload.get("death_rate", 0.0)))),
+            "sub_dao_yun_costs": str(payload.get("sub_dao_yun_costs", "")),
+            "breakthrough_dao_yun_cost": max(0, int(payload.get("breakthrough_dao_yun_cost", 0))),
+        }
+        ok = await self._data_manager.admin_update_realm(level, data)
+        if not ok:
+            return {"success": False, "message": "境界不存在"}
+        await self._reload_runtime_registries()
+        await self._normalize_players_after_registry_change()
+        return {"success": True, "message": "境界已更新"}
+
+    async def admin_delete_realm(self, level: int) -> dict:
+        ok = await self._data_manager.admin_delete_realm(level)
+        if not ok:
+            return {"success": False, "message": "境界不存在"}
+        await self._reload_runtime_registries()
+        await self._normalize_players_after_registry_change()
+        return {"success": True, "message": "境界已删除"}
+
+    async def get_realm_names(self) -> dict[int, str]:
+        """获取境界等级→名称映射。"""
+        return await self._data_manager.get_realm_names()
 
     async def admin_list_weapons(self) -> list[dict]:
         from .constants import EQUIPMENT_TIER_NAMES

@@ -53,6 +53,11 @@ class DataManager:
 
     async def _create_tables(self):
         """创建数据库表。"""
+        realms_table_exists = False
+        async with self.db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'realms' LIMIT 1"
+        ) as cur:
+            realms_table_exists = (await cur.fetchone()) is not None
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS players (
                 user_id             TEXT PRIMARY KEY,
@@ -94,6 +99,25 @@ class DataManager:
                 death_count         INTEGER DEFAULT 0,
                 unified_msg_origin  TEXT,
                 password_hash       TEXT
+            )
+        """)
+        # 境界配置表（管理员可维护）
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS realms (
+                level             INTEGER PRIMARY KEY,
+                name              TEXT NOT NULL,
+                has_sub_realm     INTEGER DEFAULT 0,
+                high_realm        INTEGER DEFAULT 0,
+                exp_to_next       INTEGER DEFAULT 100,
+                sub_exp_to_next   INTEGER DEFAULT 0,
+                base_hp           INTEGER DEFAULT 100,
+                base_attack       INTEGER DEFAULT 10,
+                base_defense      INTEGER DEFAULT 5,
+                base_lingqi       INTEGER DEFAULT 50,
+                breakthrough_rate REAL DEFAULT 1.0,
+                death_rate        REAL DEFAULT 0.0,
+                sub_dao_yun_costs TEXT DEFAULT '',
+                breakthrough_dao_yun_cost INTEGER DEFAULT 0
             )
         """)
         # 历练场景表
@@ -326,6 +350,13 @@ class DataManager:
         await self._alter_add_column("world_chat_messages", "sect_role", "TEXT DEFAULT ''")
         await self._alter_add_column("world_chat_messages", "sect_role_name", "TEXT DEFAULT ''")
         await self._ensure_sect_schema(force=True)
+        # 境界表迁移：新增道韵字段
+        await self._alter_add_column("realms", "sub_dao_yun_costs", "TEXT DEFAULT ''")
+        await self._alter_add_column("realms", "breakthrough_dao_yun_cost", "INTEGER DEFAULT 0")
+        # 境界表首次创建时写入一份默认数据；之后完全以数据库内容为准
+        if not realms_table_exists:
+            await self._seed_realms()
+        await self._backfill_realm_dao_yun_defaults()
         # 填充场景数据
         await self._seed_adventure_scenes()
         # 填充心法定义（仅补齐缺失，不覆盖已有配置）
@@ -609,6 +640,227 @@ class DataManager:
         except Exception:
             pass
         self._sect_schema_checked = True
+
+    async def _seed_realms(self):
+        """首次创建境界表时，写入一份内置默认境界。"""
+        import json as _json
+        from .constants import REALM_CONFIG as DEFAULT_REALM_CONFIG
+
+        rows = []
+        for level, cfg in DEFAULT_REALM_CONFIG.items():
+            sub_costs = cfg.get("sub_dao_yun_costs", [])
+            rows.append((
+                int(level),
+                cfg["name"],
+                1 if cfg.get("has_sub_realm") else 0,
+                1 if cfg.get("high_realm") else 0,
+                int(cfg.get("exp_to_next", 100)),
+                int(cfg.get("sub_exp_to_next", 0)),
+                int(cfg.get("base_hp", 100)),
+                int(cfg.get("base_attack", 10)),
+                int(cfg.get("base_defense", 5)),
+                int(cfg.get("base_lingqi", 50)),
+                float(cfg.get("breakthrough_rate", 1.0)),
+                float(cfg.get("death_rate", 0.0)),
+                _json.dumps(sub_costs) if sub_costs else "",
+                int(cfg.get("breakthrough_dao_yun_cost", 0)),
+            ))
+        await self.db.executemany(
+            """
+            INSERT OR IGNORE INTO realms (
+                level, name, has_sub_realm, high_realm,
+                exp_to_next, sub_exp_to_next,
+                base_hp, base_attack, base_defense, base_lingqi,
+                breakthrough_rate, death_rate,
+                sub_dao_yun_costs, breakthrough_dao_yun_cost
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        await self.db.commit()
+
+    async def _backfill_realm_dao_yun_defaults(self):
+        """为旧 realms 表补齐新增的道韵字段默认值，不覆盖已编辑数据。"""
+        import json as _json
+        from .constants import REALM_CONFIG as DEFAULT_REALM_CONFIG
+
+        changed = False
+        for level, cfg in DEFAULT_REALM_CONFIG.items():
+            default_sub_costs = cfg.get("sub_dao_yun_costs", [])
+            default_bt_cost = int(cfg.get("breakthrough_dao_yun_cost", 0))
+            if not default_sub_costs and default_bt_cost <= 0:
+                continue
+            sub_costs_text = _json.dumps(default_sub_costs) if default_sub_costs else ""
+            cur = await self.db.execute(
+                """
+                UPDATE realms
+                SET sub_dao_yun_costs = ?, breakthrough_dao_yun_cost = ?
+                WHERE level = ?
+                  AND COALESCE(sub_dao_yun_costs, '') = ''
+                """,
+                (sub_costs_text, default_bt_cost, int(level)),
+            )
+            if (cur.rowcount or 0) > 0:
+                changed = True
+        if changed:
+            await self.db.commit()
+
+    async def load_realms(self) -> dict[int, dict]:
+        """加载境界配置（独立表 -> 运行时 REALM_CONFIG）。"""
+        import json as _json
+        from .constants import REALM_CONFIG as DEFAULT_REALM_CONFIG
+
+        realms = {}
+        try:
+            async with self.db.execute(
+                """
+                SELECT level, name, has_sub_realm, high_realm,
+                       exp_to_next, sub_exp_to_next,
+                       base_hp, base_attack, base_defense, base_lingqi,
+                       breakthrough_rate, death_rate,
+                       sub_dao_yun_costs, breakthrough_dao_yun_cost
+                FROM realms
+                ORDER BY level ASC
+                """
+            ) as cur:
+                async for row in cur:
+                    level = int(row["level"])
+                    cfg: dict[str, Any] = {
+                        "name": row["name"],
+                        "has_sub_realm": bool(int(row["has_sub_realm"])),
+                        "exp_to_next": int(row["exp_to_next"]),
+                        "sub_exp_to_next": int(row["sub_exp_to_next"]),
+                        "base_hp": int(row["base_hp"]),
+                        "base_attack": int(row["base_attack"]),
+                        "base_defense": int(row["base_defense"]),
+                        "base_lingqi": int(row["base_lingqi"]),
+                        "breakthrough_rate": float(row["breakthrough_rate"]),
+                        "death_rate": float(row["death_rate"]),
+                    }
+                    if int(row["high_realm"]):
+                        cfg["high_realm"] = True
+                    raw_costs = str(row["sub_dao_yun_costs"] or "").strip()
+                    if raw_costs:
+                        try:
+                            cfg["sub_dao_yun_costs"] = _json.loads(raw_costs)
+                        except (ValueError, TypeError):
+                            pass
+                    bt_cost = int(row["breakthrough_dao_yun_cost"] or 0)
+                    if bt_cost > 0:
+                        cfg["breakthrough_dao_yun_cost"] = bt_cost
+                    realms[level] = cfg
+        except Exception:
+            return dict(DEFAULT_REALM_CONFIG)
+        return realms if realms else dict(DEFAULT_REALM_CONFIG)
+
+    async def admin_list_realms(self) -> list[dict[str, Any]]:
+        result = []
+        async with self.db.execute(
+            """
+            SELECT level, name, has_sub_realm, high_realm,
+                   exp_to_next, sub_exp_to_next,
+                   base_hp, base_attack, base_defense, base_lingqi,
+                   breakthrough_rate, death_rate,
+                   sub_dao_yun_costs, breakthrough_dao_yun_cost
+            FROM realms
+            ORDER BY level ASC
+            """
+        ) as cur:
+            async for row in cur:
+                result.append(dict(row))
+        return result
+
+    async def admin_has_realm_name(self, name: str, exclude_level: int | None = None) -> bool:
+        if exclude_level is not None:
+            async with self.db.execute(
+                "SELECT 1 FROM realms WHERE name = ? AND level != ? LIMIT 1",
+                (name, exclude_level),
+            ) as cur:
+                return (await cur.fetchone()) is not None
+        async with self.db.execute(
+            "SELECT 1 FROM realms WHERE name = ? LIMIT 1", (name,),
+        ) as cur:
+            return (await cur.fetchone()) is not None
+
+    async def admin_create_realm(self, data: dict[str, Any]) -> bool:
+        cur = await self.db.execute(
+            """
+            INSERT OR IGNORE INTO realms (
+                level, name, has_sub_realm, high_realm,
+                exp_to_next, sub_exp_to_next,
+                base_hp, base_attack, base_defense, base_lingqi,
+                breakthrough_rate, death_rate,
+                sub_dao_yun_costs, breakthrough_dao_yun_cost
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(data["level"]),
+                data["name"],
+                int(data.get("has_sub_realm", 0)),
+                int(data.get("high_realm", 0)),
+                int(data.get("exp_to_next", 100)),
+                int(data.get("sub_exp_to_next", 0)),
+                int(data.get("base_hp", 100)),
+                int(data.get("base_attack", 10)),
+                int(data.get("base_defense", 5)),
+                int(data.get("base_lingqi", 50)),
+                float(data.get("breakthrough_rate", 1.0)),
+                float(data.get("death_rate", 0.0)),
+                str(data.get("sub_dao_yun_costs", "")),
+                int(data.get("breakthrough_dao_yun_cost", 0)),
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_update_realm(self, level: int, data: dict[str, Any]) -> bool:
+        cur = await self.db.execute(
+            """
+            UPDATE realms
+            SET name = ?, has_sub_realm = ?, high_realm = ?,
+                exp_to_next = ?, sub_exp_to_next = ?,
+                base_hp = ?, base_attack = ?, base_defense = ?, base_lingqi = ?,
+                breakthrough_rate = ?, death_rate = ?,
+                sub_dao_yun_costs = ?, breakthrough_dao_yun_cost = ?
+            WHERE level = ?
+            """,
+            (
+                data["name"],
+                int(data.get("has_sub_realm", 0)),
+                int(data.get("high_realm", 0)),
+                int(data.get("exp_to_next", 100)),
+                int(data.get("sub_exp_to_next", 0)),
+                int(data.get("base_hp", 100)),
+                int(data.get("base_attack", 10)),
+                int(data.get("base_defense", 5)),
+                int(data.get("base_lingqi", 50)),
+                float(data.get("breakthrough_rate", 1.0)),
+                float(data.get("death_rate", 0.0)),
+                str(data.get("sub_dao_yun_costs", "")),
+                int(data.get("breakthrough_dao_yun_cost", 0)),
+                level,
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_delete_realm(self, level: int) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM realms WHERE level = ?",
+            (level,),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def get_realm_names(self) -> dict[int, str]:
+        """获取境界等级->名称映射（公开API用）。"""
+        result = {}
+        async with self.db.execute(
+            "SELECT level, name FROM realms ORDER BY level ASC"
+        ) as cur:
+            async for row in cur:
+                result[int(row["level"])] = row["name"]
+        return result
 
     async def _seed_adventure_scenes(self):
         """若场景表为空，填充40条历练场景数据。"""

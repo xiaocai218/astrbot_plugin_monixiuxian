@@ -118,5 +118,11 @@
     "type": "bool",
     "default": false,
     "hint": "默认关闭以降低启动风险；开启前请确认已安装 fastapi/uvicorn 依赖"
+  },
+  "web_link_message": {
+    "description": "web指令自定义回复内容",
+    "type": "string",
+    "default": "修仙世界网页版：http://<服务器IP>:{port}\n在浏览器中打开即可游玩",
+    "hint": "输入\"修仙 web\"时的回复文本，可用 {port} 占位符代表端口号"
   }
 }

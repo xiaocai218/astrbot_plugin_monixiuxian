@@ -13,7 +13,7 @@ from .constants import (
     get_total_gongfa_bonus, can_cultivate_gongfa,
     get_max_sub_realm, get_player_base_max_lingqi, get_player_base_stats,
     get_sub_realm_dao_yun_cost, get_breakthrough_dao_yun_cost,
-    is_high_realm,
+    get_nearest_realm_level, get_next_realm_level,
     DEATH_REALM_START,
 )
 from .models import Player
@@ -38,7 +38,22 @@ async def perform_cultivate(player: Player, cooldown: int = 60) -> dict:
             "sub_level_up": False,
         }
 
-    realm_cfg = REALM_CONFIG[player.realm]
+    normalized_realm = get_nearest_realm_level(player.realm)
+    if normalized_realm != player.realm:
+        player.realm = normalized_realm
+    if has_sub_realm(player.realm):
+        player.sub_realm = max(0, min(int(player.sub_realm), get_max_sub_realm(player.realm)))
+    else:
+        player.sub_realm = 0
+
+    realm_cfg = REALM_CONFIG.get(player.realm)
+    if not realm_cfg:
+        return {
+            "success": False,
+            "exp_gained": 0,
+            "message": "当前境界配置无效，无法修炼",
+            "sub_level_up": False,
+        }
     # 基础经验
     base_min = 10 + player.realm * 5 + player.sub_realm * 2
     base_max = 30 + player.realm * 10 + player.sub_realm * 4
@@ -220,10 +235,23 @@ async def attempt_breakthrough(player: Player, bonus_rate: float = 0.0,
     Returns:
         {"success": bool, "message": str, "new_realm": str | None, "died": bool}
     """
-    realm_cfg = REALM_CONFIG[player.realm]
+    normalized_realm = get_nearest_realm_level(player.realm)
+    if normalized_realm != player.realm:
+        player.realm = normalized_realm
+    if has_sub_realm(player.realm):
+        player.sub_realm = max(0, min(int(player.sub_realm), get_max_sub_realm(player.realm)))
+    else:
+        player.sub_realm = 0
 
-    if player.realm >= RealmLevel.MAHAYANA:
-        return {"success": False, "message": "已达大乘期，无法继续突破",
+    realm_cfg = REALM_CONFIG.get(player.realm)
+    if not realm_cfg:
+        return {"success": False, "message": "当前境界配置无效，无法突破",
+                "new_realm": None, "died": False}
+
+    next_realm = get_next_realm_level(player.realm)
+    if next_realm is None:
+        max_name = REALM_CONFIG.get(player.realm, {}).get("name", "最高境界")
+        return {"success": False, "message": f"已达{max_name}，无法继续突破",
                 "new_realm": None, "died": False}
 
     # 有小境界的大境界，必须到圆满才能突破
@@ -279,7 +307,7 @@ async def attempt_breakthrough(player: Player, bonus_rate: float = 0.0,
     rate_percent = int(rate * 100)
 
     if random.random() <= rate:
-        player.realm += 1
+        player.realm = next_realm
         player.sub_realm = 0
         player.exp = 0
         player.breakthrough_bonus = 0.0  # 成功后清零累积加成

@@ -1,0 +1,105 @@
+<svg width="1024" height="192" viewBox="0 0 1024 192" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="frameGold" x1="88" y1="96" x2="936" y2="96" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#6F4D1D"/>
+      <stop offset="0.18" stop-color="#B98A36"/>
+      <stop offset="0.34" stop-color="#F6E0A0"/>
+      <stop offset="0.5" stop-color="#FFE9A8"/>
+      <stop offset="0.67" stop-color="#D6A94B"/>
+      <stop offset="0.84" stop-color="#8D6228"/>
+      <stop offset="1" stop-color="#5F4218"/>
+    </linearGradient>
+    <linearGradient id="darkMetal" x1="512" y1="44" x2="512" y2="148" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#251C26"/>
+      <stop offset="0.45" stop-color="#120F18"/>
+      <stop offset="1" stop-color="#08070D"/>
+    </linearGradient>
+    <linearGradient id="jadeGlow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#C9FFF1"/>
+      <stop offset="0.4" stop-color="#68E3D0"/>
+      <stop offset="1" stop-color="#1A8C8A"/>
+    </linearGradient>
+    <linearGradient id="innerAura" x1="136" y1="96" x2="888" y2="96" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4AD7D4"/>
+      <stop offset="0.5" stop-color="#D2FFF5"/>
+      <stop offset="1" stop-color="#4AD7D4"/>
+    </linearGradient>
+    <filter id="goldGlow" x="-40%" y="-120%" width="180%" height="340%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="1 0 0 0 0.91 0 1 0 0 0.72 0 0 1 0 0.34 0 0 0 0.6 0"/>
+      <feBlend mode="screen" in2="SourceGraphic"/>
+    </filter>
+    <filter id="cyanGlow" x="-40%" y="-180%" width="180%" height="460%">
+      <feGaussianBlur stdDeviation="5" result="blur"/>
+      <feColorMatrix in="blur" type="matrix" values="1 0 0 0 0.24 0 1 0 0 0.93 0 0 1 0 0.9 0 0 0 0.75 0"/>
+      <feBlend mode="screen" in2="SourceGraphic"/>
+    </filter>
+    <filter id="shadow" x="-10%" y="-20%" width="120%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#shadow)">
+    <path
+      d="M120 44H904A32 32 0 0 1 936 76V116A32 32 0 0 1 904 148H120A32 32 0 0 1 88 116V76A32 32 0 0 1 120 44ZM156 72H868A20 20 0 0 1 888 92V100A20 20 0 0 1 868 120H156A20 20 0 0 1 136 100V92A20 20 0 0 1 156 72Z"
+      fill="url(#darkMetal)"
+      fill-rule="evenodd"
+      clip-rule="evenodd"
+    />
+    <path
+      d="M120 44H904A32 32 0 0 1 936 76V116A32 32 0 0 1 904 148H120A32 32 0 0 1 88 116V76A32 32 0 0 1 120 44Z"
+      stroke="url(#frameGold)"
+      stroke-width="4"
+    />
+    <path
+      d="M156 72H868A20 20 0 0 1 888 92V100A20 20 0 0 1 868 120H156A20 20 0 0 1 136 100V92A20 20 0 0 1 156 72Z"
+      stroke="#8C6A2D"
+      stroke-width="3"
+    />
+
+    <path d="M144 58H880" stroke="#FDE6A4" stroke-opacity="0.7" stroke-width="2"/>
+    <path d="M144 134H880" stroke="#7B5A25" stroke-opacity="0.9" stroke-width="2"/>
+    <path d="M184 96H840" stroke="url(#innerAura)" stroke-opacity="0.9" stroke-width="2.5" filter="url(#cyanGlow)"/>
+
+    <path d="M126 76L154 52H194L172 76H126Z" fill="#2B2330" stroke="url(#frameGold)" stroke-width="3"/>
+    <path d="M898 76L870 52H830L852 76H898Z" fill="#2B2330" stroke="url(#frameGold)" stroke-width="3"/>
+    <path d="M126 116L154 140H194L172 116H126Z" fill="#2B2330" stroke="url(#frameGold)" stroke-width="3"/>
+    <path d="M898 116L870 140H830L852 116H898Z" fill="#2B2330" stroke="url(#frameGold)" stroke-width="3"/>
+
+    <path d="M66 96L120 50L164 50L136 96L164 142L120 142L66 96Z" fill="url(#darkMetal)" stroke="url(#frameGold)" stroke-width="4"/>
+    <path d="M958 96L904 50L860 50L888 96L860 142L904 142L958 96Z" fill="url(#darkMetal)" stroke="url(#frameGold)" stroke-width="4"/>
+
+    <path d="M86 96L118 66L140 96L118 126L86 96Z" fill="url(#jadeGlow)" filter="url(#cyanGlow)"/>
+    <path d="M938 96L906 66L884 96L906 126L938 96Z" fill="url(#jadeGlow)" filter="url(#cyanGlow)"/>
+
+    <path d="M182 52L206 44L230 52L206 60L182 52Z" fill="#F7E6B0" fill-opacity="0.85"/>
+    <path d="M842 52L818 44L794 52L818 60L842 52Z" fill="#F7E6B0" fill-opacity="0.85"/>
+    <path d="M182 140L206 148L230 140L206 132L182 140Z" fill="#8EDFD5" fill-opacity="0.78"/>
+    <path d="M842 140L818 148L794 140L818 132L842 140Z" fill="#8EDFD5" fill-opacity="0.78"/>
+
+    <path d="M248 58L264 50L280 58L264 66L248 58Z" fill="#CFA34B"/>
+    <path d="M776 58L760 50L744 58L760 66L776 58Z" fill="#CFA34B"/>
+    <path d="M248 134L264 142L280 134L264 126L248 134Z" fill="#5FCFC6"/>
+    <path d="M776 134L760 142L744 134L760 126L776 134Z" fill="#5FCFC6"/>
+
+    <g stroke="#DDB869" stroke-width="2" stroke-linecap="round" opacity="0.85">
+      <path d="M294 58V66"/>
+      <path d="M322 58V66"/>
+      <path d="M350 58V66"/>
+      <path d="M674 58V66"/>
+      <path d="M702 58V66"/>
+      <path d="M730 58V66"/>
+      <path d="M294 126V134"/>
+      <path d="M322 126V134"/>
+      <path d="M350 126V134"/>
+      <path d="M674 126V134"/>
+      <path d="M702 126V134"/>
+      <path d="M730 126V134"/>
+    </g>
+
+    <g filter="url(#goldGlow)" opacity="0.7">
+      <path d="M210 96H252" stroke="#F5CF72" stroke-width="2"/>
+      <path d="M814 96H772" stroke="#F5CF72" stroke-width="2"/>
+    </g>
+  </g>
+</svg>

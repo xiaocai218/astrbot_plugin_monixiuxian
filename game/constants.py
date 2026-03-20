@@ -104,7 +104,9 @@ REALM_CONFIG: dict[int, dict] = {
         "base_defense": 600,
         "base_lingqi": 3600,
         "breakthrough_rate": 0.25,
-        "death_rate": 0.10,         # 10% 死亡
+        "death_rate": 0.10,
+        "sub_dao_yun_costs": [50, 80, 100, 120],
+        "breakthrough_dao_yun_cost": 120,
     },
     RealmLevel.VOID_MERGE: {
         "name": "合虚期",
@@ -117,7 +119,9 @@ REALM_CONFIG: dict[int, dict] = {
         "base_defense": 1500,
         "base_lingqi": 8000,
         "breakthrough_rate": 0.18,
-        "death_rate": 0.15,         # 15% 死亡
+        "death_rate": 0.15,
+        "sub_dao_yun_costs": [240, 260, 280, 300],
+        "breakthrough_dao_yun_cost": 300,
     },
     RealmLevel.TRIBULATION: {
         "name": "渡劫期",
@@ -130,7 +134,9 @@ REALM_CONFIG: dict[int, dict] = {
         "base_defense": 4000,
         "base_lingqi": 18000,
         "breakthrough_rate": 0.12,
-        "death_rate": 0.20,         # 20% 死亡
+        "death_rate": 0.20,
+        "sub_dao_yun_costs": [600, 640, 680, 720],
+        "breakthrough_dao_yun_cost": 720,
     },
     RealmLevel.MAHAYANA: {
         "name": "大乘期",
@@ -143,7 +149,9 @@ REALM_CONFIG: dict[int, dict] = {
         "base_defense": 10000,
         "base_lingqi": 40000,
         "breakthrough_rate": 0.0,
-        "death_rate": 0.30,         # 30% 死亡（若有更高境界）
+        "death_rate": 0.30,
+        "sub_dao_yun_costs": [1440, 1520, 1600, 1680],
+        "breakthrough_dao_yun_cost": 1680,
     },
 }
 
@@ -495,11 +503,15 @@ def get_daily_recycle_price(item_id: str, target_date: date | None = None) -> in
 
 
 def can_equip(realm: int, tier: int) -> bool:
-    """检查指定境界能否装备指定品阶的装备。"""
+    """检查指定境界能否装备指定品阶的装备。超出预设上限的境界视为满足最高品阶要求。"""
     req = TIER_REALM_REQUIREMENTS.get(tier)
     if not req:
         return False
-    return req[0] <= realm <= req[1]
+    min_r, max_r = req
+    # 境界超出预设范围时，只检查下限
+    if realm > max(v[1] for v in TIER_REALM_REQUIREMENTS.values()):
+        return realm >= min_r
+    return min_r <= realm <= max_r
 
 
 def get_equip_bonus(player_weapon: str, player_armor: str) -> dict:
@@ -1214,6 +1226,62 @@ def get_total_gongfa_bonus(player) -> dict:
 _refresh_gongfa_scroll_items()
 
 
+def set_realm_config(realms: dict[int, dict]):
+    """替换境界配置（供数据库加载后同步到运行时）。"""
+    REALM_CONFIG.clear()
+    REALM_CONFIG.update(realms)
+
+
+def get_sorted_realm_levels() -> list[int]:
+    """按从低到高返回当前已配置的境界等级。"""
+    return sorted(int(level) for level in REALM_CONFIG.keys())
+
+
+def get_max_realm_level() -> int:
+    """获取当前配置的最大境界等级。"""
+    levels = get_sorted_realm_levels()
+    return levels[-1] if levels else 0
+
+
+def get_next_realm_level(realm: int) -> int | None:
+    """获取比当前境界更高的下一个已配置境界。"""
+    current = int(realm)
+    for level in get_sorted_realm_levels():
+        if level > current:
+            return level
+    return None
+
+
+def get_previous_realm_level(realm: int) -> int | None:
+    """获取比当前境界更低的上一个已配置境界。"""
+    current = int(realm)
+    prev = None
+    for level in get_sorted_realm_levels():
+        if level >= current:
+            break
+        prev = level
+    return prev
+
+
+def get_nearest_realm_level(realm: int) -> int:
+    """获取与给定等级最接近的已配置境界，优先回退到更低境界。"""
+    current = int(realm)
+    if current in REALM_CONFIG:
+        return current
+    levels = get_sorted_realm_levels()
+    if not levels:
+        return 0
+    prev = get_previous_realm_level(current)
+    nxt = get_next_realm_level(current)
+    if prev is None:
+        return nxt if nxt is not None else levels[0]
+    if nxt is None:
+        return prev
+    if abs(current - prev) <= abs(nxt - current):
+        return prev
+    return nxt
+
+
 def has_sub_realm(realm: int) -> bool:
     """该大境界是否有小境界。"""
     cfg = REALM_CONFIG.get(realm)
@@ -1236,28 +1304,18 @@ def get_max_sub_realm(realm: int) -> int:
 
 
 def get_sub_realm_dao_yun_cost(realm: int, sub_realm: int) -> int:
-    """获取从 sub_realm 升到 sub_realm+1 所需道韵（仅化神~大乘）。
-    化神：50/80/100/120，合虚：240/260/280/300，
-    渡劫：600/640/680/720，大乘：1440/1520/1600/1680。"""
-    if not is_high_realm(realm):
+    """获取从 sub_realm 升到 sub_realm+1 所需道韵（从 REALM_CONFIG 动态读取）。"""
+    cfg = REALM_CONFIG.get(realm, {})
+    costs = cfg.get("sub_dao_yun_costs", [])
+    if not costs:
         return 0
-
-    realm_offset = realm - RealmLevel.DEITY_TRANSFORM
-    costs_map = {
-        0: [50, 80, 100, 120],      # 化神
-        1: [240, 260, 280, 300],    # 合虚
-        2: [600, 640, 680, 720],    # 渡劫
-        3: [1440, 1520, 1600, 1680] # 大乘
-    }
-    costs = costs_map.get(realm_offset, [])
     return costs[sub_realm] if sub_realm < len(costs) else 0
 
 
 def get_breakthrough_dao_yun_cost(realm: int) -> int:
-    """获取从 realm 突破到 realm+1 所需道韵（仅化神~渡劫）。"""
-    if not is_high_realm(realm) or realm >= RealmLevel.MAHAYANA:
-        return 0
-    return get_sub_realm_dao_yun_cost(realm, 3)
+    """获取从 realm 突破到 realm+1 所需道韵（从 REALM_CONFIG 动态读取）。"""
+    cfg = REALM_CONFIG.get(realm, {})
+    return int(cfg.get("breakthrough_dao_yun_cost", 0))
 
 
 def get_realm_name(realm: int, sub_realm: int = 0) -> str:
