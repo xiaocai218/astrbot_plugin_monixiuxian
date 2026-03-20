@@ -46,7 +46,6 @@ async def use_item(player: Player, item_id: str, count: int = 1) -> dict:
 
     # 突破丹特殊检查：突破率100%时无法使用（支持新旧丹药）
     if "breakthrough_bonus" in item.effect and "_temp_buff" not in item.effect:
-        from .constants import REALM_CONFIG
         realm_cfg = REALM_CONFIG.get(player.realm, {})
         base_rate = realm_cfg.get("breakthrough_rate", 0.0)
         accumulated_bonus = getattr(player, 'breakthrough_bonus', 0.0)

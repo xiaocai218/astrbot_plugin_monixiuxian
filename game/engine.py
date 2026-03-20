@@ -498,7 +498,32 @@ class GameEngine:
         if player.realm < RealmLevel.QI_REFINING:
             return {"success": False, "message": "修为尚浅，至少需要练气期才能历练"}
 
-        return await self.dungeon.start(player)
+        if self.dungeon.has_active_session(user_id) or self.pvp.get_session_for_player(user_id):
+            return await self.dungeon.start(player)
+
+        cfg = self._checkin_config or {}
+        try:
+            cooldown = int(cfg.get("adventure_cooldown", 1800))
+        except (TypeError, ValueError):
+            cooldown = 1800
+        cooldown = max(0, cooldown)
+
+        now = time.time()
+        if cooldown > 0 and player.last_adventure_time > 0:
+            remaining = cooldown - (now - player.last_adventure_time)
+            if remaining > 0:
+                remaining = int(remaining)
+                mins = remaining // 60
+                secs = remaining % 60
+                if mins > 0:
+                    return {"success": False, "message": f"历练冷却中，请等待{mins}分{secs}秒后再试"}
+                return {"success": False, "message": f"历练冷却中，请等待{secs}秒后再试"}
+
+        result = await self.dungeon.start(player)
+        if result.get("success"):
+            player.last_adventure_time = now
+            await self._save_player(player)
+        return result
 
     async def get_adventure_scenes(self) -> list[dict]:
         """获取所有历练场景列表。"""

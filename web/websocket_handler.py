@@ -952,10 +952,7 @@ async def _handle_message(
 
     # ── 副本系统 ─────────────────────────────────────────
     elif msg_type == "dungeon_start":
-        player = await engine.get_player(user_id)
-        if not player:
-            return {"type": "error", "message": "角色不存在"}
-        result = await engine.dungeon.start(player)
+        result = await engine.adventure(user_id)
         return {"type": "action_result", "action": "dungeon_start", "data": result}
 
     elif msg_type == "dungeon_advance":

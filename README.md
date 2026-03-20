@@ -1,4 +1,4 @@
-# astrbot_plugin_xiuxian
+# astrbot_plugin_monixiuxian
 
 修仙世界（AstrBot 插件），提供聊天指令 + Web 双端玩法，包含修炼、突破、签到、挂机、历练、装备、宗门、世界频道、排行榜、管理员面板等功能。
 
