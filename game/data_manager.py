@@ -283,7 +283,8 @@ class DataManager:
                 join_policy   TEXT DEFAULT 'open',
                 min_realm     INTEGER DEFAULT 0,
                 created_at    REAL NOT NULL,
-                announcement  TEXT DEFAULT ''
+                announcement  TEXT DEFAULT '',
+                warehouse_capacity INTEGER DEFAULT 200
             )
         """)
         # 宗门成员关系表
@@ -293,6 +294,7 @@ class DataManager:
                 sect_id   TEXT NOT NULL,
                 role      TEXT NOT NULL DEFAULT 'disciple',
                 joined_at REAL NOT NULL,
+                contribution_points INTEGER DEFAULT 0,
                 FOREIGN KEY (sect_id) REFERENCES sects(sect_id)
             )
         """)
@@ -315,6 +317,36 @@ class DataManager:
         await self.db.execute("""
             CREATE INDEX IF NOT EXISTS idx_sect_applications_sect
             ON sect_applications (sect_id, status)
+        """)
+        # 宗门仓库表
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS sect_warehouse (
+                sect_id   TEXT NOT NULL,
+                item_id   TEXT NOT NULL,
+                quantity  INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (sect_id, item_id),
+                FOREIGN KEY (sect_id) REFERENCES sects(sect_id)
+            )
+        """)
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sect_warehouse_sect
+            ON sect_warehouse (sect_id)
+        """)
+        # 宗门贡献点规则配置表
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS sect_contribution_config (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                sect_id     TEXT NOT NULL,
+                rule_type   TEXT NOT NULL,
+                target_key  TEXT NOT NULL,
+                points      INTEGER NOT NULL,
+                UNIQUE(sect_id, rule_type, target_key),
+                FOREIGN KEY (sect_id) REFERENCES sects(sect_id)
+            )
+        """)
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sect_contrib_config_sect
+            ON sect_contribution_config (sect_id)
         """)
         await self.db.commit()
         # 数据库升级：为旧表添加新列
@@ -634,6 +666,8 @@ class DataManager:
         await self._alter_add_column("sect_applications", "applied_at", "REAL DEFAULT 0.0")
         await self._alter_add_column("sect_applications", "resolved_at", "REAL")
         await self._alter_add_column("sect_applications", "resolved_by", "TEXT")
+        await self._alter_add_column("sect_members", "contribution_points", "INTEGER DEFAULT 0")
+        await self._alter_add_column("sects", "warehouse_capacity", "INTEGER DEFAULT 200")
         try:
             await self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sects_name_unique ON sects (name)")
             await self.db.commit()
@@ -2223,10 +2257,10 @@ class DataManager:
         await self.db.commit()
 
     async def load_sect_members(self, sect_id: str) -> list[dict]:
-        """加载宗门所有成员（含玩家名和境界）。"""
+        """加载宗门所有成员（含玩家名、境界和贡献点）。"""
         await self._ensure_sect_schema()
         cur = await self.db.execute(
-            """SELECT m.user_id, m.role, m.joined_at,
+            """SELECT m.user_id, m.role, m.joined_at, m.contribution_points,
                       p.name AS player_name, p.realm, p.sub_realm
                FROM sect_members m
                LEFT JOIN players p ON m.user_id = p.user_id
@@ -2282,3 +2316,286 @@ class DataManager:
             (role, user_id),
         )
         await self.db.commit()
+
+    # ── 宗门仓库 ──────────────────────────────────────────
+
+    async def get_sect_warehouse(self, sect_id: str) -> list[dict]:
+        """获取宗门仓库所有物品。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT item_id, quantity FROM sect_warehouse WHERE sect_id = ? AND quantity > 0",
+            (sect_id,),
+        )
+        rows = await cur.fetchall()
+        return [{"item_id": r[0], "quantity": r[1]} for r in rows]
+
+    async def get_sect_warehouse_item(self, sect_id: str, item_id: str) -> int:
+        """获取宗门仓库中某物品数量。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT quantity FROM sect_warehouse WHERE sect_id = ? AND item_id = ?",
+            (sect_id, item_id),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def get_sect_warehouse_slot_count(self, sect_id: str) -> int:
+        """获取宗门仓库已使用格数（不同物品种类数）。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT COUNT(*) FROM sect_warehouse WHERE sect_id = ? AND quantity > 0",
+            (sect_id,),
+        )
+        return (await cur.fetchone())[0]
+
+    async def add_sect_warehouse_item(self, sect_id: str, item_id: str, quantity: int) -> None:
+        """向宗门仓库添加物品。"""
+        await self._ensure_sect_schema()
+        await self.db.execute(
+            """INSERT INTO sect_warehouse (sect_id, item_id, quantity)
+               VALUES (?, ?, ?)
+               ON CONFLICT(sect_id, item_id) DO UPDATE SET quantity = quantity + ?""",
+            (sect_id, item_id, quantity, quantity),
+        )
+        await self.db.commit()
+
+    async def remove_sect_warehouse_item(self, sect_id: str, item_id: str, quantity: int) -> bool:
+        """从宗门仓库移除物品，返回是否成功。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT quantity FROM sect_warehouse WHERE sect_id = ? AND item_id = ?",
+            (sect_id, item_id),
+        )
+        row = await cur.fetchone()
+        if not row or row[0] < quantity:
+            return False
+        new_qty = row[0] - quantity
+        if new_qty <= 0:
+            await self.db.execute(
+                "DELETE FROM sect_warehouse WHERE sect_id = ? AND item_id = ?",
+                (sect_id, item_id),
+            )
+        else:
+            await self.db.execute(
+                "UPDATE sect_warehouse SET quantity = ? WHERE sect_id = ? AND item_id = ?",
+                (new_qty, sect_id, item_id),
+            )
+        await self.db.commit()
+        return True
+
+    async def delete_sect_warehouse(self, sect_id: str) -> None:
+        """删除宗门仓库所有物品（解散宗门时调用）。"""
+        await self._ensure_sect_schema()
+        await self.db.execute(
+            "DELETE FROM sect_warehouse WHERE sect_id = ?", (sect_id,),
+        )
+        await self.db.commit()
+
+    async def warehouse_deposit_atomic(
+        self, player: "Player", sect_id: str, item_id: str, quantity: int,
+        contribution_delta: int,
+    ) -> dict:
+        """独立连接事务：仓库入库 + 贡献点增加 + 玩家落库。
+
+        返回 {"success": True, "contribution": int}
+        或 {"success": False, "reason": ...}。
+        """
+        conn: aiosqlite.Connection | None = None
+        try:
+            conn = await aiosqlite.connect(self._db_path)
+            await conn.execute("PRAGMA busy_timeout = 30000")
+            await conn.execute("BEGIN IMMEDIATE")
+
+            # 复检仓库容量
+            cur = await conn.execute(
+                "SELECT warehouse_capacity FROM sects WHERE sect_id = ?", (sect_id,),
+            )
+            sect_row = await cur.fetchone()
+            if not sect_row:
+                await conn.rollback()
+                return {"success": False, "reason": "sect_not_found"}
+            capacity = sect_row[0] if sect_row[0] is not None else 200
+
+            cur2 = await conn.execute(
+                "SELECT quantity FROM sect_warehouse WHERE sect_id = ? AND item_id = ?",
+                (sect_id, item_id),
+            )
+            existing = await cur2.fetchone()
+            if not existing or existing[0] == 0:
+                cur3 = await conn.execute(
+                    "SELECT COUNT(*) FROM sect_warehouse WHERE sect_id = ? AND quantity > 0",
+                    (sect_id,),
+                )
+                slots_used = (await cur3.fetchone())[0]
+                if slots_used >= capacity:
+                    await conn.rollback()
+                    return {"success": False, "reason": "warehouse_full"}
+
+            # 写仓库
+            await conn.execute(
+                """INSERT INTO sect_warehouse (sect_id, item_id, quantity)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(sect_id, item_id) DO UPDATE SET quantity = quantity + ?""",
+                (sect_id, item_id, quantity, quantity),
+            )
+
+            # 加贡献点（校验成员仍在该宗门）
+            cur_contrib = await conn.execute(
+                "UPDATE sect_members SET contribution_points = contribution_points + ? "
+                "WHERE user_id = ? AND sect_id = ?",
+                (contribution_delta, player.user_id, sect_id),
+            )
+            if cur_contrib.rowcount == 0:
+                await conn.rollback()
+                return {"success": False, "reason": "member_not_found"}
+
+            # 玩家落库
+            await self._upsert_player(player, db=conn)
+            await conn.commit()
+
+            # 事务完成后读贡献点（用主连接）
+            new_contribution = await self.get_member_contribution(player.user_id)
+            return {"success": True, "contribution": new_contribution}
+        except Exception:
+            if conn is not None:
+                await conn.rollback()
+            raise
+        finally:
+            if conn is not None:
+                await conn.close()
+
+    async def warehouse_exchange_atomic(
+        self, player: "Player", sect_id: str, item_id: str, quantity: int,
+        contribution_cost: int,
+    ) -> dict:
+        """独立连接事务：条件扣贡献点 + 条件扣仓库 + 玩家落库。
+
+        返回 {"success": True, "contribution": int}
+        或 {"success": False, "reason": "insufficient_stock"|"insufficient_contribution"}。
+        """
+        conn: aiosqlite.Connection | None = None
+        try:
+            conn = await aiosqlite.connect(self._db_path)
+            await conn.execute("PRAGMA busy_timeout = 30000")
+            await conn.execute("BEGIN IMMEDIATE")
+
+            # 条件扣贡献点
+            cur = await conn.execute(
+                "UPDATE sect_members "
+                "SET contribution_points = contribution_points - ? "
+                "WHERE user_id = ? AND sect_id = ? AND contribution_points >= ?",
+                (contribution_cost, player.user_id, sect_id, contribution_cost),
+            )
+            if cur.rowcount == 0:
+                await conn.rollback()
+                return {"success": False, "reason": "insufficient_contribution"}
+
+            # 条件扣仓库
+            cur2 = await conn.execute(
+                "UPDATE sect_warehouse "
+                "SET quantity = quantity - ? "
+                "WHERE sect_id = ? AND item_id = ? AND quantity >= ?",
+                (quantity, sect_id, item_id, quantity),
+            )
+            if cur2.rowcount == 0:
+                await conn.rollback()
+                return {"success": False, "reason": "insufficient_stock"}
+
+            # 清理零库存行
+            await conn.execute(
+                "DELETE FROM sect_warehouse WHERE sect_id = ? AND item_id = ? AND quantity <= 0",
+                (sect_id, item_id),
+            )
+
+            # 玩家落库
+            await self._upsert_player(player, db=conn)
+            await conn.commit()
+
+            # 事务完成后读贡献点（用主连接）
+            new_contribution = await self.get_member_contribution(player.user_id)
+            return {"success": True, "contribution": new_contribution}
+        except Exception:
+            if conn is not None:
+                await conn.rollback()
+            raise
+        finally:
+            if conn is not None:
+                await conn.close()
+
+    # ── 宗门贡献点规则 ────────────────────────────────────
+
+    async def get_contribution_config(self, sect_id: str) -> list[dict]:
+        """获取宗门全部贡献点规则。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT rule_type, target_key, points FROM sect_contribution_config WHERE sect_id = ?",
+            (sect_id,),
+        )
+        rows = await cur.fetchall()
+        return [{"rule_type": r[0], "target_key": r[1], "points": r[2]} for r in rows]
+
+    async def get_contribution_config_by_key(
+        self, sect_id: str, rule_type: str, target_key: str,
+    ) -> int | None:
+        """获取某条具体规则的贡献点数。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT points FROM sect_contribution_config WHERE sect_id = ? AND rule_type = ? AND target_key = ?",
+            (sect_id, rule_type, target_key),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else None
+
+    async def set_contribution_config(
+        self, sect_id: str, rule_type: str, target_key: str, points: int,
+    ) -> None:
+        """设置/更新一条贡献点规则。"""
+        await self._ensure_sect_schema()
+        await self.db.execute(
+            """INSERT INTO sect_contribution_config (sect_id, rule_type, target_key, points)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(sect_id, rule_type, target_key) DO UPDATE SET points = ?""",
+            (sect_id, rule_type, target_key, points, points),
+        )
+        await self.db.commit()
+
+    async def delete_contribution_config(
+        self, sect_id: str, rule_type: str, target_key: str,
+    ) -> None:
+        """删除一条贡献点规则。"""
+        await self._ensure_sect_schema()
+        await self.db.execute(
+            "DELETE FROM sect_contribution_config WHERE sect_id = ? AND rule_type = ? AND target_key = ?",
+            (sect_id, rule_type, target_key),
+        )
+        await self.db.commit()
+
+    async def delete_all_contribution_config(self, sect_id: str) -> None:
+        """删除宗门所有贡献点规则（解散宗门时调用）。"""
+        await self._ensure_sect_schema()
+        await self.db.execute(
+            "DELETE FROM sect_contribution_config WHERE sect_id = ?", (sect_id,),
+        )
+        await self.db.commit()
+
+    # ── 成员贡献点 ────────────────────────────────────────
+
+    async def get_member_contribution(self, user_id: str) -> int:
+        """获取成员贡献点。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT contribution_points FROM sect_members WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def update_member_contribution(self, user_id: str, delta: int) -> int:
+        """增减成员贡献点，返回新值。"""
+        await self._ensure_sect_schema()
+        await self.db.execute(
+            "UPDATE sect_members SET contribution_points = MAX(0, contribution_points + ?) WHERE user_id = ?",
+            (delta, user_id),
+        )
+        await self.db.commit()
+        return await self.get_member_contribution(user_id)

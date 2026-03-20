@@ -1156,5 +1156,69 @@ async def _handle_message(
             await _broadcast_sect_changed(ws_manager, exclude_user_id=user_id)
         return {"type": "action_result", "action": "sect_disband", "data": result}
 
+    # ── 宗门仓库 ──────────────────────────────────────────
+
+    elif msg_type == "sect_warehouse_list":
+        data = await engine.sect_warehouse_list(user_id)
+        return {"type": "sect_warehouse_data", "data": data}
+
+    elif msg_type == "sect_warehouse_deposit":
+        d = msg.get("data", {})
+        item_id = str(d.get("item_id", "")).strip()
+        if not item_id:
+            return {"type": "error", "message": "缺少物品ID"}
+        try:
+            count = max(1, int(d.get("count", 1)))
+        except (TypeError, ValueError):
+            count = 1
+        result = await engine.sect_warehouse_deposit(user_id, item_id, count)
+        if result.get("success"):
+            await _broadcast_sect_changed(ws_manager, exclude_user_id=user_id)
+        return {"type": "action_result", "action": "sect_warehouse_deposit", "data": result}
+
+    elif msg_type == "sect_warehouse_exchange":
+        d = msg.get("data", {})
+        item_id = str(d.get("item_id", "")).strip()
+        if not item_id:
+            return {"type": "error", "message": "缺少物品ID"}
+        try:
+            count = max(1, int(d.get("count", 1)))
+        except (TypeError, ValueError):
+            count = 1
+        result = await engine.sect_warehouse_exchange(user_id, item_id, count)
+        if result.get("success"):
+            await _broadcast_sect_changed(ws_manager, exclude_user_id=user_id)
+        return {"type": "action_result", "action": "sect_warehouse_exchange", "data": result}
+
+    elif msg_type == "sect_contribution_rules":
+        data = await engine.sect_get_contribution_rules(user_id)
+        return {"type": "sect_contribution_rules_data", "data": data}
+
+    elif msg_type == "sect_set_submit_rule":
+        d = msg.get("data", {})
+        quality_key = str(d.get("quality_key", "")).strip()
+        if not quality_key:
+            return {"type": "error", "message": "缺少品质分类"}
+        try:
+            points = max(0, int(d.get("points", 0)))
+        except (TypeError, ValueError):
+            return {"type": "error", "message": "贡献点数必须为整数"}
+        result = await engine.sect_set_submit_rule(user_id, quality_key, points)
+        return {"type": "action_result", "action": "sect_set_submit_rule", "data": result}
+
+    elif msg_type == "sect_set_exchange_rule":
+        d = msg.get("data", {})
+        target_key = str(d.get("target_key", "")).strip()
+        if not target_key:
+            return {"type": "error", "message": "缺少目标键"}
+        try:
+            points = max(0, int(d.get("points", 0)))
+        except (TypeError, ValueError):
+            return {"type": "error", "message": "贡献点数必须为整数"}
+        raw_is_item = d.get("is_item", False)
+        is_item = raw_is_item is True or (isinstance(raw_is_item, str) and raw_is_item.lower() in ("true", "1"))
+        result = await engine.sect_set_exchange_rule(user_id, target_key, points, is_item=is_item)
+        return {"type": "action_result", "action": "sect_set_exchange_rule", "data": result}
+
     else:
         return {"type": "error", "message": f"未知操作: {msg_type}"}

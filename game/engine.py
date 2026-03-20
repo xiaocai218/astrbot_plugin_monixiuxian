@@ -2680,3 +2680,69 @@ class GameEngine:
     async def sect_transfer(self, leader_id: str, target_id: str) -> dict:
         """转让宗主。"""
         return await sect_mod.transfer_leader(leader_id, target_id, self._data_manager)
+
+    # ── 宗门仓库 ──────────────────────────────────────────
+
+    async def sect_warehouse_deposit(self, user_id: str, item_id: str, count: int = 1) -> dict:
+        """上交物品到宗门仓库。"""
+        player = self._players.get(user_id)
+        if not player:
+            return {"success": False, "message": "你还没有角色，请先创建"}
+
+        def _normalize(p: Player) -> None:
+            self._auto_unequip_invalid_heart_method(p, convert_ratio=0.6, force=False)
+            p.heart_method_value = max(0, int(getattr(p, "heart_method_value", 0)))
+            self._clamp_player_hp(p)
+
+        result = await sect_mod.warehouse_deposit(
+            player, item_id, count, self._data_manager,
+            pre_commit=_normalize,
+        )
+        if result["success"]:
+            try:
+                await self._notify_player_update(player)
+            except Exception:
+                logger.exception("修仙世界：玩家状态推送失败 user_id=%s", user_id)
+        return result
+
+    async def sect_warehouse_exchange(self, user_id: str, item_id: str, count: int = 1) -> dict:
+        """从宗门仓库兑换物品。"""
+        player = self._players.get(user_id)
+        if not player:
+            return {"success": False, "message": "你还没有角色，请先创建"}
+
+        def _normalize(p: Player) -> None:
+            self._auto_unequip_invalid_heart_method(p, convert_ratio=0.6, force=False)
+            p.heart_method_value = max(0, int(getattr(p, "heart_method_value", 0)))
+            self._clamp_player_hp(p)
+
+        result = await sect_mod.warehouse_exchange(
+            player, item_id, count, self._data_manager,
+            pre_commit=_normalize,
+        )
+        if result["success"]:
+            try:
+                await self._notify_player_update(player)
+            except Exception:
+                logger.exception("修仙世界：玩家状态推送失败 user_id=%s", user_id)
+        return result
+
+    async def sect_warehouse_list(self, user_id: str) -> dict:
+        """查看宗门仓库。"""
+        return await sect_mod.warehouse_list(user_id, self._data_manager)
+
+    async def sect_set_submit_rule(self, user_id: str, quality_key: str, points: int) -> dict:
+        """设置上交贡献点规则。"""
+        return await sect_mod.set_submit_rule(user_id, quality_key, points, self._data_manager)
+
+    async def sect_set_exchange_rule(
+        self, user_id: str, target_key: str, points: int, *, is_item: bool = False,
+    ) -> dict:
+        """设置兑换贡献点规则。"""
+        return await sect_mod.set_exchange_rule(
+            user_id, target_key, points, self._data_manager, is_item=is_item,
+        )
+
+    async def sect_get_contribution_rules(self, user_id: str) -> dict:
+        """获取宗门贡献点规则。"""
+        return await sect_mod.get_contribution_rules(user_id, self._data_manager)
