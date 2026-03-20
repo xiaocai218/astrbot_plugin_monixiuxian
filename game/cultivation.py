@@ -119,7 +119,7 @@ async def perform_cultivate(player: Player, cooldown: int = 60) -> dict:
                 def_bonus = int(realm_cfg["base_defense"] * 0.06)
                 lingqi_bonus = max(1, int(realm_cfg.get("base_lingqi", 0) * 0.08))
                 player.max_hp += hp_bonus
-                player.hp = min(player.hp + hp_bonus, player.max_hp)
+                player.hp = player.max_hp
                 player.attack += atk_bonus
                 player.defense += def_bonus
                 player.lingqi += lingqi_bonus
@@ -283,20 +283,17 @@ async def attempt_breakthrough(player: Player, bonus_rate: float = 0.0,
         player.sub_realm = 0
         player.exp = 0
         player.breakthrough_bonus = 0.0  # 成功后清零累积加成
-        old_hp = player.hp
         base_stats = get_player_base_stats(player)
         player.max_hp = base_stats["max_hp"]
-        recover_hp = max(1, int(player.max_hp * 0.25))
-        player.hp = min(player.max_hp, old_hp + recover_hp)
+        player.hp = player.max_hp
         player.attack = base_stats["attack"]
         player.defense = base_stats["defense"]
         player.lingqi = base_stats["max_lingqi"]
-        actual_recover = max(0, player.hp - old_hp)
         new_name = get_realm_name(player.realm, player.sub_realm)
         cost_msg = f"消耗道韵{dao_cost}，" if dao_cost > 0 else ""
         return {
             "success": True,
-            "message": f"突破成功！{cost_msg}当前境界：{new_name}，回复{actual_recover}点气血（突破概率{rate_percent}%）",
+            "message": f"突破成功！{cost_msg}当前境界：{new_name}，气血恢复满血（突破概率{rate_percent}%）",
             "new_realm": new_name,
             "died": False,
         }

@@ -79,6 +79,9 @@ class WebServer:
 
     async def stop(self):
         """优雅关闭。"""
+        ws_manager = getattr(self.game_engine, "_ws_manager", None)
+        if ws_manager and hasattr(ws_manager, "stop_chat_cleanup_task"):
+            await ws_manager.stop_chat_cleanup_task()
         if self._server:
             self._server.should_exit = True
         if self._task:

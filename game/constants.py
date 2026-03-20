@@ -1237,17 +1237,17 @@ def get_max_sub_realm(realm: int) -> int:
 
 def get_sub_realm_dao_yun_cost(realm: int, sub_realm: int) -> int:
     """获取从 sub_realm 升到 sub_realm+1 所需道韵（仅化神~大乘）。
-    化神：500/800/1000/1200，合虚：2400/2600/2800/3000，
-    渡劫：6000/6400/6800/7200，大乘：14400/15200/16000/16800。"""
+    化神：50/80/100/120，合虚：240/260/280/300，
+    渡劫：600/640/680/720，大乘：1440/1520/1600/1680。"""
     if not is_high_realm(realm):
         return 0
 
     realm_offset = realm - RealmLevel.DEITY_TRANSFORM
     costs_map = {
-        0: [500, 800, 1000, 1200],      # 化神
-        1: [2400, 2600, 2800, 3000],    # 合虚
-        2: [6000, 6400, 6800, 7200],    # 渡劫
-        3: [14400, 15200, 16000, 16800] # 大乘
+        0: [50, 80, 100, 120],      # 化神
+        1: [240, 260, 280, 300],    # 合虚
+        2: [600, 640, 680, 720],    # 渡劫
+        3: [1440, 1520, 1600, 1680] # 大乘
     }
     costs = costs_map.get(realm_offset, [])
     return costs[sub_realm] if sub_realm < len(costs) else 0

@@ -6,6 +6,7 @@ import os
 import json
 import re
 import time
+import asyncio
 
 from astrbot.api import logger
 from astrbot.api.event import filter, AstrMessageEvent
@@ -153,6 +154,7 @@ class XiuxianPlugin(Star):
         self._engine.auth = auth_manager
         self._engine.set_name_reviewer(self._review_name_with_ai)
         self._engine.set_chat_reviewer(self._review_chat_with_ai)
+        self._engine.set_sect_name_reviewer(self._review_sect_name_with_ai)
         await self._engine.initialize()
         self._engine._checkin_config = self._get_checkin_config()
         logger.info("修仙世界：游戏引擎已初始化")
@@ -267,6 +269,90 @@ class XiuxianPlugin(Star):
         )
         if any(s in text for s in blocked_signals):
             return {"allow": False, "reason": "AI判定道号违规"}
+        if any(s in text for s in passed_signals):
+            return {"allow": True, "reason": ""}
+        return {"allow": True, "reason": "AI审核结果不明确，按本地规则放行"}
+
+    async def _review_sect_name_with_ai(self, name: str) -> dict:
+        """调用 AstrBot 当前模型对宗门名称做安全审核。"""
+        def local_review() -> dict:
+            allow, reason = self._engine._local_name_risk_check(name)
+            return {"allow": bool(allow), "reason": str(reason or "").strip()}
+
+        get_provider = getattr(self.context, "get_using_provider", None)
+        if not callable(get_provider):
+            return local_review()
+
+        try:
+            provider = get_provider()
+        except Exception:
+            return local_review()
+        if hasattr(provider, "__await__"):
+            try:
+                provider = await asyncio.wait_for(provider, timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("修仙世界：宗门名AI审核器初始化超时，降级到本地规则")
+                return local_review()
+            except Exception:
+                return local_review()
+
+        if not provider or not hasattr(provider, "text_chat"):
+            return local_review()
+
+        prompt = (
+            "你是修仙游戏宗门名称审核器。\n"
+            "请判断该宗门名称是否明显包含以下内容："
+            "色情、侮辱谩骂、歧视攻击、低俗挑逗。\n"
+            "注意：修仙风格名称（如血刀门、杀生寺、灭世宗）属于正常风格，应予放行。\n"
+            "只有在「高度确定违规」时才拒绝；不确定时必须放行。\n"
+            "只输出JSON，不要任何额外文本，格式："
+            "{\"allow\": true/false, \"reason\": \"一句话原因\"}。\n"
+            f"待审核宗门名称：{name}"
+        )
+
+        try:
+            llm_response = await asyncio.wait_for(
+                provider.text_chat(prompt=prompt, contexts=[]),
+                timeout=5.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("修仙世界：宗门名AI审核超时，降级到本地规则")
+            return local_review()
+        except Exception:
+            logger.exception("修仙世界：宗门名AI审核调用失败")
+            return local_review()
+
+        raw = str(
+            getattr(llm_response, "completion_text", "")
+            or getattr(llm_response, "text", "")
+            or llm_response
+            or ""
+        ).strip()
+        if not raw:
+            return {"allow": True, "reason": "AI审核结果为空，按本地规则放行"}
+
+        try:
+            m = re.search(r"\{[\s\S]*\}", raw)
+            if m:
+                obj = json.loads(m.group(0))
+                allow = bool(obj.get("allow", obj.get("ok", False)))
+                reason = str(obj.get("reason", "")).strip()
+                return {"allow": allow, "reason": reason}
+        except Exception:
+            pass
+
+        text = raw.lower()
+        blocked_signals = (
+            "\"allow\":false", "\"allow\": false",
+            "判定违规", "明显违规", "拒绝通过", "不予通过",
+        )
+        passed_signals = (
+            "\"allow\":true", "\"allow\": true",
+            "allow:true", "allow = true",
+            "通过", "合规", "正常", "可用",
+        )
+        if any(s in text for s in blocked_signals):
+            return {"allow": False, "reason": "AI判定宗门名违规"}
         if any(s in text for s in passed_signals):
             return {"allow": True, "reason": ""}
         return {"allow": True, "reason": "AI审核结果不明确，按本地规则放行"}

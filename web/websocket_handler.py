@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import re
 import time
-from collections import deque
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..game.constants import get_realm_name
 from ..game.engine import GameEngine
 from ..game.models import Player
+from ..game.sect import ROLE_NAMES
 from .access_guard import get_access_guard
+
+ws_logger = logging.getLogger("xiuxian.websocket")
 
 RANKINGS_PUSH_DELAY = 0.6
 MARKET_PUSH_DELAY = 0.4
@@ -22,6 +25,8 @@ MARKET_PAGE_SIZE = 9
 WORLD_CHAT_MAX_HISTORY = 100
 WORLD_CHAT_MAX_LEN = 100
 WORLD_CHAT_COOLDOWN = 3.0  # 秒
+WORLD_CHAT_MAX_AGE = 30 * 24 * 3600  # 1个月（秒）
+WORLD_CHAT_CLEANUP_INTERVAL = 6 * 3600  # 每6小时清理一次
 _RE_CHINESE_ONLY = re.compile(
     r"^[\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\u2000-\u206f\u0020-\u0040\u005b-\u0060\u007b-\u007e"
     r"\u3400-\u4dbf\U00020000-\U0002a6df\U0002a700-\U0002b73f"
@@ -47,7 +52,8 @@ _PENDING_DEATH_ALLOWED_TYPES = {
 class ConnectionManager:
     """管理 WebSocket 连接。"""
 
-    def __init__(self):
+    def __init__(self, engine: GameEngine):
+        self._engine = engine
         self._connections: dict[str, WebSocket] = {}  # user_id -> websocket
         self._market_pages: dict[str, int] = {}
         self._market_my_watchers: set[str] = set()
@@ -56,8 +62,8 @@ class ConnectionManager:
         self._market_dirty = False
         self._market_flush_task: asyncio.Task | None = None
         # 世界频道
-        self._world_chat_history: deque[dict] = deque(maxlen=WORLD_CHAT_MAX_HISTORY)
         self._world_chat_cooldowns: dict[str, float] = {}  # user_id -> last_send_ts
+        self._chat_cleanup_task: asyncio.Task | None = None
 
     async def connect(self, user_id: str, websocket: WebSocket):
         self._connections[user_id] = websocket
@@ -199,16 +205,12 @@ class ConnectionManager:
             })
 
     # ── 世界频道 ──────────────────────────────────────────
-    def get_world_chat_history(self) -> list[dict]:
-        """获取世界频道历史消息（最新在后）。"""
-        result: list[dict] = []
-        for msg in self._world_chat_history:
-            item = dict(msg)
-            realm = item.get("realm", "")
-            if isinstance(realm, int) or (isinstance(realm, str) and realm.isdigit()):
-                item["realm"] = get_realm_name(int(realm), 0)
-            result.append(item)
-        return result
+    async def get_world_chat_history(self) -> list[dict]:
+        """从数据库获取世界频道历史消息（最新在后）。"""
+        return await self._engine._data_manager.load_chat_history(
+            WORLD_CHAT_MAX_HISTORY,
+            max_age_seconds=WORLD_CHAT_MAX_AGE,
+        )
 
     def check_chat_cooldown(self, user_id: str) -> tuple[bool, float]:
         """检查发言冷却，返回 (ok, remaining_seconds)。"""
@@ -222,12 +224,58 @@ class ConnectionManager:
     def record_chat_send(self, user_id: str):
         self._world_chat_cooldowns[user_id] = time.time()
 
-    def add_chat_message(self, msg: dict):
-        self._world_chat_history.append(msg)
+    async def add_chat_message(self, msg: dict):
+        """保存消息到数据库。"""
+        await self._engine._data_manager.save_chat_message(
+            user_id=msg.get("user_id", ""),
+            name=msg.get("name", ""),
+            realm=msg.get("realm", ""),
+            content=msg.get("content", ""),
+            created_at=msg.get("time", time.time()),
+            sect_name=msg.get("sect_name", ""),
+            sect_role=msg.get("sect_role", ""),
+            sect_role_name=msg.get("sect_role_name", ""),
+        )
 
     async def broadcast_chat(self, msg: dict):
         """广播世界频道消息给所有在线玩家。"""
         await self.broadcast({"type": "world_chat_msg", "data": msg})
+
+    def start_chat_cleanup_task(self):
+        """启动定期清理过期世界频道消息的后台任务。"""
+        if self._chat_cleanup_task and not self._chat_cleanup_task.done():
+            return
+        self._chat_cleanup_task = asyncio.create_task(self._chat_cleanup_loop())
+
+    async def stop_chat_cleanup_task(self):
+        """停止定期清理过期世界频道消息的后台任务。"""
+        task = self._chat_cleanup_task
+        if not task:
+            return
+        if task.done():
+            self._chat_cleanup_task = None
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._chat_cleanup_task = None
+
+    async def _chat_cleanup_loop(self):
+        """每隔一段时间清理超过1个月的世界频道消息。"""
+        logger = logging.getLogger("xiuxian.world_chat")
+        while True:
+            try:
+                await asyncio.sleep(WORLD_CHAT_CLEANUP_INTERVAL)
+                deleted = await self._engine._data_manager.cleanup_old_chat_messages(WORLD_CHAT_MAX_AGE)
+                if deleted > 0:
+                    logger.info("已清理 %d 条过期世界频道消息", deleted)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("世界频道消息清理失败")
 
 
 def create_ws_router(
@@ -237,8 +285,9 @@ def create_ws_router(
     api_rate_limit_1s_count: int = 10000,
 ) -> APIRouter:
     router = APIRouter()
-    ws_manager = ConnectionManager()
+    ws_manager = ConnectionManager(engine)
     engine._ws_manager = ws_manager
+    ws_manager.start_chat_cleanup_task()
     access_guard = get_access_guard()
     required_guard_token = (guard_token or "").strip()
     try:
@@ -367,7 +416,7 @@ def create_ws_router(
             ws_manager.queue_rankings_refresh(engine)
             await websocket.send_json({
                 "type": "world_chat_history",
-                "data": ws_manager.get_world_chat_history(),
+                "data": await ws_manager.get_world_chat_history(),
             })
 
             # 推送公告
@@ -403,20 +452,41 @@ def create_ws_router(
                     await websocket.send_json({"type": "error", "message": reason or "请求过于频繁，请稍后再试"})
                     await websocket.close()
                     break
-                result = await _handle_message(
-                    engine,
-                    user_id,
-                    msg,
-                    command_prefix=command_prefix,
-                    ws_manager=ws_manager,
-                )
+                try:
+                    result = await _handle_message(
+                        engine,
+                        user_id,
+                        msg,
+                        command_prefix=command_prefix,
+                        ws_manager=ws_manager,
+                    )
+                except Exception:
+                    detail = "unknown"
+                    try:
+                        import traceback
+                        detail = traceback.format_exc(limit=5).strip().splitlines()[-1]
+                    except Exception:
+                        pass
+                    ws_logger.exception(
+                        "修仙世界：WS消息处理失败 user_id=%s msg_type=%s",
+                        user_id,
+                        msg.get("type", ""),
+                    )
+                    try:
+                        await websocket.send_json({
+                            "type": "error",
+                            "message": f"服务器处理请求时发生异常：{detail}",
+                        })
+                    except Exception:
+                        pass
+                    continue
                 if result and result.get("type") != "noop":
                     await websocket.send_json(result)
 
         except WebSocketDisconnect:
             pass
         except Exception:
-            pass
+            ws_logger.exception("修仙世界：WebSocket会话异常 user_id=%s", user_id)
         finally:
             if user_id:
                 ws_manager.disconnect(user_id)
@@ -537,6 +607,19 @@ async def _broadcast_pvp_result(
         "type": "pvp_update",
         "data": {"pvp_state": result["pvp_state_b"]},
     })
+
+
+async def _broadcast_sect_changed(
+    ws_manager: ConnectionManager | None,
+    exclude_user_id: str | None = None,
+):
+    """广播宗门数据变更，让在线前端自行刷新宗门相关面板。"""
+    if not ws_manager:
+        return
+    try:
+        await ws_manager.broadcast({"type": "sect_changed"}, exclude_user_id=exclude_user_id)
+    except Exception:
+        ws_logger.exception("修仙世界：宗门变更广播失败")
 
 
 def _schedule_pvp_challenge_timeout(
@@ -822,22 +905,36 @@ async def _handle_message(
         player = await engine.get_player(user_id)
         player_name = player.name if player else "未知"
         player_realm = get_realm_name(player.realm, player.sub_realm) if player else ""
+        # 获取宗门名
+        sect_name = ""
+        sect_role = ""
+        sect_role_name = ""
+        membership = await engine._data_manager.load_player_sect(user_id)
+        if membership:
+            sect_role = membership.get("role", "")
+            sect_role_name = ROLE_NAMES.get(sect_role, sect_role)
+            sect = await engine._data_manager.load_sect(membership["sect_id"])
+            if sect:
+                sect_name = sect["name"]
         chat_msg = {
             "user_id": user_id,
             "name": player_name,
             "realm": player_realm,
+            "sect_name": sect_name,
+            "sect_role": sect_role,
+            "sect_role_name": sect_role_name,
             "content": content,
             "time": time.time(),
         }
         ws_manager.record_chat_send(user_id)
-        ws_manager.add_chat_message(chat_msg)
+        await ws_manager.add_chat_message(chat_msg)
         await ws_manager.broadcast_chat(chat_msg)
         return {"type": "noop"}
 
     elif msg_type == "get_world_chat_history":
         if not ws_manager:
             return {"type": "world_chat_history", "data": []}
-        return {"type": "world_chat_history", "data": ws_manager.get_world_chat_history()}
+        return {"type": "world_chat_history", "data": await ws_manager.get_world_chat_history()}
 
     # ── 死亡保留确认 ─────────────────────────────────────
     elif msg_type == "death_confirm_keep":
@@ -971,6 +1068,96 @@ async def _handle_message(
         if session:
             return {"type": "pvp_state", "data": session.to_dict(user_id)}
         return {"type": "pvp_state", "data": None}
+
+    # ── 宗门系统 ─────────────────────────────────────────
+
+    elif msg_type == "sect_create":
+        data = msg.get("data", {})
+        name = str(data.get("name", "")).strip()
+        description = str(data.get("description", "")).strip()
+        if not name:
+            return {"type": "error", "message": "请输入宗门名称"}
+        result = await engine.sect_create(user_id, name, description)
+        if result.get("success"):
+            await _broadcast_sect_changed(ws_manager, exclude_user_id=user_id)
+        return {"type": "action_result", "action": "sect_create", "data": result}
+
+    elif msg_type == "sect_list":
+        page = msg.get("data", {}).get("page", 1)
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            page = 1
+        data = await engine.sect_list(page, page_size=10)
+        return {"type": "sect_list_data", "data": data}
+
+    elif msg_type == "sect_my":
+        data = await engine.sect_my(user_id)
+        return {"type": "sect_my_data", "data": data}
+
+    elif msg_type == "sect_detail":
+        sect_id = msg.get("data", {}).get("sect_id", "")
+        if not sect_id:
+            return {"type": "error", "message": "缺少宗门ID"}
+        data = await engine.sect_detail(sect_id)
+        return {"type": "sect_detail_data", "data": data}
+
+    elif msg_type == "sect_join":
+        sect_id = msg.get("data", {}).get("sect_id", "")
+        if not sect_id:
+            return {"type": "error", "message": "缺少宗门ID"}
+        result = await engine.sect_join(user_id, sect_id)
+        if result.get("success"):
+            await _broadcast_sect_changed(ws_manager, exclude_user_id=user_id)
+        return {"type": "action_result", "action": "sect_join", "data": result}
+
+    elif msg_type == "sect_leave":
+        result = await engine.sect_leave(user_id)
+        if result.get("success"):
+            await _broadcast_sect_changed(ws_manager, exclude_user_id=user_id)
+        return {"type": "action_result", "action": "sect_leave", "data": result}
+
+    elif msg_type == "sect_kick":
+        target_id = msg.get("data", {}).get("target_id", "")
+        if not target_id:
+            return {"type": "error", "message": "缺少目标玩家ID"}
+        result = await engine.sect_kick(user_id, target_id)
+        if result.get("success"):
+            await _broadcast_sect_changed(ws_manager, exclude_user_id=user_id)
+        return {"type": "action_result", "action": "sect_kick", "data": result}
+
+    elif msg_type == "sect_set_role":
+        data = msg.get("data", {})
+        target_id = data.get("target_id", "")
+        role = data.get("role", "")
+        if not target_id or not role:
+            return {"type": "error", "message": "缺少目标玩家或身份"}
+        result = await engine.sect_set_role(user_id, target_id, role)
+        if result.get("success"):
+            await _broadcast_sect_changed(ws_manager, exclude_user_id=user_id)
+        return {"type": "action_result", "action": "sect_set_role", "data": result}
+
+    elif msg_type == "sect_update_info":
+        data = msg.get("data", {})
+        result = await engine.sect_update_info(user_id, data)
+        if result.get("success"):
+            await _broadcast_sect_changed(ws_manager, exclude_user_id=user_id)
+        return {"type": "action_result", "action": "sect_update_info", "data": result}
+
+    elif msg_type == "sect_transfer":
+        target_id = msg.get("data", {}).get("target_id", "")
+        if not target_id:
+            return {"type": "error", "message": "缺少目标玩家ID"}
+        result = await engine.sect_transfer(user_id, target_id)
+        if result.get("success"):
+            await _broadcast_sect_changed(ws_manager, exclude_user_id=user_id)
+        return {"type": "action_result", "action": "sect_transfer", "data": result}
+
+    elif msg_type == "sect_disband":
+        result = await engine.sect_disband(user_id)
+        if result.get("success"):
+            await _broadcast_sect_changed(ws_manager, exclude_user_id=user_id)
+        return {"type": "action_result", "action": "sect_disband", "data": result}
 
     else:
         return {"type": "error", "message": f"未知操作: {msg_type}"}

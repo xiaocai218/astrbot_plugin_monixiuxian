@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+import time
 from datetime import datetime
 from typing import Optional, Any
 
@@ -39,6 +40,7 @@ class DataManager:
         self._db_path = os.path.join(data_dir, "xiuxian.db")
         self.db: Optional[aiosqlite.Connection] = None
         self._shop_purchase_lock = asyncio.Lock()
+        self._sect_schema_checked = False
 
     async def initialize(self):
         """初始化数据目录、打开数据库、建表、迁移旧数据。"""
@@ -226,6 +228,70 @@ class DataManager:
                 enabled       INTEGER DEFAULT 1
             )
         """)
+        # 世界频道消息表
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS world_chat_messages (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    TEXT NOT NULL,
+                name       TEXT NOT NULL,
+                realm      TEXT NOT NULL DEFAULT '',
+                sect_name  TEXT NOT NULL DEFAULT '',
+                sect_role  TEXT NOT NULL DEFAULT '',
+                sect_role_name TEXT NOT NULL DEFAULT '',
+                content    TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_world_chat_created
+            ON world_chat_messages (created_at)
+        """)
+        # 宗门主表
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS sects (
+                sect_id       TEXT PRIMARY KEY,
+                name          TEXT NOT NULL UNIQUE,
+                leader_id     TEXT NOT NULL,
+                description   TEXT DEFAULT '',
+                level         INTEGER DEFAULT 1,
+                spirit_stones INTEGER DEFAULT 0,
+                max_members   INTEGER DEFAULT 30,
+                join_policy   TEXT DEFAULT 'open',
+                min_realm     INTEGER DEFAULT 0,
+                created_at    REAL NOT NULL,
+                announcement  TEXT DEFAULT ''
+            )
+        """)
+        # 宗门成员关系表
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS sect_members (
+                user_id   TEXT PRIMARY KEY,
+                sect_id   TEXT NOT NULL,
+                role      TEXT NOT NULL DEFAULT 'disciple',
+                joined_at REAL NOT NULL,
+                FOREIGN KEY (sect_id) REFERENCES sects(sect_id)
+            )
+        """)
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sect_members_sect
+            ON sect_members (sect_id)
+        """)
+        # 宗门申请表（预留）
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS sect_applications (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     TEXT NOT NULL,
+                sect_id     TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                applied_at  REAL NOT NULL,
+                resolved_at REAL,
+                resolved_by TEXT
+            )
+        """)
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sect_applications_sect
+            ON sect_applications (sect_id, status)
+        """)
         await self.db.commit()
         # 数据库升级：为旧表添加新列
         await self._alter_add_column("players", "last_adventure_time", "REAL DEFAULT 0.0")
@@ -256,6 +322,10 @@ class DataManager:
         await self._alter_add_column("players", "gongfa_3_mastery", "INTEGER DEFAULT 0")
         await self._alter_add_column("players", "gongfa_3_exp", "INTEGER DEFAULT 0")
         await self._alter_add_column("gongfas", "lingqi_cost", "INTEGER DEFAULT 0")
+        await self._alter_add_column("world_chat_messages", "sect_name", "TEXT DEFAULT ''")
+        await self._alter_add_column("world_chat_messages", "sect_role", "TEXT DEFAULT ''")
+        await self._alter_add_column("world_chat_messages", "sect_role_name", "TEXT DEFAULT ''")
+        await self._ensure_sect_schema(force=True)
         # 填充场景数据
         await self._seed_adventure_scenes()
         # 填充心法定义（仅补齐缺失，不覆盖已有配置）
@@ -514,6 +584,31 @@ class DataManager:
             await self.db.commit()
         except Exception:
             pass  # 列已存在
+
+    async def _ensure_sect_schema(self, force: bool = False):
+        """确保宗门相关旧表已经自动升级到当前结构。"""
+        if self._sect_schema_checked and not force:
+            return
+        await self._alter_add_column("sects", "description", "TEXT DEFAULT ''")
+        await self._alter_add_column("sects", "level", "INTEGER DEFAULT 1")
+        await self._alter_add_column("sects", "spirit_stones", "INTEGER DEFAULT 0")
+        await self._alter_add_column("sects", "max_members", "INTEGER DEFAULT 30")
+        await self._alter_add_column("sects", "join_policy", "TEXT DEFAULT 'open'")
+        await self._alter_add_column("sects", "min_realm", "INTEGER DEFAULT 0")
+        await self._alter_add_column("sects", "created_at", "REAL DEFAULT 0.0")
+        await self._alter_add_column("sects", "announcement", "TEXT DEFAULT ''")
+        await self._alter_add_column("sect_members", "role", "TEXT DEFAULT 'disciple'")
+        await self._alter_add_column("sect_members", "joined_at", "REAL DEFAULT 0.0")
+        await self._alter_add_column("sect_applications", "status", "TEXT DEFAULT 'pending'")
+        await self._alter_add_column("sect_applications", "applied_at", "REAL DEFAULT 0.0")
+        await self._alter_add_column("sect_applications", "resolved_at", "REAL")
+        await self._alter_add_column("sect_applications", "resolved_by", "TEXT")
+        try:
+            await self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sects_name_unique ON sects (name)")
+            await self.db.commit()
+        except Exception:
+            pass
+        self._sect_schema_checked = True
 
     async def _seed_adventure_scenes(self):
         """若场景表为空，填充40条历练场景数据。"""
@@ -1645,3 +1740,293 @@ class DataManager:
         )
         await self.db.commit()
         return (cur.rowcount or 0) > 0
+
+    # ── 世界频道消息 ──────────────────────────────────────────
+
+    async def save_chat_message(
+        self,
+        user_id: str,
+        name: str,
+        realm: str,
+        content: str,
+        created_at: float,
+        sect_name: str = "",
+        sect_role: str = "",
+        sect_role_name: str = "",
+    ):
+        """保存一条世界频道消息到数据库。"""
+        await self.db.execute(
+            "INSERT INTO world_chat_messages (user_id, name, realm, content, created_at, sect_name, sect_role, sect_role_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, name, realm, content, created_at, sect_name, sect_role, sect_role_name),
+        )
+        await self.db.commit()
+
+    async def load_chat_history(self, limit: int = 100, max_age_seconds: float | None = None) -> list[dict]:
+        """从数据库加载最近的世界频道消息（按时间升序）。"""
+        if max_age_seconds is not None:
+            cutoff = time.time() - max_age_seconds
+            cursor = await self.db.execute(
+                "SELECT user_id, name, realm, content, created_at, sect_name, sect_role, sect_role_name "
+                "FROM world_chat_messages "
+                "WHERE created_at >= ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (cutoff, limit),
+            )
+        else:
+            cursor = await self.db.execute(
+                "SELECT user_id, name, realm, content, created_at, sect_name, sect_role, sect_role_name FROM world_chat_messages ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            )
+        rows = await cursor.fetchall()
+        result = []
+        for row in reversed(rows):
+            result.append({
+                "user_id": row[0],
+                "name": row[1],
+                "realm": row[2],
+                "content": row[3],
+                "time": row[4],
+                "sect_name": row[5] if len(row) > 5 else "",
+                "sect_role": row[6] if len(row) > 6 else "",
+                "sect_role_name": row[7] if len(row) > 7 else "",
+            })
+        return result
+
+    async def cleanup_old_chat_messages(self, max_age_seconds: float) -> int:
+        """删除超过指定时间的世界频道消息，返回删除条数。"""
+        cutoff = time.time() - max_age_seconds
+        cur = await self.db.execute(
+            "DELETE FROM world_chat_messages WHERE created_at < ?",
+            (cutoff,),
+        )
+        await self.db.commit()
+        return cur.rowcount or 0
+
+    # ── 宗门 CRUD ──────────────────────────────────────────
+
+    async def save_sect(self, sect: dict) -> None:
+        """新增宗门记录。"""
+        await self._ensure_sect_schema()
+        await self.db.execute(
+            """INSERT INTO sects
+               (sect_id, name, leader_id, description, level, spirit_stones,
+                max_members, join_policy, min_realm, created_at, announcement)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                sect["sect_id"],
+                sect["name"],
+                sect["leader_id"],
+                sect.get("description", ""),
+                sect.get("level", 1),
+                sect.get("spirit_stones", 0),
+                sect.get("max_members", 30),
+                sect.get("join_policy", "open"),
+                sect.get("min_realm", 0),
+                sect["created_at"],
+                sect.get("announcement", ""),
+            ),
+        )
+        await self.db.commit()
+
+    async def create_sect_with_leader(self, sect: dict, leader_user_id: str) -> None:
+        """原子创建宗门及宗主成员关系。"""
+        await self._ensure_sect_schema()
+        try:
+            await self.db.execute(
+                """INSERT INTO sects
+                   (sect_id, name, leader_id, description, level, spirit_stones,
+                    max_members, join_policy, min_realm, created_at, announcement)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    sect["sect_id"],
+                    sect["name"],
+                    sect["leader_id"],
+                    sect.get("description", ""),
+                    sect.get("level", 1),
+                    sect.get("spirit_stones", 0),
+                    sect.get("max_members", 30),
+                    sect.get("join_policy", "open"),
+                    sect.get("min_realm", 0),
+                    sect["created_at"],
+                    sect.get("announcement", ""),
+                ),
+            )
+            await self.db.execute(
+                """INSERT INTO sect_members (user_id, sect_id, role, joined_at)
+                   VALUES (?, ?, ?, ?)""",
+                (leader_user_id, sect["sect_id"], "leader", time.time()),
+            )
+            await self.db.commit()
+        except Exception:
+            await self.db.rollback()
+            raise
+
+    async def delete_sect(self, sect_id: str) -> None:
+        """删除宗门及其所有成员关系和申请记录。"""
+        await self.db.execute("DELETE FROM sect_members WHERE sect_id = ?", (sect_id,))
+        await self.db.execute("DELETE FROM sect_applications WHERE sect_id = ?", (sect_id,))
+        await self.db.execute("DELETE FROM sects WHERE sect_id = ?", (sect_id,))
+        await self.db.commit()
+
+    async def load_sect(self, sect_id: str) -> dict | None:
+        """按 sect_id 加载宗门。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute("SELECT * FROM sects WHERE sect_id = ?", (sect_id,))
+        row = await cur.fetchone()
+        if not row:
+            return None
+        columns = [d[0] for d in cur.description]
+        return dict(zip(columns, row))
+
+    async def load_sect_by_name(self, name: str) -> dict | None:
+        """按名称加载宗门。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute("SELECT * FROM sects WHERE name = ?", (name,))
+        row = await cur.fetchone()
+        if not row:
+            return None
+        columns = [d[0] for d in cur.description]
+        return dict(zip(columns, row))
+
+    async def load_sects_page(self, page: int = 1, page_size: int = 10) -> dict:
+        """分页查询宗门列表（含成员计数）。"""
+        await self._ensure_sect_schema()
+        try:
+            page = int(page)
+        except (TypeError, ValueError):
+            page = 1
+        page = max(1, page)
+        page_size = max(1, min(page_size, 50))
+
+        row = await self.db.execute("SELECT COUNT(*) FROM sects")
+        total = (await row.fetchone())[0]
+        total_pages = max(1, (total + page_size - 1) // page_size)
+        page = min(page, total_pages)
+        offset = (page - 1) * page_size
+
+        cur = await self.db.execute(
+            """SELECT s.*, COUNT(m.user_id) AS member_count
+               FROM sects s
+               LEFT JOIN sect_members m ON s.sect_id = m.sect_id
+               GROUP BY s.sect_id
+               ORDER BY s.created_at DESC
+               LIMIT ? OFFSET ?""",
+            (page_size, offset),
+        )
+        rows = await cur.fetchall()
+        columns = [d[0] for d in cur.description]
+        sects = [dict(zip(columns, r)) for r in rows]
+        return {
+            "sects": sects,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "total_pages": total_pages,
+        }
+
+    async def update_sect_info(self, sect_id: str, data: dict) -> None:
+        """更新宗门可变字段（description, join_policy, min_realm, announcement）。"""
+        await self._ensure_sect_schema()
+        allowed = {"description", "join_policy", "min_realm", "announcement"}
+        sets = []
+        params = []
+        for k, v in data.items():
+            if k in allowed:
+                sets.append(f"{k} = ?")
+                params.append(v)
+        if not sets:
+            return
+        params.append(sect_id)
+        await self.db.execute(
+            f"UPDATE sects SET {', '.join(sets)} WHERE sect_id = ?",
+            params,
+        )
+        await self.db.commit()
+
+    async def update_sect_leader(self, sect_id: str, new_leader_id: str) -> None:
+        """更新宗门宗主。"""
+        await self._ensure_sect_schema()
+        await self.db.execute(
+            "UPDATE sects SET leader_id = ? WHERE sect_id = ?",
+            (new_leader_id, sect_id),
+        )
+        await self.db.commit()
+
+    # ── 宗门成员 CRUD ──────────────────────────────────────
+
+    async def save_sect_member(self, user_id: str, sect_id: str, role: str = "disciple") -> None:
+        """添加宗门成员。"""
+        await self._ensure_sect_schema()
+        import time as _time
+        await self.db.execute(
+            """INSERT OR REPLACE INTO sect_members (user_id, sect_id, role, joined_at)
+               VALUES (?, ?, ?, ?)""",
+            (user_id, sect_id, role, _time.time()),
+        )
+        await self.db.commit()
+
+    async def delete_sect_member(self, user_id: str) -> None:
+        """移除宗门成员。"""
+        await self.db.execute("DELETE FROM sect_members WHERE user_id = ?", (user_id,))
+        await self.db.commit()
+
+    async def load_sect_members(self, sect_id: str) -> list[dict]:
+        """加载宗门所有成员（含玩家名和境界）。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            """SELECT m.user_id, m.role, m.joined_at,
+                      p.name AS player_name, p.realm, p.sub_realm
+               FROM sect_members m
+               LEFT JOIN players p ON m.user_id = p.user_id
+               WHERE m.sect_id = ?
+               ORDER BY
+                   CASE m.role
+                       WHEN 'leader' THEN 0
+                       WHEN 'vice_leader' THEN 1
+                       WHEN 'elder' THEN 2
+                       ELSE 3
+                   END,
+                   m.joined_at ASC""",
+            (sect_id,),
+        )
+        rows = await cur.fetchall()
+        columns = [d[0] for d in cur.description]
+        return [dict(zip(columns, r)) for r in rows]
+
+    async def load_player_sect(self, user_id: str) -> dict | None:
+        """查询玩家所在宗门（返回成员记录）。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT * FROM sect_members WHERE user_id = ?", (user_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        columns = [d[0] for d in cur.description]
+        return dict(zip(columns, row))
+
+    async def count_sect_members(self, sect_id: str) -> int:
+        """统计宗门成员数。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT COUNT(*) FROM sect_members WHERE sect_id = ?", (sect_id,),
+        )
+        return (await cur.fetchone())[0]
+
+    async def count_members_by_role(self, sect_id: str, role: str) -> int:
+        """统计宗门某身份的成员数。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT COUNT(*) FROM sect_members WHERE sect_id = ? AND role = ?",
+            (sect_id, role),
+        )
+        return (await cur.fetchone())[0]
+
+    async def update_sect_member_role(self, user_id: str, role: str) -> None:
+        """更新成员身份。"""
+        await self._ensure_sect_schema()
+        await self.db.execute(
+            "UPDATE sect_members SET role = ? WHERE user_id = ?",
+            (role, user_id),
+        )
+        await self.db.commit()

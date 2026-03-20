@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import logging
 import random
 import re
 import time
@@ -42,6 +43,9 @@ from .inventory import (
 from .models import Player
 from . import market as market_mod
 from . import shop as shop_mod
+from . import sect as sect_mod
+
+logger = logging.getLogger("xiuxian.engine")
 
 _BAD_NAME_KEYWORDS = (
     # 仅保留“高置信度违规词”，避免误伤正常道号
@@ -65,6 +69,7 @@ class GameEngine:
         self._checkin_config: dict = {}  # 签到配置，由外部设置
         self._ws_manager = None  # 由 web 层设置
         self._name_reviewer: Callable[[str], Awaitable[dict | tuple | bool]] | None = None
+        self._sect_name_reviewer: Callable[[str], Awaitable[dict]] | None = None
         self._chat_reviewer: Callable[[str], Awaitable[dict]] | None = None
         self.auth: AuthManager | None = None
         self._pending_deaths: dict[str, dict] = {}
@@ -119,8 +124,25 @@ class GameEngine:
             # 清理过期心法道具
             if self._clean_expired_heart_methods(player):
                 normalized = True
+            if self._clamp_player_hp(player):
+                normalized = True
         if normalized:
             await self._data_manager.save_all_players(self._players)
+
+    @staticmethod
+    def _clamp_player_hp(player: Player) -> bool:
+        """兜底确保玩家气血始终处于合法范围内。"""
+        changed = False
+        max_hp = max(1, int(getattr(player, "max_hp", 1) or 1))
+        if player.max_hp != max_hp:
+            player.max_hp = max_hp
+            changed = True
+
+        hp = max(0, min(player.max_hp, int(getattr(player, "hp", 0) or 0)))
+        if player.hp != hp:
+            player.hp = hp
+            changed = True
+        return changed
 
     async def get_or_create_player(self, user_id: str, name: str) -> Player:
         """获取或创建玩家。"""
@@ -418,7 +440,7 @@ class GameEngine:
                 def_bonus = int(realm_cfg["base_defense"] * 0.06)
                 lingqi_bonus = max(1, int(realm_cfg.get("base_lingqi", 0) * 0.08))
                 player.max_hp += hp_bonus
-                player.hp = min(player.hp + hp_bonus, player.max_hp)
+                player.hp = player.max_hp
                 player.attack += atk_bonus
                 player.defense += def_bonus
                 player.lingqi += lingqi_bonus
@@ -500,7 +522,8 @@ class GameEngine:
             removed = self._auto_unequip_invalid_equipment(player)
             heart_fix = self._auto_unequip_invalid_heart_method(player, convert_ratio=0.0, force=False)
             removed_gongfas = self._auto_unequip_invalid_gongfa(player)
-            if removed or heart_fix.get("removed_name") or removed_gongfas:
+            hp_changed = self._clamp_player_hp(player)
+            if removed or heart_fix.get("removed_name") or removed_gongfas or hp_changed:
                 changed = True
         if changed:
             await self._data_manager.save_all_players(self._players)
@@ -1448,6 +1471,7 @@ class GameEngine:
         player = self._players.get(user_id)
         if not player:
             return None
+        self._clamp_player_hp(player)
         panel = player.to_dict()
         pending = self._pending_deaths.get(user_id)
         if pending:
@@ -1560,8 +1584,12 @@ class GameEngine:
         # 兜底：若心法境界不符则自动卸下为秘籍，并结转60%心法值
         self._auto_unequip_invalid_heart_method(player, convert_ratio=0.6, force=False)
         player.heart_method_value = max(0, int(getattr(player, "heart_method_value", 0)))
+        self._clamp_player_hp(player)
         await self._data_manager.save_player(player)
-        await self._notify_player_update(player)
+        try:
+            await self._notify_player_update(player)
+        except Exception:
+            logger.exception("修仙世界：玩家状态推送失败 user_id=%s", player.user_id)
 
     async def _notify_player_update(self, player: Player):
         """向前端推送玩家面板、背包与排行榜变化。"""
@@ -1588,6 +1616,7 @@ class GameEngine:
             if isinstance(value, dict):
                 value = dict(value)
             setattr(player, field.name, value)
+        GameEngine._clamp_player_hp(player)
 
     async def _notify_market_changed(self, action: str, count: int = 0):
         """广播坊市列表变更，驱动前端实时刷新。"""
@@ -1862,6 +1891,10 @@ class GameEngine:
 
     async def shutdown(self):
         """关闭时保存所有数据并关闭数据库。"""
+        if self._ws_manager and hasattr(self._ws_manager, "stop_chat_cleanup_task"):
+            await self._ws_manager.stop_chat_cleanup_task()
+        for player in self._players.values():
+            self._clamp_player_hp(player)
         await self._data_manager.save_all_players(self._players)
         if self.auth:
             await self.auth.save()
@@ -1897,6 +1930,10 @@ class GameEngine:
     def set_chat_reviewer(self, reviewer: Callable[[str], Awaitable[dict]] | None):
         """设置世界频道消息审核器（由插件层注入 AI 审核实现）。"""
         self._chat_reviewer = reviewer
+
+    def set_sect_name_reviewer(self, reviewer: Callable[[str], Awaitable[dict]] | None):
+        """设置宗门名称审核器（由插件层注入 AI 审核实现）。"""
+        self._sect_name_reviewer = reviewer
 
     def _local_name_risk_check(self, name: str) -> tuple[bool, str]:
         """本地敏感词兜底检测。"""
@@ -2074,6 +2111,7 @@ class GameEngine:
         player = self._players.get(user_id)
         if not player:
             return None
+        self._clamp_player_hp(player)
         from .inventory import get_inventory_display_sync
         d = player.to_dict()
         d["inventory_detail"] = get_inventory_display_sync(player)
@@ -2407,3 +2445,67 @@ class GameEngine:
             self._apply_player_snapshot(player, snapshot)
             await self._notify_player_update(player)
             return result
+
+    # ── 宗门系统 ─────────────────────────────────────────
+
+    async def sect_create(self, user_id: str, name: str, description: str = "") -> dict:
+        """创建宗门。"""
+        player = self._players.get(user_id)
+        if not player:
+            return {"success": False, "message": "你还没有角色，请先创建"}
+        reviewer = self._sect_name_reviewer or self._name_reviewer
+        result = await sect_mod.create_sect(
+            player, name, description, self._data_manager,
+            name_reviewer=reviewer,
+        )
+        if result["success"]:
+            await self._save_player(player)
+        return result
+
+    async def sect_disband(self, user_id: str) -> dict:
+        """解散宗门。"""
+        player = self._players.get(user_id)
+        if not player:
+            return {"success": False, "message": "你还没有角色，请先创建"}
+        return await sect_mod.disband_sect(player, self._data_manager)
+
+    async def sect_list(self, page: int = 1, page_size: int = 10) -> dict:
+        """获取宗门列表。"""
+        return await sect_mod.get_sect_list(self._data_manager, page, page_size)
+
+    async def sect_detail(self, sect_id: str) -> dict:
+        """获取宗门详情。"""
+        return await sect_mod.get_sect_detail(sect_id, self._data_manager)
+
+    async def sect_my(self, user_id: str) -> dict:
+        """获取我的宗门信息。"""
+        return await sect_mod.get_my_sect(user_id, self._data_manager)
+
+    async def sect_join(self, user_id: str, sect_id: str) -> dict:
+        """加入宗门。"""
+        player = self._players.get(user_id)
+        if not player:
+            return {"success": False, "message": "你还没有角色，请先创建"}
+        return await sect_mod.join_sect(player, sect_id, self._data_manager)
+
+    async def sect_leave(self, user_id: str) -> dict:
+        """退出宗门。"""
+        return await sect_mod.leave_sect(user_id, self._data_manager)
+
+    async def sect_kick(self, operator_id: str, target_id: str) -> dict:
+        """踢出成员。"""
+        return await sect_mod.kick_member(operator_id, target_id, self._data_manager)
+
+    async def sect_set_role(self, operator_id: str, target_id: str, role: str) -> dict:
+        """设置成员身份。"""
+        return await sect_mod.set_member_role(
+            operator_id, target_id, role, self._data_manager,
+        )
+
+    async def sect_update_info(self, operator_id: str, data: dict) -> dict:
+        """修改宗门信息。"""
+        return await sect_mod.update_sect_info(operator_id, data, self._data_manager)
+
+    async def sect_transfer(self, leader_id: str, target_id: str) -> dict:
+        """转让宗主。"""
+        return await sect_mod.transfer_leader(leader_id, target_id, self._data_manager)
