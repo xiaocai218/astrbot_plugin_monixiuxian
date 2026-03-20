@@ -519,11 +519,7 @@ class GameEngine:
                     return {"success": False, "message": f"历练冷却中，请等待{mins}分{secs}秒后再试"}
                 return {"success": False, "message": f"历练冷却中，请等待{secs}秒后再试"}
 
-        result = await self.dungeon.start(player)
-        if result.get("success"):
-            player.last_adventure_time = now
-            await self._save_player(player)
-        return result
+        return await self.dungeon.start(player)
 
     async def get_adventure_scenes(self) -> list[dict]:
         """获取所有历练场景列表。"""

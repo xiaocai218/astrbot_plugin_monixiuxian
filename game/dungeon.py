@@ -99,6 +99,11 @@ class DungeonManager:
         player.hp = 1
         return True
 
+    @staticmethod
+    def _mark_adventure_finished(player: Player):
+        """记录本次历练结束时间，用于冷却判定。"""
+        player.last_adventure_time = time.time()
+
     async def _resolve_dungeon_death(
         self,
         player: Player,
@@ -116,6 +121,7 @@ class DungeonManager:
             session.pvp_session_id = None
             session.fatal_on_next_damage = False
             session.message = talisman_message
+            self._mark_adventure_finished(player)
             await self._engine._save_player(player)
             result = {
                 "success": True,
@@ -176,8 +182,9 @@ class DungeonManager:
             session.message = (
                 f"安全通过{LAYER_NAMES[layer]}！获得奖励：{reward.get('desc', '')}"
             )
-            await self._engine._save_player(player)
             if layer >= len(LAYER_NAMES) - 1:
+                self._mark_adventure_finished(player)
+                await self._engine._save_player(player)
                 session.status = "exited"
                 session.message += "\n恭喜！你通过了全部五层！"
                 result = {
@@ -188,6 +195,7 @@ class DungeonManager:
                 }
                 self._cleanup_session(player.user_id)
                 return result
+            await self._engine._save_player(player)
             session.current_layer = layer + 1
             session.status = "layer_complete"
             return {
@@ -305,6 +313,8 @@ class DungeonManager:
 
         session.status = "exited"
         session.message = "你选择见好就收，带着战利品离开了副本"
+        self._mark_adventure_finished(player)
+        await self._engine._save_player(player)
         result = {
             "success": True, "message": session.message,
             "dungeon_state": session.to_dict(),
@@ -393,8 +403,9 @@ class DungeonManager:
                 )
             if low_hp_warning:
                 session.message = self._append_low_hp_warning(session.message)
-            await self._engine._save_player(player)
             if layer >= len(LAYER_NAMES) - 1:
+                self._mark_adventure_finished(player)
+                await self._engine._save_player(player)
                 session.status = "exited"
                 session.message += "\n通过了全部五层！"
                 result = {
@@ -407,6 +418,7 @@ class DungeonManager:
                     result["low_hp_warning"] = True
                 self._cleanup_session(player.user_id)
                 return result
+            await self._engine._save_player(player)
             session.current_layer = layer + 1
             session.status = "layer_complete"
             result = {
@@ -431,6 +443,7 @@ class DungeonManager:
             new_name = get_realm_name(player.realm, player.sub_realm)
             session.message = f"天灾降临！修为跌落{actual}层：{old_name} → {new_name}"
             session.status = "failed"
+            self._mark_adventure_finished(player)
             await self._engine._save_player(player)
             result = {
                 "success": True, "passed": True, "danger": "disaster",
@@ -631,6 +644,7 @@ class DungeonManager:
             session.combat = None
             session.status = "failed"
             session.message = "逃离战斗，历练结束，保留已获奖励"
+            self._mark_adventure_finished(player)
             await self._engine._save_player(player)
             result = {
                 "success": True,
@@ -646,6 +660,7 @@ class DungeonManager:
             session.combat = None
             session.status = "failed"
             session.message = "战斗超时，双方脱离，历练结束"
+            self._mark_adventure_finished(player)
             await self._engine._save_player(player)
             result = {
                 "success": True,
@@ -718,6 +733,9 @@ class DungeonManager:
             session.status = "failed"
             session.message = f"你被在线玩家{enemy_name}击败，历练结束"
 
+        if player.hp > 0:
+            self._mark_adventure_finished(player)
+            await self._engine._save_player(player)
         snapshot = session.to_dict()
         result = {
             "success": True,
@@ -743,9 +761,10 @@ class DungeonManager:
         session.accumulated_rewards.append(reward)
         session.combat = None
         session.pvp_session_id = None
-        await self._engine._save_player(player)
 
         if layer >= len(LAYER_NAMES) - 1:
+            self._mark_adventure_finished(player)
+            await self._engine._save_player(player)
             session.status = "exited"
             session.message = (
                 f"击败{enemy_name}！获得：{reward.get('desc', '')}\n通过了全部五层！"
@@ -759,6 +778,7 @@ class DungeonManager:
             self._cleanup_session(player.user_id)
             return result
 
+        await self._engine._save_player(player)
         session.current_layer = layer + 1
         session.status = "layer_complete"
         session.message = f"击败{enemy_name}！获得：{reward.get('desc', '')}"
