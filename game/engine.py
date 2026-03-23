@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import datetime
 import logging
 import random
@@ -64,7 +65,7 @@ class GameEngine:
     def __init__(self, data_manager: DataManager, cultivate_cooldown: int = 60):
         self._data_manager = data_manager
         self._players: dict[str, Player] = {}
-        self._shop_buy_locks: dict[str, asyncio.Lock] = {}
+        self._player_locks: dict[str, asyncio.Lock] = {}
         self._name_index: dict[str, str] = {}  # {道号: user_id} 用于按名查找
         self._cultivate_cooldown = cultivate_cooldown
         self._checkin_config: dict = {}  # 签到配置，由外部设置
@@ -1814,6 +1815,15 @@ class GameEngine:
             setattr(player, field.name, value)
         GameEngine._clamp_player_hp(player)
 
+    def _get_player_lock(self, user_id: str) -> asyncio.Lock:
+        """获取玩家级锁（按需创建），用于保护需要原子修改玩家状态的操作。"""
+        return self._player_locks.setdefault(user_id, asyncio.Lock())
+
+    @staticmethod
+    def _snapshot_player(player: Player) -> Player:
+        """创建玩家对象的深拷贝快照，用于在事务中操作而不影响共享内存。"""
+        return Player.from_dict(player.to_dict(include_sensitive=True))
+
     async def _notify_market_changed(self, action: str, count: int = 0):
         """广播坊市列表变更，驱动前端实时刷新。"""
         if self._ws_manager and hasattr(self._ws_manager, "queue_market_refresh"):
@@ -1827,6 +1837,56 @@ class GameEngine:
                     "ts": time.time(),
                 },
             })
+
+    async def _process_market_cleanup(self):
+        """清理过期坊市商品：逐条在持锁事务内原子完成标记+退物。"""
+        expired = await market_mod.cleanup_expired(self._data_manager)
+        cleaned_count = 0
+
+        for listing in expired:
+            sid = listing["seller_id"]
+            seller = self._players.get(sid)
+            if not seller:
+                # 卖家不在线/已删除，仅标记过期，物品无法退回
+                await self._data_manager.update_listing_status(
+                    listing["listing_id"], "expired", expected_status="active",
+                )
+                cleaned_count += 1
+                continue
+
+            async with self._get_player_lock(sid):
+                snapshot = self._snapshot_player(seller)
+                item_id = listing["item_id"]
+                snapshot.inventory[item_id] = (
+                    snapshot.inventory.get(item_id, 0) + listing["quantity"]
+                )
+                try:
+                    async with self._data_manager.transaction() as tx:
+                        cur = await tx.execute(
+                            """UPDATE market_listings SET status = ?
+                               WHERE listing_id = ? AND status = ?""",
+                            ("expired", listing["listing_id"], "active"),
+                        )
+                        if cur.rowcount <= 0:
+                            # 已被并发处理（购买/取消），跳过
+                            continue
+                        await self._data_manager._upsert_player(snapshot, db=tx)
+                except Exception:
+                    logger.exception(
+                        "修仙世界：过期清理事务失败 listing=%s seller=%s",
+                        listing["listing_id"], sid,
+                    )
+                    continue
+
+                self._apply_player_snapshot(seller, snapshot)
+                try:
+                    await self._notify_player_update(seller)
+                except Exception:
+                    logger.exception("修仙世界：玩家状态推送失败 user_id=%s", sid)
+                cleaned_count += 1
+
+        if cleaned_count > 0:
+            await self._notify_market_changed("cleanup", cleaned_count)
 
     def _auto_unequip_invalid_equipment(self, player: Player) -> list[str]:
         """自动卸下当前境界无法装备的物品并放回背包。"""
@@ -2384,12 +2444,19 @@ class GameEngine:
         player = self._players.get(user_id)
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
-        result = await market_mod.list_item(
-            player, item_id, quantity, unit_price, self._data_manager,
-        )
-        if result["success"]:
-            await self._save_player(player)
-            await self._notify_market_changed("list")
+
+        async with self._get_player_lock(user_id):
+            snapshot = self._snapshot_player(player)
+            result = await market_mod.list_item(
+                snapshot, item_id, quantity, unit_price, self._data_manager,
+            )
+            if result["success"]:
+                self._apply_player_snapshot(player, snapshot)
+                try:
+                    await self._notify_player_update(player)
+                except Exception:
+                    logger.exception("修仙世界：玩家状态推送失败 user_id=%s", player.user_id)
+                await self._notify_market_changed("list")
         return result
 
     async def market_list_by_name(
@@ -2421,25 +2488,46 @@ class GameEngine:
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
 
-        cleanup = await market_mod.cleanup_expired(self._data_manager, self._players)
-        for seller_id in cleanup.get("seller_ids", []):
-            seller = self._players.get(seller_id)
-            if seller:
-                await self._save_player(seller)
-        if cleanup.get("count", 0) > 0:
-            await self._notify_market_changed("cleanup", cleanup.get("count", 0))
+        await self._process_market_cleanup()
 
-        result = await market_mod.buy_item(
-            player, listing_id, self._data_manager, self._players,
-        )
-        if result["success"]:
-            await self._save_player(player)
-            # 同时保存卖家
-            seller_id = result.get("seller_id")
-            seller = self._players.get(seller_id) if seller_id else None
-            if seller:
-                await self._save_player(seller)
-            await self._notify_market_changed("buy")
+        # 预查 listing 以确定卖家 ID，用于加锁
+        listing = await self._data_manager.get_listing_by_id(listing_id)
+        if not listing:
+            return {"success": False, "message": "该商品不存在"}
+
+        seller_id = listing["seller_id"]
+        if seller_id == user_id:
+            return {"success": False, "message": "不能购买自己的商品"}
+
+        seller = self._players.get(seller_id)
+        if not seller:
+            return {"success": False, "message": "卖家信息异常，请稍后重试"}
+
+        # 按 user_id 排序获取双方锁，避免死锁
+        lock_ids = sorted({user_id, seller_id})
+        lock_first = self._get_player_lock(lock_ids[0])
+        lock_second = self._get_player_lock(lock_ids[1]) if len(lock_ids) > 1 else None
+
+        async with lock_first:
+            ctx = lock_second if lock_second else contextlib.nullcontext()
+            async with ctx:
+                buyer_snapshot = self._snapshot_player(player)
+                seller_snapshot = self._snapshot_player(seller)
+                result = await market_mod.buy_item(
+                    buyer_snapshot, seller_snapshot, listing_id, self._data_manager,
+                )
+                if result["success"]:
+                    self._apply_player_snapshot(player, buyer_snapshot)
+                    self._apply_player_snapshot(seller, seller_snapshot)
+                    try:
+                        await self._notify_player_update(player)
+                    except Exception:
+                        logger.exception("修仙世界：玩家状态推送失败 user_id=%s", player.user_id)
+                    try:
+                        await self._notify_player_update(seller)
+                    except Exception:
+                        logger.exception("修仙世界：玩家状态推送失败 user_id=%s", seller_id)
+                    await self._notify_market_changed("buy")
         return result
 
     async def market_buy_by_prefix(self, user_id: str, prefix: str) -> dict:
@@ -2454,12 +2542,19 @@ class GameEngine:
         player = self._players.get(user_id)
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
-        result = await market_mod.cancel_listing(
-            player, listing_id, self._data_manager,
-        )
-        if result["success"]:
-            await self._save_player(player)
-            await self._notify_market_changed("cancel")
+
+        async with self._get_player_lock(user_id):
+            snapshot = self._snapshot_player(player)
+            result = await market_mod.cancel_listing(
+                snapshot, listing_id, self._data_manager,
+            )
+            if result["success"]:
+                self._apply_player_snapshot(player, snapshot)
+                try:
+                    await self._notify_player_update(player)
+                except Exception:
+                    logger.exception("修仙世界：玩家状态推送失败 user_id=%s", player.user_id)
+                await self._notify_market_changed("cancel")
         return result
 
     async def market_cancel_by_prefix(self, user_id: str, prefix: str) -> dict:
@@ -2541,13 +2636,7 @@ class GameEngine:
     ) -> dict:
         """浏览坊市商品（含过期清理 + 卖家名称补充）。"""
         if cleanup_expired:
-            cleanup = await market_mod.cleanup_expired(self._data_manager, self._players)
-            for seller_id in cleanup.get("seller_ids", []):
-                seller = self._players.get(seller_id)
-                if seller:
-                    await self._save_player(seller)
-            if cleanup.get("count", 0) > 0:
-                await self._notify_market_changed("cleanup", cleanup.get("count", 0))
+            await self._process_market_cleanup()
 
         data = await market_mod.get_listings(self._data_manager, page, page_size)
 
@@ -2566,13 +2655,7 @@ class GameEngine:
             return []
 
         if cleanup_expired:
-            cleanup = await market_mod.cleanup_expired(self._data_manager, self._players)
-            for seller_id in cleanup.get("seller_ids", []):
-                seller = self._players.get(seller_id)
-                if seller:
-                    await self._save_player(seller)
-            if cleanup.get("count", 0) > 0:
-                await self._notify_market_changed("cleanup", cleanup.get("count", 0))
+            await self._process_market_cleanup()
 
         listings = await market_mod.get_my_listings(player, self._data_manager)
         for listing in listings:
@@ -2627,9 +2710,8 @@ class GameEngine:
         player = self._players.get(user_id)
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
-        lock = self._shop_buy_locks.setdefault(user_id, asyncio.Lock())
-        async with lock:
-            snapshot = Player.from_dict(player.to_dict(include_sensitive=True))
+        async with self._get_player_lock(user_id):
+            snapshot = self._snapshot_player(player)
             result = await shop_mod.buy_from_shop(snapshot, item_id, quantity)
             if not result["success"]:
                 return result

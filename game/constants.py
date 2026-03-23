@@ -1393,8 +1393,38 @@ LAYER_PASS_RATES = [0.80, 0.72, 0.64, 0.56, 0.50]
 LAYER_REWARD_TYPES = ["spirit_stones", "equipment", "pills", "heart_method", "gongfa"]
 LAYER_NAMES = ["灵石秘境", "兵器洞府", "丹药福地", "心法秘阁", "功法圣殿"]
 DANGER_WEIGHTS = {"disaster": 80, "monster": 15, "enemy": 5}
-DISASTER_OUTCOMES = {"hp_damage": 90, "realm_drop": 7, "death": 3}
+DISASTER_OUTCOMES = {"hp_damage": 90, "realm_drop": 7, "catastrophe": 3}
 FLEE_BASE_RATES = [0.70, 0.60, 0.50, 0.40, 0.30]
+DUNGEON_RISK_SCORE_CAP = 100.0
+DUNGEON_LOW_HP_LINE = 0.20
+DUNGEON_FAILURE_WEIGHTS = {
+    "hp_loss": 0.38,
+    "threat_gap": 0.24,
+    "layer": 0.16,
+    "risk_stack": 0.14,
+    "low_hp": 0.08,
+}
+DUNGEON_FAILURE_THRESHOLDS = {
+    "minor": 35.0,
+    "serious": 55.0,
+    "critical": 75.0,
+}
+DUNGEON_DEATH_MODEL = {
+    "guard_layers": 2,
+    "base": 0.003,
+    "per_point": 0.0006,
+    "max": 0.018,
+}
+DUNGEON_RISK_ADJUSTMENTS = {
+    "safe_pass": -4.0,
+    "combat_win": -6.0,
+    "disaster_damage_base": 8.0,
+    "disaster_damage_ratio": 28.0,
+    "low_hp_bonus": 12.0,
+    "failed_flee": 10.0,
+    "catastrophe": 18.0,
+    "realm_drop": 16.0,
+}
 # (概率, 属性比) — "realm_up" 表示高1大境界
 ENEMY_TIERS: list[tuple] = [(0.90, 0.70), (0.09, 1.50), (0.01, "realm_up")]
 COMBAT_MAX_ROUNDS = 30

@@ -12,6 +12,9 @@ from .constants import (
     REALM_CONFIG, RealmLevel,
     LAYER_PASS_RATES, LAYER_REWARD_TYPES, LAYER_NAMES,
     DANGER_WEIGHTS, DISASTER_OUTCOMES,
+    DUNGEON_RISK_SCORE_CAP, DUNGEON_LOW_HP_LINE,
+    DUNGEON_FAILURE_WEIGHTS, DUNGEON_FAILURE_THRESHOLDS,
+    DUNGEON_DEATH_MODEL, DUNGEON_RISK_ADJUSTMENTS,
     ENEMY_TIERS, COMBAT_MAX_ROUNDS,
     get_realm_name, get_equip_bonus, get_heart_method_bonus,
     get_total_gongfa_bonus, get_player_base_max_lingqi,
@@ -19,7 +22,7 @@ from .constants import (
 )
 from .models import Player
 
-LOW_HP_WARNING_TEXT = "你已濒死，仅剩1点生命，建议立刻退出秘境；若再受伤，将会当场陨落。"
+LOW_HP_WARNING_TEXT = "你已重伤濒危，仅剩1点生命，建议立刻退出秘境；若继续冒进，死亡风险会急剧上升。"
 
 
 @dataclass
@@ -35,6 +38,8 @@ class DungeonSession:
     started_at: float = field(default_factory=time.time)
     fatal_on_next_damage: bool = False
     low_hp_warning_nonce: int = 0
+    risk_score: float = 0.0
+    last_severity: float = 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -51,6 +56,8 @@ class DungeonSession:
             "started_at": self.started_at,
             "fatal_on_next_damage": self.fatal_on_next_damage,
             "low_hp_warning_nonce": self.low_hp_warning_nonce,
+            "risk_score": self.risk_score,
+            "last_severity": self.last_severity,
         }
 
 
@@ -104,6 +111,250 @@ class DungeonManager:
     def _mark_adventure_finished(player: Player):
         """记录本次历练结束时间，用于冷却判定。"""
         player.last_adventure_time = time.time()
+
+    @staticmethod
+    def _adjust_risk(session: DungeonSession, delta: float):
+        """调整本次历练风险值，并限制在配置区间内。"""
+        session.risk_score = round(
+            max(0.0, min(DUNGEON_RISK_SCORE_CAP, session.risk_score + float(delta))),
+            2,
+        )
+
+    def _apply_low_hp_warning_if_needed(
+        self, session: DungeonSession, message: str, low_hp_warning: bool
+    ) -> tuple[str, bool]:
+        if not low_hp_warning:
+            return message, False
+        self._adjust_risk(session, DUNGEON_RISK_ADJUSTMENTS["low_hp_bonus"])
+        return self._append_low_hp_warning(message), True
+
+    @staticmethod
+    def _calc_power_score(attack: int, defense: int, hp: int) -> float:
+        return attack * 1.25 + defense * 0.95 + hp * 0.08
+
+    @classmethod
+    def _calc_threat_gap(cls, player_power: float, enemy_power: float) -> float:
+        ratio = enemy_power / max(1.0, player_power)
+        return max(0.0, min(1.0, (ratio - 1.0) / 0.8))
+
+    @classmethod
+    def _calc_combat_threat_gap(cls, combat: Optional[CombatState]) -> float:
+        if not combat:
+            return 0.35
+        player_power = cls._calc_power_score(
+            combat.player_attack, combat.player_defense, combat.player_max_hp
+        )
+        enemy_power = cls._calc_power_score(
+            combat.enemy_attack, combat.enemy_defense, combat.enemy_max_hp
+        )
+        return cls._calc_threat_gap(player_power, enemy_power)
+
+    @staticmethod
+    def _get_effective_combat_stats(player: Player) -> dict:
+        from .pills import get_effective_combat_stats
+
+        return get_effective_combat_stats(player)
+
+    @classmethod
+    def _set_player_effective_hp(cls, player: Player, target_effective_hp: int) -> tuple[int, int]:
+        effective_stats = cls._get_effective_combat_stats(player)
+        effective_max_hp = max(1, int(effective_stats["max_hp"]))
+        hp_delta = effective_max_hp - player.max_hp
+        target = max(1, min(int(target_effective_hp), effective_max_hp))
+        player.hp = max(1, min(player.max_hp, target - hp_delta))
+        return target, effective_max_hp
+
+    def _calc_failure_severity(
+        self,
+        player: Player,
+        session: DungeonSession,
+        *,
+        threat_gap: float,
+        severity_bonus: float = 0.0,
+    ) -> dict:
+        effective_stats = self._get_effective_combat_stats(player)
+        effective_max_hp = max(1, int(effective_stats["max_hp"]))
+        effective_hp = max(0, int(effective_stats["hp"]))
+        hp_ratio = max(0.0, min(1.0, effective_hp / effective_max_hp))
+        layer_factor = session.current_layer / max(1, len(LAYER_NAMES) - 1)
+        risk_stack = session.risk_score / DUNGEON_RISK_SCORE_CAP
+        low_hp_factor = 1.0 if (hp_ratio <= DUNGEON_LOW_HP_LINE or session.fatal_on_next_damage) else 0.0
+
+        severity = 100.0 * (
+            DUNGEON_FAILURE_WEIGHTS["hp_loss"] * (1.0 - hp_ratio)
+            + DUNGEON_FAILURE_WEIGHTS["threat_gap"] * max(0.0, min(1.0, threat_gap))
+            + DUNGEON_FAILURE_WEIGHTS["layer"] * layer_factor
+            + DUNGEON_FAILURE_WEIGHTS["risk_stack"] * risk_stack
+            + DUNGEON_FAILURE_WEIGHTS["low_hp"] * low_hp_factor
+        )
+        severity = max(0.0, min(100.0, severity + severity_bonus))
+        session.last_severity = round(severity, 2)
+        return {
+            "severity": severity,
+            "hp_ratio": hp_ratio,
+            "effective_hp": effective_hp,
+            "effective_max_hp": effective_max_hp,
+        }
+
+    async def _finalize_failure_exit(
+        self,
+        player: Player,
+        session: DungeonSession,
+        *,
+        message: str,
+        result_extra: Optional[dict] = None,
+    ) -> dict:
+        session.status = "failed"
+        session.combat = None
+        session.pvp_session_id = None
+        session.fatal_on_next_damage = False
+        session.message = message
+        self._mark_adventure_finished(player)
+        await self._engine._save_player(player)
+        result = {
+            "success": True,
+            "message": session.message,
+            "dungeon_state": session.to_dict(),
+        }
+        if result_extra:
+            result.update(result_extra)
+        self._cleanup_session(player.user_id)
+        return result
+
+    async def _resolve_failure_outcome(
+        self,
+        player: Player,
+        session: DungeonSession,
+        *,
+        context: str,
+        threat_gap: float,
+        extra_result: Optional[dict] = None,
+        severity_bonus: float = 0.0,
+        preferred_realm_drop: bool = False,
+        death_message: Optional[str] = None,
+        talisman_message: Optional[str] = None,
+    ) -> dict:
+        failure = self._calc_failure_severity(
+            player,
+            session,
+            threat_gap=threat_gap,
+            severity_bonus=severity_bonus,
+        )
+        severity = failure["severity"]
+        self._adjust_risk(session, severity * 0.25)
+
+        death_prob = 0.0
+        critical_threshold = DUNGEON_FAILURE_THRESHOLDS["critical"]
+        if (
+            severity >= critical_threshold
+            and session.current_layer >= DUNGEON_DEATH_MODEL["guard_layers"]
+        ):
+            death_prob = min(
+                DUNGEON_DEATH_MODEL["max"],
+                DUNGEON_DEATH_MODEL["base"]
+                + (severity - critical_threshold) * DUNGEON_DEATH_MODEL["per_point"],
+            )
+
+        result_base = dict(extra_result or {})
+        result_base.update(
+            {
+                "failure_severity": round(severity, 2),
+                "death_prob": round(death_prob, 4),
+                "risk_score": round(session.risk_score, 2),
+            }
+        )
+
+        if death_prob > 0 and random.random() < death_prob:
+            return await self._resolve_dungeon_death(
+                player,
+                session,
+                death_message=death_message or f"你在{context}中伤重不治，不幸陨落……",
+                talisman_message=(
+                    talisman_message
+                    or f"你在{context}中本该陨落，幸有保命符替你挡下死劫。你拖着残躯退出秘境，历练结束。"
+                ),
+                extra_result=result_base,
+            )
+
+        realm_drop_rate = 0.0
+        if severity >= critical_threshold:
+            realm_drop_rate = 0.34
+        elif severity >= DUNGEON_FAILURE_THRESHOLDS["serious"]:
+            realm_drop_rate = 0.18
+        if preferred_realm_drop:
+            realm_drop_rate = min(0.88, realm_drop_rate + 0.28)
+
+        if realm_drop_rate > 0 and random.random() < realm_drop_rate:
+            from .adventure import _drop_realm_steps, _rebuild_stats_by_realm
+
+            old_name = get_realm_name(player.realm, player.sub_realm)
+            drop_levels = 1 if severity < critical_threshold else random.randint(1, 3)
+            if preferred_realm_drop:
+                drop_levels = min(3, drop_levels + 1)
+            actual_drop = _drop_realm_steps(player, drop_levels)
+            player.exp = 0
+            _rebuild_stats_by_realm(player)
+            self._engine._auto_unequip_invalid_equipment(player)
+            self._engine._auto_unequip_invalid_heart_method(
+                player, convert_ratio=0.6, force=False
+            )
+            new_name = get_realm_name(player.realm, player.sub_realm)
+            result_base.update(
+                {
+                    "realm_changed": actual_drop > 0,
+                    "old_realm": old_name,
+                    "new_realm": new_name,
+                    "failure_outcome": "realm_drop",
+                }
+            )
+            return await self._finalize_failure_exit(
+                player,
+                session,
+                message=(
+                    f"你在{context}中险死还生，修为跌落{max(1, actual_drop)}层："
+                    f"{old_name} → {new_name}，历练结束。"
+                ),
+                result_extra=result_base,
+            )
+
+        serious = severity >= DUNGEON_FAILURE_THRESHOLDS["serious"]
+        if serious:
+            target_ratio = random.uniform(0.08, 0.15)
+            outcome = "serious_wound"
+        else:
+            target_ratio = random.uniform(0.18, 0.30)
+            outcome = "minor_wound"
+        current_hp = failure["effective_hp"]
+        effective_max_hp = failure["effective_max_hp"]
+        target_effective_hp = max(1, int(effective_max_hp * target_ratio))
+        if 0 < current_hp <= target_effective_hp:
+            target_effective_hp = current_hp
+        new_effective_hp, effective_max_hp = self._set_player_effective_hp(
+            player, target_effective_hp
+        )
+        result_base.update(
+            {
+                "failure_outcome": outcome,
+                "hp": new_effective_hp,
+                "max_hp": effective_max_hp,
+            }
+        )
+        if serious:
+            message = (
+                f"你在{context}中遭受重创，勉强保住性命，"
+                f"当前HP：{new_effective_hp}/{effective_max_hp}，历练结束。"
+            )
+        else:
+            message = (
+                f"你在{context}中负伤撤离，"
+                f"当前HP：{new_effective_hp}/{effective_max_hp}，历练结束。"
+            )
+        return await self._finalize_failure_exit(
+            player,
+            session,
+            message=message,
+            result_extra=result_base,
+        )
 
     async def _resolve_dungeon_death(
         self,
@@ -180,6 +431,7 @@ class DungeonManager:
         if self._roll_passage(layer):
             reward = await self._generate_layer_reward(player, layer)
             session.accumulated_rewards.append(reward)
+            self._adjust_risk(session, DUNGEON_RISK_ADJUSTMENTS["safe_pass"])
             session.message = (
                 f"安全通过{LAYER_NAMES[layer]}！获得奖励：{reward.get('desc', '')}"
             )
@@ -292,9 +544,9 @@ class DungeonManager:
         self._sync_player_from_combat(player, combat)
         low_hp_warning = self._sync_low_hp_warning(session, player.hp)
         await self._engine._save_player(player)
-        session.message = combined_msg
-        if low_hp_warning:
-            session.message = self._append_low_hp_warning(session.message)
+        session.message, low_hp_warning = self._apply_low_hp_warning_if_needed(
+            session, combined_msg, low_hp_warning
+        )
         result = {
             "success": True, "message": combined_msg,
             "dungeon_state": session.to_dict(),
@@ -373,12 +625,15 @@ class DungeonManager:
             else:
                 dmg = max(1, int(effective_stats["max_hp"] * dmg_ratio))
 
-            # 有实际伤害且濒死 → 判定死亡
             if dmg > 0 and (effective_stats["hp"] <= 1 or session.fatal_on_next_damage):
-                return await self._resolve_dungeon_death(
+                self._adjust_risk(session, DUNGEON_RISK_ADJUSTMENTS["catastrophe"])
+                return await self._resolve_failure_outcome(
                     player,
                     session,
-                    death_message="你本已命悬一线，又遭天灾重创，当场陨落……",
+                    context="天灾余波中",
+                    threat_gap=0.9,
+                    severity_bonus=12.0,
+                    death_message="你本已命悬一线，又遭天灾重创，不幸陨落……",
                     talisman_message="天灾本该夺你性命，所幸保命符替你挡下一劫。你拖着残躯逃出秘境，历练结束。",
                     extra_result={
                         "passed": True,
@@ -389,6 +644,12 @@ class DungeonManager:
             new_effective_hp = max(1, effective_stats["hp"] - dmg)
             player.hp = max(1, min(player.max_hp, new_effective_hp - effective_stats["hp_delta"]))
             low_hp_warning = self._sync_low_hp_warning(session, player.hp)
+            damage_ratio = min(1.0, dmg / max(1, effective_stats["max_hp"]))
+            self._adjust_risk(
+                session,
+                DUNGEON_RISK_ADJUSTMENTS["disaster_damage_base"]
+                + DUNGEON_RISK_ADJUSTMENTS["disaster_damage_ratio"] * damage_ratio,
+            )
             reward = await self._generate_layer_reward(player, layer)
             session.accumulated_rewards.append(reward)
             if mitigated_to_floor:
@@ -402,8 +663,9 @@ class DungeonManager:
                     f"遭遇天灾！受到{dmg}点伤害，HP: {new_effective_hp}/{effective_stats['max_hp']}。"
                     f"你强撑着穿过险境，获得奖励：{reward.get('desc', '')}"
                 )
-            if low_hp_warning:
-                session.message = self._append_low_hp_warning(session.message)
+            session.message, low_hp_warning = self._apply_low_hp_warning_if_needed(
+                session, session.message, low_hp_warning
+            )
             if layer >= len(LAYER_NAMES) - 1:
                 self._mark_adventure_finished(player)
                 await self._engine._save_player(player)
@@ -432,33 +694,28 @@ class DungeonManager:
             return result
 
         if roll <= DISASTER_OUTCOMES["hp_damage"] + DISASTER_OUTCOMES["realm_drop"]:
-            from .adventure import _drop_realm_steps, _rebuild_stats_by_realm
-
-            old_name = get_realm_name(player.realm, player.sub_realm)
-            actual = _drop_realm_steps(player, random.randint(1, 3))
-            _rebuild_stats_by_realm(player)
-            self._engine._auto_unequip_invalid_equipment(player)
-            self._engine._auto_unequip_invalid_heart_method(
-                player, convert_ratio=0.6, force=False
+            self._adjust_risk(session, DUNGEON_RISK_ADJUSTMENTS["realm_drop"])
+            return await self._resolve_failure_outcome(
+                player,
+                session,
+                context="天灾冲击中",
+                threat_gap=0.78,
+                severity_bonus=8.0,
+                preferred_realm_drop=True,
+                extra_result={
+                    "passed": True,
+                    "danger": "disaster",
+                },
             )
-            new_name = get_realm_name(player.realm, player.sub_realm)
-            session.message = f"天灾降临！修为跌落{actual}层：{old_name} → {new_name}"
-            session.status = "failed"
-            self._mark_adventure_finished(player)
-            await self._engine._save_player(player)
-            result = {
-                "success": True, "passed": True, "danger": "disaster",
-                "realm_changed": True,
-                "message": session.message,
-                "dungeon_state": session.to_dict(),
-            }
-            self._cleanup_session(player.user_id)
-            return result
 
-        return await self._resolve_dungeon_death(
+        self._adjust_risk(session, DUNGEON_RISK_ADJUSTMENTS["catastrophe"])
+        return await self._resolve_failure_outcome(
             player,
             session,
-            death_message="天灾降临，不幸陨落……",
+            context="天灾中心",
+            threat_gap=1.0,
+            severity_bonus=18.0,
+            death_message="天灾降临，你被卷入毁灭乱流，不幸陨落……",
             talisman_message="天灾降临之际，保命符替你扛下死劫。你侥幸逃出生天，历练结束。",
             extra_result={
                 "passed": True,
@@ -623,20 +880,26 @@ class DungeonManager:
                 combat.enemy_name if combat else "敌人",
             )
             if low_hp_warning:
-                session.message = self._append_low_hp_warning(session.message)
-                result["message"] = session.message
-                result["dungeon_state"] = session.to_dict()
-                result["low_hp_warning"] = True
+                session.message, low_hp_warning = self._apply_low_hp_warning_if_needed(
+                    session, session.message, low_hp_warning
+                )
+                if low_hp_warning:
+                    result["message"] = session.message
+                    result["dungeon_state"] = session.to_dict()
+                    result["low_hp_warning"] = True
             return result
 
         elif outcome == "lose":
             if combat:
                 self._sync_player_from_combat(player, combat)
             enemy_name = combat.enemy_name if combat else "敌人"
-            return await self._resolve_dungeon_death(
+            return await self._resolve_failure_outcome(
                 player,
                 session,
-                death_message=f"被{enemy_name}击败，不幸陨落……",
+                context=f"与{enemy_name}交战时",
+                threat_gap=self._calc_combat_threat_gap(combat),
+                severity_bonus=6.0,
+                death_message=f"被{enemy_name}击败，伤势过重，不幸陨落……",
                 talisman_message=f"被{enemy_name}击败之际，保命符替你扛下死劫。你重伤退出秘境，历练结束。",
             )
 
@@ -722,34 +985,55 @@ class DungeonManager:
                 f"在线玩家{enemy_name}",
             )
 
-        if player.hp <= 0:
-            session.status = "dead"
-            session.message = "你在秘境遭遇战中陨落……"
-        elif pvp_session.winner_id is None:
-            session.status = "failed"
-            session.message = "你与在线对手鏖战许久仍未分出胜负，历练被迫中止"
-        elif pvp_session.end_reason == "flee":
-            session.status = "failed"
-            session.message = "你在秘境遭遇战中献上物品脱身，历练结束"
-        else:
-            session.status = "failed"
-            session.message = f"你被在线玩家{enemy_name}击败，历练结束"
+        my_state = (
+            pvp_session.state_a
+            if pvp_session.player_a_id == dungeon_user_id
+            else pvp_session.state_b
+        )
+        opp_state = (
+            pvp_session.state_b
+            if pvp_session.player_a_id == dungeon_user_id
+            else pvp_session.state_a
+        )
+        threat_gap = self._calc_threat_gap(
+            self._calc_power_score(
+                my_state.player_attack, my_state.player_defense, my_state.player_max_hp
+            ),
+            self._calc_power_score(
+                opp_state.player_attack, opp_state.player_defense, opp_state.player_max_hp
+            ),
+        )
 
-        if player.hp > 0:
-            self._mark_adventure_finished(player)
-            await self._engine._save_player(player)
-        snapshot = session.to_dict()
-        result = {
-            "success": True,
-            "message": session.message,
-            "dungeon_state": snapshot,
-        }
-        pending = self._engine._pending_deaths.get(player.user_id)
-        if player.hp <= 0 and pending:
-            result["died"] = True
-            result["death_items"] = list(pending.get("items", []))
-        self._cleanup_session(dungeon_user_id)
-        return result
+        if pvp_session.winner_id is None:
+            return await self._finalize_failure_exit(
+                player,
+                session,
+                message="你与在线对手鏖战许久仍未分出胜负，历练被迫中止。",
+                result_extra={
+                    "failure_outcome": "timeout_exit",
+                    "risk_score": round(session.risk_score, 2),
+                },
+            )
+        if pvp_session.end_reason == "flee":
+            return await self._finalize_failure_exit(
+                player,
+                session,
+                message="你在秘境遭遇战中献上物品脱身，历练结束。",
+                result_extra={
+                    "failure_outcome": "flee_exit",
+                    "risk_score": round(session.risk_score, 2),
+                },
+            )
+
+        return await self._resolve_failure_outcome(
+            player,
+            session,
+            context=f"与在线玩家{enemy_name}交锋时",
+            threat_gap=threat_gap,
+            severity_bonus=10.0,
+            death_message=f"你在秘境遭遇战中被在线玩家{enemy_name}击溃，不幸陨落……",
+            talisman_message=f"在线玩家{enemy_name}本可取你性命，所幸保命符替你挡下死劫。你重伤退出秘境，历练结束。",
+        )
 
     async def _complete_layer_victory(
         self,
@@ -761,6 +1045,7 @@ class DungeonManager:
         layer = session.current_layer
         reward = await self._generate_layer_reward(player, layer)
         session.accumulated_rewards.append(reward)
+        self._adjust_risk(session, DUNGEON_RISK_ADJUSTMENTS["combat_win"])
         session.combat = None
         session.pvp_session_id = None
 

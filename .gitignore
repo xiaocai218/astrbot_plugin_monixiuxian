@@ -8,6 +8,8 @@ __pycache__/
 .npm-cache/
 .playwright-runner/
 .pw-browsers/
+tests
+REVIEW_FIXES.md
 
 # Distribution / packaging
 .Python

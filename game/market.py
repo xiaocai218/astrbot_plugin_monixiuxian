@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from typing import TYPE_CHECKING
 
 from .constants import ITEM_REGISTRY, EQUIPMENT_REGISTRY, parse_stored_heart_method_item_id
+from .data_manager import DataManager
 
 if TYPE_CHECKING:
-    from .data_manager import DataManager
     from .models import Player
+
+logger = logging.getLogger(__name__)
 
 # ── 常量 ────────────────────────────────────────────────
 LISTING_DURATION = 86400  # 24 小时
@@ -72,7 +75,11 @@ async def list_item(
     unit_price: int,
     dm: DataManager,
 ) -> dict:
-    """上架物品到坊市。"""
+    """上架物品到坊市。
+
+    调用方应传入玩家快照（非共享对象），并在外层持有玩家锁。
+    事务成功后由调用方将快照回写到共享对象。
+    """
     # 临时心法道具绑定过期时间，禁止流转
     if parse_stored_heart_method_item_id(item_id):
         return {"success": False, "message": "临时心法道具不可上架"}
@@ -113,29 +120,42 @@ async def list_item(
             "message": f"灵石不足以支付手续费（需 {fee} 灵石，当前 {player.spirit_stones}）",
         }
 
-    # 扣除物品 + 手续费
+    total_price = unit_price * quantity
+    now = time.time()
+    listing_id = uuid.uuid4().hex[:12]
+
+    # 在快照上修改状态（不影响共享对象）
     player.inventory[item_id] = owned - quantity
     if player.inventory[item_id] <= 0:
         del player.inventory[item_id]
     player.spirit_stones -= fee
 
-    total_price = unit_price * quantity
-    now = time.time()
-    listing_id = uuid.uuid4().hex[:12]
+    # 在独立连接事务内原子完成：上架记录 + 卖家资产扣除
+    try:
+        async with dm.transaction() as tx:
+            await tx.execute(
+                """INSERT INTO market_listings
+                   (listing_id, seller_id, item_id, quantity, unit_price,
+                    total_price, fee, listed_at, expires_at, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    listing_id,
+                    player.user_id,
+                    item_id,
+                    quantity,
+                    unit_price,
+                    total_price,
+                    fee,
+                    now,
+                    now + LISTING_DURATION,
+                    "active",
+                ),
+            )
+            await dm._upsert_player(player, db=tx)
 
-    listing = {
-        "listing_id": listing_id,
-        "seller_id": player.user_id,
-        "item_id": item_id,
-        "quantity": quantity,
-        "unit_price": unit_price,
-        "total_price": total_price,
-        "fee": fee,
-        "listed_at": now,
-        "expires_at": now + LISTING_DURATION,
-        "status": "active",
-    }
-    await dm.insert_market_listing(listing)
+    except Exception as e:
+        logger.error(f"坊市上架数据库操作失败: {e}")
+        return {"success": False, "message": "上架失败，请稍后重试"}
 
     return {
         "success": True,
@@ -148,6 +168,7 @@ async def list_item(
         "listing_id": listing_id,
         "fee": fee,
         "rate": rate,
+        "players_saved": True,
     }
 
 
@@ -155,11 +176,15 @@ async def list_item(
 
 async def buy_item(
     buyer: Player,
+    seller: Player,
     listing_id: str,
     dm: DataManager,
-    players: dict[str, Player],
 ) -> dict:
-    """从坊市购买物品。"""
+    """从坊市购买物品。
+
+    调用方应传入买家和卖家的快照（非共享对象），并在外层持有双方锁。
+    事务成功后由调用方将快照回写到共享对象。
+    """
     listing = await dm.get_listing_by_id(listing_id)
     if not listing:
         return {"success": False, "message": "该商品不存在"}
@@ -174,79 +199,74 @@ async def buy_item(
     if listing["seller_id"] == buyer.user_id:
         return {"success": False, "message": "不能购买自己的商品"}
 
+    if listing["seller_id"] != seller.user_id:
+        return {"success": False, "message": "卖家信息异常，请稍后重试"}
+
     total_price = listing["total_price"]
     if buyer.spirit_stones < total_price:
         return {
             "success": False,
             "message": f"灵石不足（需 {total_price}，当前 {buyer.spirit_stones}）",
         }
-    now = time.time()
-    updated = await dm.update_listing_status(
-        listing_id,
-        "sold",
-        buyer.user_id,
-        now,
-        expected_status="active",
-    )
-    if updated <= 0:
-        return {"success": False, "message": "该商品已被其他修士抢先购买"}
 
     item_id = listing["item_id"]
     item_def = ITEM_REGISTRY.get(item_id)
     equip_def = EQUIPMENT_REGISTRY.get(item_id)
     item_name = (item_def.name if item_def else equip_def.name) if (item_def or equip_def) else item_id
-    seller = players.get(listing["seller_id"])
-    if not seller:
-        await dm.update_listing_status(
-            listing_id,
-            "active",
-            None,
-            None,
-            expected_status="sold",
-        )
-        return {"success": False, "message": "卖家信息异常，请稍后重试"}
 
-    # 结算（状态已抢占成功）
     quantity = int(listing["quantity"])
+
+    # 在快照上修改状态（不影响共享对象）
     buyer.spirit_stones -= total_price
     buyer.inventory[item_id] = buyer.inventory.get(item_id, 0) + quantity
     seller.spirit_stones += total_price
 
+    # 在独立连接事务内原子完成所有数据库变更
+    now = time.time()
     try:
-        history = {
-            "history_id": uuid.uuid4().hex[:12],
-            "item_id": item_id,
-            "quantity": quantity,
-            "unit_price": listing["unit_price"],
-            "total_price": total_price,
-            "fee": listing["fee"],
-            "seller_id": listing["seller_id"],
-            "buyer_id": buyer.user_id,
-            "sold_at": now,
-        }
-        await dm.insert_market_history(history)
-    except Exception:
-        # 回滚内存与状态，避免玩家资产异常。
-        buyer.spirit_stones += total_price
-        buyer_left = buyer.inventory.get(item_id, 0) - quantity
-        if buyer_left > 0:
-            buyer.inventory[item_id] = buyer_left
-        else:
-            buyer.inventory.pop(item_id, None)
-        seller.spirit_stones -= total_price
-        await dm.update_listing_status(
-            listing_id,
-            "active",
-            None,
-            None,
-            expected_status="sold",
-        )
+        async with dm.transaction() as tx:
+            cur = await tx.execute(
+                """UPDATE market_listings
+                   SET status = ?, buyer_id = ?, sold_at = ?
+                   WHERE listing_id = ? AND status = ?""",
+                ("sold", buyer.user_id, now, listing_id, "active"),
+            )
+            if cur.rowcount <= 0:
+                raise DataManager.TransactionAbort("该商品已被其他修士抢先购买")
+
+            await tx.execute(
+                """INSERT INTO market_history
+                   (history_id, item_id, quantity, unit_price, total_price,
+                    fee, seller_id, buyer_id, sold_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    uuid.uuid4().hex[:12],
+                    item_id,
+                    quantity,
+                    listing["unit_price"],
+                    total_price,
+                    listing["fee"],
+                    seller.user_id,
+                    buyer.user_id,
+                    now,
+                ),
+            )
+
+            # 买卖双方全量 upsert 快照（双方均受锁保护，无并发风险）
+            await dm._upsert_player(buyer, db=tx)
+            await dm._upsert_player(seller, db=tx)
+
+    except DataManager.TransactionAbort as e:
+        return {"success": False, "message": str(e)}
+    except Exception as e:
+        logger.error(f"坊市交易数据库操作失败: {e}")
         return {"success": False, "message": "交易失败，请稍后重试"}
 
     return {
         "success": True,
         "message": f"成功购买「{item_name}」x{listing['quantity']}，花费 {total_price} 灵石",
-        "seller_id": listing["seller_id"],
+        "seller_id": seller.user_id,
+        "players_saved": True,
     }
 
 
@@ -257,7 +277,11 @@ async def cancel_listing(
     listing_id: str,
     dm: DataManager,
 ) -> dict:
-    """取消上架（手续费不退）。"""
+    """取消上架（手续费不退）。
+
+    调用方应传入玩家快照（非共享对象），并在外层持有玩家锁。
+    事务成功后由调用方将快照回写到共享对象。
+    """
     listing = await dm.get_listing_by_id(listing_id)
     if not listing:
         return {"success": False, "message": "该商品不存在"}
@@ -273,21 +297,30 @@ async def cancel_listing(
     equip_def = EQUIPMENT_REGISTRY.get(item_id)
     item_name = (item_def.name if item_def else equip_def.name) if (item_def or equip_def) else item_id
 
-    updated = await dm.update_listing_status(
-        listing_id,
-        "cancelled",
-        expected_status="active",
-    )
-    if updated <= 0:
-        # 可能被并发购买/过期处理
-        return {"success": False, "message": "该商品状态已变更，请刷新后重试"}
-
-    # 退回物品（状态更新成功后再执行，避免并发下重复返还）
+    # 在快照上修改状态
     player.inventory[item_id] = player.inventory.get(item_id, 0) + listing["quantity"]
+
+    # 在独立连接事务内原子完成：下架状态更新 + 玩家物品退回
+    try:
+        async with dm.transaction() as tx:
+            cur = await tx.execute(
+                """UPDATE market_listings SET status = ?
+                   WHERE listing_id = ? AND status = ?""",
+                ("cancelled", listing_id, "active"),
+            )
+            if cur.rowcount <= 0:
+                return {"success": False, "message": "该商品状态已变更，请刷新后重试"}
+
+            await dm._upsert_player(player, db=tx)
+
+    except Exception as e:
+        logger.error(f"坊市下架数据库操作失败: {e}")
+        return {"success": False, "message": "下架失败，请稍后重试"}
 
     return {
         "success": True,
         "message": f"已下架「{item_name}」x{listing['quantity']}，物品已退回（手续费不退）",
+        "players_saved": True,
     }
 
 
@@ -329,32 +362,14 @@ async def clear_my_history(
 
 async def cleanup_expired(
     dm: DataManager,
-    players: dict[str, Player],
-) -> dict:
-    """清理过期商品并退回物品，返回清理统计。"""
-    now = time.time()
-    expired = await dm.get_expired_active_listings(now)
-    refunded_seller_ids: set[str] = set()
-    cleaned_count = 0
-    for listing in expired:
-        updated = await dm.update_listing_status(
-            listing["listing_id"],
-            "expired",
-            expected_status="active",
-        )
-        if updated <= 0:
-            continue
+) -> list[dict]:
+    """查询所有过期但仍为 active 的商品列表，不做任何状态变更。
 
-        cleaned_count += 1
-        seller = players.get(listing["seller_id"])
-        if seller:
-            item_id = listing["item_id"]
-            seller.inventory[item_id] = seller.inventory.get(item_id, 0) + listing["quantity"]
-            refunded_seller_ids.add(seller.user_id)
-    return {
-        "count": cleaned_count,
-        "seller_ids": list(refunded_seller_ids),
-    }
+    实际的过期处理（标记 expired + 退回物品）由 engine 层逐条
+    在持有玩家锁的事务内原子完成。
+    """
+    now = time.time()
+    return await dm.get_expired_active_listings(now)
 
 
 def get_item_name(item_id: str) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import shutil
@@ -41,6 +42,37 @@ class DataManager:
         self.db: Optional[aiosqlite.Connection] = None
         self._shop_purchase_lock = asyncio.Lock()
         self._sect_schema_checked = False
+
+    class TransactionAbort(Exception):
+        """在事务上下文中主动中止，携带用户提示消息。"""
+        pass
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        """提供一个使用独立连接的数据库事务，异常时自动 rollback。
+
+        独立连接确保事务内的操作与 self.db 上的普通写操作完全隔离，
+        不会出现其他协程的写入被意外卷入事务的问题。
+
+        用法::
+
+            async with dm.transaction() as tx:
+                await tx.execute("UPDATE ...", (...))
+                await tx.execute("INSERT ...", (...))
+            # 离开 with 块自动 commit；异常则自动 rollback
+        """
+        conn = await aiosqlite.connect(self._db_path)
+        conn.row_factory = aiosqlite.Row
+        await conn.execute("PRAGMA journal_mode=WAL")
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield conn
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+        finally:
+            await conn.close()
 
     async def initialize(self):
         """初始化数据目录、打开数据库、建表、迁移旧数据。"""

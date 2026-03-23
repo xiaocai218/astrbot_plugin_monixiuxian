@@ -537,17 +537,25 @@ class PvPManager:
                 session.result_message = f"{player_a.name}获胜！"
 
             if knocked_out_a:
-                extra_a = await self._apply_player_defeat(session.state_a, player_a)
+                extra_a = await self._apply_player_defeat(
+                    session.state_a, player_a, source=session.source
+                )
                 extras[session.player_a_id].update(extra_a)
                 if extra_a.get("death_prevented"):
                     session.combat_log.append(f"{player_a.name}触发保命符，保住了一命！")
+                elif extra_a.get("defeat_survived"):
+                    session.combat_log.append(f"{player_a.name}被打成重伤，勉强保住了性命！")
                 elif extra_a.get("died"):
                     session.combat_log.append(f"{player_a.name}当场陨落！")
             if knocked_out_b:
-                extra_b = await self._apply_player_defeat(session.state_b, player_b)
+                extra_b = await self._apply_player_defeat(
+                    session.state_b, player_b, source=session.source
+                )
                 extras[session.player_b_id].update(extra_b)
                 if extra_b.get("death_prevented"):
                     session.combat_log.append(f"{player_b.name}触发保命符，保住了一命！")
+                elif extra_b.get("defeat_survived"):
+                    session.combat_log.append(f"{player_b.name}被打成重伤，勉强保住了性命！")
                 elif extra_b.get("died"):
                     session.combat_log.append(f"{player_b.name}当场陨落！")
 
@@ -845,7 +853,9 @@ class PvPManager:
                 requester.inventory.pop(item_id, None)
             await add_item(opponent, item_id, count)
 
-    async def _apply_player_defeat(self, state: CombatState, player: Player) -> dict:
+    async def _apply_player_defeat(
+        self, state: CombatState, player: Player, *, source: str = ""
+    ) -> dict:
         """处理玩家被打至 0 血后的结算。"""
         if player.inventory.get("life_talisman", 0) > 0:
             player.inventory["life_talisman"] -= 1
@@ -857,6 +867,15 @@ class PvPManager:
             return {
                 "died": False,
                 "death_prevented": True,
+            }
+
+        if source == "dungeon":
+            state.player_hp = 1
+            player.hp = 1
+            player.lingqi = max(0, min(state.player_max_lingqi, state.player_lingqi))
+            return {
+                "died": False,
+                "defeat_survived": True,
             }
 
         player.hp = 0
