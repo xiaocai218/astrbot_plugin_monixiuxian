@@ -41,7 +41,7 @@ async def use_item(player: Player, item_id: str, count: int = 1) -> dict:
     if item.item_type == "equipment":
         return {"success": False, "message": "装备请使用【装备】功能", "effect": None}
 
-    if item.item_type != "consumable":
+    if item.item_type not in ("consumable", "heart_method", "gongfa"):
         return {"success": False, "message": "该物品不可使用", "effect": None}
 
     # 突破丹特殊检查：突破率100%时无法使用（支持新旧丹药）
@@ -431,6 +431,32 @@ def get_inventory_display_sync(player: Player) -> list[dict]:
                 entry["duration"] = pill.duration
             if pill.side_effect_desc:
                 entry["side_effect_desc"] = pill.side_effect_desc
+        # 心法秘籍详情
+        hm_id = parse_heart_method_manual_id(item_id)
+        if not hm_id:
+            hm_id = parse_stored_heart_method_item_id(item_id)
+        if hm_id:
+            hm = HEART_METHOD_REGISTRY.get(hm_id)
+            if hm:
+                entry["heart_method_quality"] = hm.quality
+                entry["quality_name"] = HEART_METHOD_QUALITY_NAMES.get(hm.quality, "普通")
+                realm_name = REALM_CONFIG.get(hm.realm, {}).get("name", "未知境界")
+                entry["realm_name"] = realm_name
+                entry["attack_bonus"] = hm.attack_bonus
+                entry["defense_bonus"] = hm.defense_bonus
+                entry["exp_multiplier"] = hm.exp_multiplier
+                entry["dao_yun_rate"] = hm.dao_yun_rate
+        # 功法卷轴详情
+        gf_id = parse_gongfa_scroll_id(item_id)
+        if gf_id:
+            gf = GONGFA_REGISTRY.get(gf_id)
+            if gf:
+                entry["gongfa_tier"] = gf.tier
+                entry["tier_name"] = GONGFA_TIER_NAMES.get(gf.tier, "未知")
+                entry["attack_bonus"] = gf.attack_bonus
+                entry["defense_bonus"] = gf.defense_bonus
+                entry["hp_regen"] = gf.hp_regen
+                entry["lingqi_regen"] = gf.lingqi_regen
         result.append(entry)
     return result
 
@@ -455,14 +481,21 @@ def find_item_ids_by_name(name: str, query_type: str | None = None) -> list[str]
             return item_type == "equipment" or item_id in EQUIPMENT_REGISTRY
         if qtype == "heart_method":
             return (
-                parse_heart_method_manual_id(item_id) is not None
+                item_type == "heart_method"
+                or parse_heart_method_manual_id(item_id) is not None
                 or parse_stored_heart_method_item_id(item_id) is not None
+            )
+        if qtype == "gongfa":
+            return (
+                item_type == "gongfa"
+                or item_id.startswith("gongfa_scroll_")
             )
         if qtype == "item":
             return (
-                item_type != "equipment"
+                item_type not in ("equipment", "heart_method", "gongfa")
                 and parse_heart_method_manual_id(item_id) is None
                 and parse_stored_heart_method_item_id(item_id) is None
+                and not item_id.startswith("gongfa_scroll_")
             )
         return False
 

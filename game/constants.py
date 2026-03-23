@@ -161,7 +161,7 @@ class ItemDef:
     """物品定义。"""
     item_id: str
     name: str
-    item_type: str  # "consumable" | "material" | "equipment"
+    item_type: str  # "consumable" | "material" | "equipment" | "heart_method" | "gongfa"
     description: str
     effect: dict = field(default_factory=dict)
 
@@ -776,14 +776,14 @@ def _refresh_heart_method_manual_items():
         ITEM_REGISTRY[manual_id] = ItemDef(
             item_id=manual_id,
             name=f"{hm.name}秘籍",
-            item_type="consumable",
+            item_type="heart_method",
             description=f"可领悟{quality_name}心法【{hm.name}】（{realm_name}）",
             effect={"learn_heart_method": hm.method_id},
         )
         ITEM_REGISTRY[stored_manual_id] = ItemDef(
             item_id=stored_manual_id,
             name=f"{hm.name}秘籍（临时）",
-            item_type="consumable",
+            item_type="heart_method",
             description=f"保留的{quality_name}心法【{hm.name}】（{realm_name}），三日内有效，不可回收",
             effect={"learn_heart_method": hm.method_id},
         )
@@ -1156,7 +1156,7 @@ def _refresh_gongfa_scroll_items():
         ITEM_REGISTRY[scroll_id] = ItemDef(
             item_id=scroll_id,
             name=f"{gf.name}卷轴",
-            item_type="consumable",
+            item_type="gongfa",
             description=f"{tier_name}功法【{gf.name}】卷轴（{stat_str}）",
             effect={"learn_gongfa": gf.gongfa_id},
         )

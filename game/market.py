@@ -6,7 +6,7 @@ import time
 import uuid
 from typing import TYPE_CHECKING
 
-from .constants import ITEM_REGISTRY, EQUIPMENT_REGISTRY
+from .constants import ITEM_REGISTRY, EQUIPMENT_REGISTRY, parse_stored_heart_method_item_id
 
 if TYPE_CHECKING:
     from .data_manager import DataManager
@@ -73,6 +73,10 @@ async def list_item(
     dm: DataManager,
 ) -> dict:
     """上架物品到坊市。"""
+    # 临时心法道具绑定过期时间，禁止流转
+    if parse_stored_heart_method_item_id(item_id):
+        return {"success": False, "message": "临时心法道具不可上架"}
+
     # 校验物品存在
     item_def = ITEM_REGISTRY.get(item_id)
     equip_def = EQUIPMENT_REGISTRY.get(item_id)

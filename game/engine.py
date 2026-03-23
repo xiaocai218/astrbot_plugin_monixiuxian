@@ -18,7 +18,7 @@ from .constants import (
     GONGFA_REGISTRY, GONGFA_TIER_NAMES, MASTERY_MAX,
     get_heart_method_bonus, get_heart_method_manual_id, get_gongfa_scroll_id,
     get_stored_heart_method_item_id, parse_heart_method_manual_id,
-    parse_stored_heart_method_item_id,
+    parse_stored_heart_method_item_id, parse_gongfa_scroll_id,
     get_total_gongfa_bonus, can_cultivate_gongfa,
     get_realm_name, has_sub_realm, can_equip, get_realm_heart_methods,
     get_player_base_max_lingqi, get_player_base_stats, get_realm_base_stats, calc_gongfa_lingqi_cost,
@@ -1360,7 +1360,7 @@ class GameEngine:
         if len(matches) > 1:
             return {
                 "success": False,
-                "message": f"存在重名物品「{target_name}」，请使用：回收 装备/物品/心法 {target_name} [数量]",
+                "message": f"存在重名物品「{target_name}」，请使用：回收 装备/物品/心法/功法 {target_name} [数量]",
             }
         return await self.recycle_action(user_id, matches[0], count)
 
@@ -1536,7 +1536,7 @@ class GameEngine:
             return {"success": False, "message": f"你已在修炼【{new_hm.name}】"}
 
         item = ITEM_REGISTRY.get(source_item_id)
-        if not item or item.item_type != "consumable":
+        if not item or item.item_type not in ("consumable", "heart_method"):
             return {"success": False, "message": "心法秘籍不存在或已失效"}
         item_method_id = str(item.effect.get("learn_heart_method", ""))
         if item_method_id != new_method_id:
@@ -1718,6 +1718,24 @@ class GameEngine:
                         "description": hm.description,
                     })
                     continue
+            # 检查是否是功法卷轴
+            gf_id = parse_gongfa_scroll_id(item.item_id)
+            if gf_id:
+                gf = GONGFA_REGISTRY.get(gf_id)
+                if gf:
+                    if target_type and target_type != "gongfa":
+                        continue
+                    candidates.append({
+                        "type": "gongfa",
+                        "name": item.name,
+                        "tier_name": GONGFA_TIER_NAMES.get(gf.tier, "未知"),
+                        "attack_bonus": gf.attack_bonus,
+                        "defense_bonus": gf.defense_bonus,
+                        "hp_regen": gf.hp_regen,
+                        "lingqi_regen": gf.lingqi_regen,
+                        "description": item.description,
+                    })
+                    continue
             # 普通消耗品/材料
             if target_type and target_type != "item":
                 continue
@@ -1737,7 +1755,8 @@ class GameEngine:
         type_priority = {
             "equipment": 0,
             "heart_method": 1,
-            "item": 2,
+            "gongfa": 2,
+            "item": 3,
         }
         candidates.sort(key=lambda c: type_priority.get(str(c.get("type", "")), 9))
         return candidates[0]
@@ -2479,6 +2498,23 @@ class GameEngine:
                         "mastery_exp_max": hm.mastery_exp,
                         "bonus": bonus,
                         "description": hm.description or item_def.description,
+                    }
+            # 功法卷轴
+            gf_id = parse_gongfa_scroll_id(item_id)
+            if gf_id:
+                gf = GONGFA_REGISTRY.get(gf_id)
+                if gf:
+                    return {
+                        "kind": "gongfa",
+                        "gongfa_id": gf.gongfa_id,
+                        "name": item_def.name,
+                        "tier": gf.tier,
+                        "tier_name": GONGFA_TIER_NAMES.get(gf.tier, "未知"),
+                        "attack_bonus": gf.attack_bonus,
+                        "defense_bonus": gf.defense_bonus,
+                        "hp_regen": gf.hp_regen,
+                        "lingqi_regen": gf.lingqi_regen,
+                        "description": item_def.description,
                     }
             # 普通消耗品
             return {

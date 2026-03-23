@@ -575,6 +575,8 @@ _ITEM_TYPE_LABELS: dict[str, str] = {
     "consumable": "消耗品",
     "material": "材料",
     "equipment": "装备",
+    "heart_method": "心法",
+    "gongfa": "功法",
 }
 
 
@@ -654,6 +656,17 @@ def render_item_detail(data: dict) -> bytes:
             rows.append(("经验倍率", f"+{data['exp_multiplier'] * 100:.0f}%"))
         if data.get("dao_yun_rate", 0):
             rows.append(("道韵获取率", f"{data['dao_yun_rate'] * 100:.0f}%"))
+    elif item_type == "gongfa":
+        type_label = "功法卷轴"
+        rows.append(("品阶", data.get("tier_name", "未知")))
+        if data.get("attack_bonus", 0):
+            rows.append(("攻击加成", f"+{data['attack_bonus']}"))
+        if data.get("defense_bonus", 0):
+            rows.append(("防御加成", f"+{data['defense_bonus']}"))
+        if data.get("hp_regen", 0):
+            rows.append(("生命回复", f"+{data['hp_regen']}/次"))
+        if data.get("lingqi_regen", 0):
+            rows.append(("灵力回复", f"+{data['lingqi_regen']}/次"))
     else:
         type_label = _ITEM_TYPE_LABELS.get(data.get("item_type", ""), "物品")
         effect = data.get("effect", {})

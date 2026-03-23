@@ -644,17 +644,18 @@ class XiuxianPlugin(Star):
         query_type = query_type.strip()
         item_name = item_name.strip()
         if not query_type or not item_name:
-            yield event.plain_result(f"用法：{self._cmd('查看 装备 铁剑')} / {self._cmd('查看 心法 灭世雷诀秘籍')}")
+            yield event.plain_result(f"用法：{self._cmd('查看 装备 铁剑')} / {self._cmd('查看 心法 灭世雷诀秘籍')} / {self._cmd('查看 功法 基础剑法卷轴')}")
             return
 
         type_map = {
             "装备": "equipment",
             "物品": "item",
             "心法": "heart_method",
+            "功法": "gongfa",
         }
         target_type = type_map.get(query_type)
         if not target_type:
-            yield event.plain_result("类型仅支持：装备 / 物品 / 心法")
+            yield event.plain_result("类型仅支持：装备 / 物品 / 心法 / 功法")
             return
 
         detail = self._engine.get_item_detail(item_name, query_type=target_type)
@@ -687,6 +688,7 @@ class XiuxianPlugin(Star):
             "装备": "equipment",
             "物品": "item",
             "心法": "heart_method",
+            "功法": "gongfa",
         }
         tokens = args.split()
         if not tokens:
@@ -766,6 +768,7 @@ class XiuxianPlugin(Star):
             "装备": "equipment",
             "物品": "item",
             "心法": "heart_method",
+            "功法": "gongfa",
         }
         query_type = None
 

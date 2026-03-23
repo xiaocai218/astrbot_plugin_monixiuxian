@@ -605,8 +605,7 @@ async def warehouse_deposit(
     if not membership:
         return {"success": False, "message": "你尚未加入任何宗门"}
 
-    if membership["role"] == "leader":
-        return {"success": False, "message": "宗主无需上交物品"}
+    is_leader = membership["role"] == "leader"
 
     sect_id = membership["sect_id"]
 
@@ -616,9 +615,12 @@ async def warehouse_deposit(
         name = _get_item_display_name(item_id)
         return {"success": False, "message": f"你的「{name}」数量不足（拥有 {held}）"}
 
-    # 计算贡献点
-    points_per = await get_submit_points(sect_id, item_id, dm)
-    total_points = points_per * count
+    # 计算贡献点（宗主存放不获得贡献点）
+    if is_leader:
+        total_points = 0
+    else:
+        points_per = await get_submit_points(sect_id, item_id, dm)
+        total_points = points_per * count
 
     # 完整快照（覆盖 pre_commit 可能修改的所有字段）
     snapshot = copy.deepcopy(player.__dict__)
@@ -652,6 +654,15 @@ async def warehouse_deposit(
         return {"success": False, "message": "上交失败，请重试"}
 
     name = _get_item_display_name(item_id)
+    if is_leader:
+        return {
+            "success": True,
+            "message": f"成功存入「{name}」x{count}到宗门仓库",
+            "item_name": name,
+            "count": count,
+            "points_earned": 0,
+            "contribution": result["contribution"],
+        }
     return {
         "success": True,
         "message": f"成功上交「{name}」x{count}，获得 {total_points} 贡献点",
