@@ -339,6 +339,9 @@ class GameEngine:
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
 
+        if self.has_pending_death(user_id):
+            return {"success": False, "message": "你已道陨，请先确认重生后再挂机修炼"}
+
         try:
             max_minutes = int(self._checkin_config.get("afk_cultivate_max_minutes", 60))
         except (TypeError, ValueError):
@@ -373,6 +376,9 @@ class GameEngine:
         player = self._players.get(user_id)
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
+
+        if self.has_pending_death(user_id):
+            return {"success": False, "message": "你已道陨，请先确认重生后再结算挂机收益"}
 
         if player.afk_cultivate_end <= 0:
             return {"success": False, "message": "当前没有挂机修炼记录"}
@@ -1896,6 +1902,9 @@ class GameEngine:
         player.heart_method_mastery = 0
         player.heart_method_exp = 0
         player.heart_method_value = 0
+        # 陨落后清空挂机修炼记录
+        player.afk_cultivate_start = 0.0
+        player.afk_cultivate_end = 0.0
         # 陨落后重置历练冷却，允许重新出发
         player.last_adventure_time = 0.0
         player.weapon = "无"

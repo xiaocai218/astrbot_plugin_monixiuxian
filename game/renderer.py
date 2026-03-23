@@ -166,9 +166,9 @@ def render_panel(data: dict) -> bytes:
     equip_rows = [
         ("心法", _clip(data.get("heart_method_name", "无"), 14)),
         ("武器", _clip(data.get("weapon_name", "无"), 14)),
-        ("功法一", _clip(data.get("gongfa_1", "无"), 14)),
-        ("功法二", _clip(data.get("gongfa_2", "无"), 14)),
-        ("功法三", _clip(data.get("gongfa_3", "无"), 14)),
+        ("功法一", _clip((data.get("gongfa_1_info") or {}).get("name", "无"), 14)),
+        ("功法二", _clip((data.get("gongfa_2_info") or {}).get("name", "无"), 14)),
+        ("功法三", _clip((data.get("gongfa_3_info") or {}).get("name", "无"), 14)),
         ("护甲", _clip(data.get("armor_name", "无"), 14)),
     ]
     y = cfg_title_y + 30

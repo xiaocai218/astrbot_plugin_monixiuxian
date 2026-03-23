@@ -6,7 +6,7 @@
 
 | 项目 | 内容 |
 | --- | --- |
-| 当前版本 | `v0.7.1` |
+| 当前版本 | `v0.7.2` |
 | 插件标识 | `astrbot_plugin_xiuxian` |
 | 数据存储 | `SQLite`（`data/plugin_data/astrbot_plugin_xiuxian/xiuxian.db`） |
 | GitHub | [linjianyan0229/astrbot_plugin_monixiuxian](https://github.com/linjianyan0229/astrbot_plugin_monixiuxian) |
