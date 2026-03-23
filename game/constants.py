@@ -1,9 +1,13 @@
 """游戏常量：境界配置、物品注册表、装备注册表。"""
 
 import hashlib
+import threading
 from dataclasses import dataclass, field
 from datetime import date
 from enum import IntEnum
+
+# 保护注册表热更新（clear+update+refresh）的原子性
+_registry_lock = threading.Lock()
 
 
 class RealmLevel(IntEnum):
@@ -394,30 +398,47 @@ for _eq in (
 
 
 def _refresh_equipment_items():
-    """根据当前 EQUIPMENT_REGISTRY 同步刷新装备物品定义。"""
-    to_remove = [
-        item_id for item_id, item in ITEM_REGISTRY.items()
-        if getattr(item, "item_type", "") == "equipment"
-    ]
-    for item_id in to_remove:
-        ITEM_REGISTRY.pop(item_id, None)
+    """根据当前 EQUIPMENT_REGISTRY 同步刷新装备物品定义。
 
+    采用先增后删策略：先写入新条目，再删除过时条目，
+    避免出现字典中装备条目全部缺失的中间状态。
+    """
+    # 构建新条目
+    new_items = {}
     for eq in EQUIPMENT_REGISTRY.values():
-        ITEM_REGISTRY[eq.equip_id] = ItemDef(
+        new_items[eq.equip_id] = ItemDef(
             item_id=eq.equip_id,
             name=eq.name,
             item_type="equipment",
             description=eq.description,
             effect={"equip_id": eq.equip_id},
         )
+    # 先写入新条目（覆盖同名旧条目）
+    ITEM_REGISTRY.update(new_items)
+    # 再删除已不存在的旧装备条目
+    stale = [
+        item_id for item_id, item in ITEM_REGISTRY.items()
+        if getattr(item, "item_type", "") == "equipment" and item_id not in new_items
+    ]
+    for item_id in stale:
+        ITEM_REGISTRY.pop(item_id, None)
 
 
 def set_equipment_registry(equipments: dict[str, EquipmentDef]):
-    """替换装备注册表（供数据库加载后同步到运行时）。"""
-    # 原地更新，避免其他模块通过 from-import 持有旧 dict 引用。
-    EQUIPMENT_REGISTRY.clear()
-    EQUIPMENT_REGISTRY.update(dict(equipments))
-    _refresh_equipment_items()
+    """替换装备注册表（供数据库加载后同步到运行时）。
+
+    采用先增后删 + 写锁保护，避免读者看到空/半更新状态。
+    在 asyncio 单线程中同步代码不会被协程打断，锁主要防御多线程场景。
+    """
+    new_data = dict(equipments)
+    with _registry_lock:
+        # 先写入所有新条目（覆盖同名旧条目）
+        EQUIPMENT_REGISTRY.update(new_data)
+        # 再删除已不存在的旧条目
+        stale = [k for k in EQUIPMENT_REGISTRY if k not in new_data]
+        for k in stale:
+            del EQUIPMENT_REGISTRY[k]
+        _refresh_equipment_items()
 
 
 _refresh_equipment_items()
@@ -760,41 +781,54 @@ def parse_stored_heart_method_item_id(item_id: str) -> str | None:
 
 
 def _refresh_heart_method_manual_items():
-    """根据当前 HEART_METHOD_REGISTRY 重新生成心法秘籍定义。"""
-    to_remove = [
-        item_id for item_id in ITEM_REGISTRY
-        if item_id.startswith(HEART_METHOD_MANUAL_PREFIX) or item_id.startswith(STORED_HEART_METHOD_PREFIX)
-    ]
-    for item_id in to_remove:
-        ITEM_REGISTRY.pop(item_id, None)
+    """根据当前 HEART_METHOD_REGISTRY 重新生成心法秘籍定义。
 
+    采用先增后删策略，避免出现秘籍条目全部缺失的中间状态。
+    """
+    new_items = {}
     for hm in HEART_METHOD_REGISTRY.values():
         manual_id = get_heart_method_manual_id(hm.method_id)
         stored_manual_id = get_stored_heart_method_item_id(hm.method_id)
         realm_name = REALM_CONFIG.get(hm.realm, {}).get("name", "未知境界")
         quality_name = HEART_METHOD_QUALITY_NAMES.get(hm.quality, "普通")
-        ITEM_REGISTRY[manual_id] = ItemDef(
+        new_items[manual_id] = ItemDef(
             item_id=manual_id,
             name=f"{hm.name}秘籍",
             item_type="heart_method",
             description=f"可领悟{quality_name}心法【{hm.name}】（{realm_name}）",
             effect={"learn_heart_method": hm.method_id},
         )
-        ITEM_REGISTRY[stored_manual_id] = ItemDef(
+        new_items[stored_manual_id] = ItemDef(
             item_id=stored_manual_id,
             name=f"{hm.name}秘籍（临时）",
             item_type="heart_method",
             description=f"保留的{quality_name}心法【{hm.name}】（{realm_name}），三日内有效，不可回收",
             effect={"learn_heart_method": hm.method_id},
         )
+    # 先写入新条目
+    ITEM_REGISTRY.update(new_items)
+    # 再删除已不存在的旧心法秘籍条目
+    stale = [
+        item_id for item_id in ITEM_REGISTRY
+        if (item_id.startswith(HEART_METHOD_MANUAL_PREFIX) or item_id.startswith(STORED_HEART_METHOD_PREFIX))
+        and item_id not in new_items
+    ]
+    for item_id in stale:
+        ITEM_REGISTRY.pop(item_id, None)
 
 
 def set_heart_method_registry(methods: dict[str, HeartMethodDef]):
-    """替换心法注册表（供数据库加载后同步到运行时）。"""
-    # 原地更新，避免其他模块通过 from-import 持有旧 dict 引用。
-    HEART_METHOD_REGISTRY.clear()
-    HEART_METHOD_REGISTRY.update(dict(methods))
-    _refresh_heart_method_manual_items()
+    """替换心法注册表（供数据库加载后同步到运行时）。
+
+    采用先增后删 + 写锁保护，避免读者看到空/半更新状态。
+    """
+    new_data = dict(methods)
+    with _registry_lock:
+        HEART_METHOD_REGISTRY.update(new_data)
+        stale = [k for k in HEART_METHOD_REGISTRY if k not in new_data]
+        for k in stale:
+            del HEART_METHOD_REGISTRY[k]
+        _refresh_heart_method_manual_items()
 
 
 def get_heart_method_bonus(method_id: str, mastery: int) -> dict:
@@ -1135,11 +1169,11 @@ def parse_gongfa_scroll_id(item_id: str) -> str | None:
 
 
 def _refresh_gongfa_scroll_items():
-    """根据当前 GONGFA_REGISTRY 重新生成功法卷轴定义。"""
-    to_remove = [item_id for item_id in ITEM_REGISTRY if item_id.startswith(GONGFA_SCROLL_PREFIX)]
-    for item_id in to_remove:
-        ITEM_REGISTRY.pop(item_id, None)
+    """根据当前 GONGFA_REGISTRY 重新生成功法卷轴定义。
 
+    采用先增后删策略，避免出现卷轴条目全部缺失的中间状态。
+    """
+    new_items = {}
     for gf in GONGFA_REGISTRY.values():
         scroll_id = get_gongfa_scroll_id(gf.gongfa_id)
         tier_name = GONGFA_TIER_NAMES.get(gf.tier, "未知")
@@ -1153,20 +1187,36 @@ def _refresh_gongfa_scroll_items():
         if gf.lingqi_regen:
             parts.append(f"灵+{gf.lingqi_regen}")
         stat_str = "/".join(parts) if parts else "无加成"
-        ITEM_REGISTRY[scroll_id] = ItemDef(
+        new_items[scroll_id] = ItemDef(
             item_id=scroll_id,
             name=f"{gf.name}卷轴",
             item_type="gongfa",
             description=f"{tier_name}功法【{gf.name}】卷轴（{stat_str}）",
             effect={"learn_gongfa": gf.gongfa_id},
         )
+    # 先写入新条目
+    ITEM_REGISTRY.update(new_items)
+    # 再删除已不存在的旧功法卷轴条目
+    stale = [
+        item_id for item_id in ITEM_REGISTRY
+        if item_id.startswith(GONGFA_SCROLL_PREFIX) and item_id not in new_items
+    ]
+    for item_id in stale:
+        ITEM_REGISTRY.pop(item_id, None)
 
 
 def set_gongfa_registry(gongfas: dict[str, GongfaDef]):
-    """替换功法注册表（供数据库加载后同步到运行时）。"""
-    GONGFA_REGISTRY.clear()
-    GONGFA_REGISTRY.update(dict(gongfas))
-    _refresh_gongfa_scroll_items()
+    """替换功法注册表（供数据库加载后同步到运行时）。
+
+    采用先增后删 + 写锁保护，避免读者看到空/半更新状态。
+    """
+    new_data = dict(gongfas)
+    with _registry_lock:
+        GONGFA_REGISTRY.update(new_data)
+        stale = [k for k in GONGFA_REGISTRY if k not in new_data]
+        for k in stale:
+            del GONGFA_REGISTRY[k]
+        _refresh_gongfa_scroll_items()
 
 
 def can_learn_gongfa() -> bool:

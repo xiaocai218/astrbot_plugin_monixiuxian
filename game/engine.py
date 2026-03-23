@@ -135,6 +135,9 @@ class GameEngine:
         if normalized:
             await self._data_manager.save_all_players(self._players)
 
+        # 启动定时清理任务（过期Token/绑定 + 过期坊市商品）
+        self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+
     @staticmethod
     def _clamp_player_hp(player: Player) -> bool:
         """兜底确保玩家气血始终处于合法范围内。"""
@@ -340,30 +343,31 @@ class GameEngine:
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
 
-        if self.has_pending_death(user_id):
-            return {"success": False, "message": "你已道陨，请先确认重生后再挂机修炼"}
+        async with self._get_player_lock(user_id):
+            if self.has_pending_death(user_id):
+                return {"success": False, "message": "你已道陨，请先确认重生后再挂机修炼"}
 
-        try:
-            max_minutes = int(self._checkin_config.get("afk_cultivate_max_minutes", 60))
-        except (TypeError, ValueError):
-            max_minutes = 60
-        if max_minutes < 1:
-            max_minutes = 60
-        if minutes < 1 or minutes > max_minutes:
-            return {"success": False, "message": f"挂机时长须在1~{max_minutes}分钟之间"}
+            try:
+                max_minutes = int(self._checkin_config.get("afk_cultivate_max_minutes", 60))
+            except (TypeError, ValueError):
+                max_minutes = 60
+            if max_minutes < 1:
+                max_minutes = 60
+            if minutes < 1 or minutes > max_minutes:
+                return {"success": False, "message": f"挂机时长须在1~{max_minutes}分钟之间"}
 
-        now = time.time()
-        if player.afk_cultivate_end > 0:
-            if player.afk_cultivate_end > now:
-                remaining = int(player.afk_cultivate_end - now)
-                mins = remaining // 60
-                secs = remaining % 60
-                return {"success": False, "message": f"正在挂机修炼中，剩余{mins}分{secs}秒"}
-            return {"success": False, "message": "你有已完成的挂机修炼尚未结算，请先使用「结算」领取收益"}
+            now = time.time()
+            if player.afk_cultivate_end > 0:
+                if player.afk_cultivate_end > now:
+                    remaining = int(player.afk_cultivate_end - now)
+                    mins = remaining // 60
+                    secs = remaining % 60
+                    return {"success": False, "message": f"正在挂机修炼中，剩余{mins}分{secs}秒"}
+                return {"success": False, "message": "你有已完成的挂机修炼尚未结算，请先使用「结算」领取收益"}
 
-        player.afk_cultivate_start = now
-        player.afk_cultivate_end = now + minutes * 60
-        await self._save_player(player)
+            player.afk_cultivate_start = now
+            player.afk_cultivate_end = now + minutes * 60
+            await self._save_player(player)
 
         return {
             "success": True,
@@ -378,150 +382,153 @@ class GameEngine:
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
 
-        if self.has_pending_death(user_id):
-            return {"success": False, "message": "你已道陨，请先确认重生后再结算挂机收益"}
+        async with self._get_player_lock(user_id):
+            # 在锁内校验死亡状态，防止与 confirm_death 竞态
+            if self.has_pending_death(user_id):
+                return {"success": False, "message": "你已道陨，请先确认重生后再结算挂机收益"}
 
-        if player.afk_cultivate_end <= 0:
-            return {"success": False, "message": "当前没有挂机修炼记录"}
+            if player.afk_cultivate_end <= 0:
+                return {"success": False, "message": "当前没有挂机修炼记录"}
 
-        now = time.time()
-        if now < player.afk_cultivate_end:
-            remaining = int(player.afk_cultivate_end - now)
-            mins = remaining // 60
-            secs = remaining % 60
-            return {"success": False, "message": f"挂机修炼尚未完成，剩余{mins}分{secs}秒"}
+            now = time.time()
+            if now < player.afk_cultivate_end:
+                remaining = int(player.afk_cultivate_end - now)
+                mins = remaining // 60
+                secs = remaining % 60
+                return {"success": False, "message": f"挂机修炼尚未完成，剩余{mins}分{secs}秒"}
 
-        # 计算挂机时长（分钟）
-        duration_sec = player.afk_cultivate_end - player.afk_cultivate_start
-        duration_min = max(1, int(duration_sec / 60))
+            # 计算挂机时长（分钟）
+            duration_sec = player.afk_cultivate_end - player.afk_cultivate_start
+            duration_min = max(1, int(duration_sec / 60))
 
-        # 经验公式：取修炼单次经验的平均值 × 分钟数
-        normalized_realm = get_nearest_realm_level(player.realm)
-        if normalized_realm != player.realm:
-            player.realm = normalized_realm
-        if has_sub_realm(player.realm):
-            player.sub_realm = max(0, min(int(player.sub_realm), get_max_sub_realm(player.realm)))
-        else:
-            player.sub_realm = 0
-        realm_cfg = REALM_CONFIG.get(player.realm)
-        if not realm_cfg:
-            return {"success": False, "message": "当前境界配置无效，无法结算挂机修炼"}
-        base_min = 10 + player.realm * 5 + player.sub_realm * 2
-        base_max = 30 + player.realm * 10 + player.sub_realm * 4
-        if player.realm >= RealmLevel.GOLDEN_CORE:
-            base_min *= 10
-            base_max *= 10
-        avg_exp_per_min = (base_min + base_max) // 2
-        total_exp = avg_exp_per_min * duration_min
+            # 经验公式：取修炼单次经验的平均值 × 分钟数
+            normalized_realm = get_nearest_realm_level(player.realm)
+            if normalized_realm != player.realm:
+                player.realm = normalized_realm
+            if has_sub_realm(player.realm):
+                player.sub_realm = max(0, min(int(player.sub_realm), get_max_sub_realm(player.realm)))
+            else:
+                player.sub_realm = 0
+            realm_cfg = REALM_CONFIG.get(player.realm)
+            if not realm_cfg:
+                return {"success": False, "message": "当前境界配置无效，无法结算挂机修炼"}
+            base_min = 10 + player.realm * 5 + player.sub_realm * 2
+            base_max = 30 + player.realm * 10 + player.sub_realm * 4
+            if player.realm >= RealmLevel.GOLDEN_CORE:
+                base_min *= 10
+                base_max *= 10
+            avg_exp_per_min = (base_min + base_max) // 2
+            total_exp = avg_exp_per_min * duration_min
 
-        # 心法经验加成
-        from .constants import get_heart_method_bonus, HEART_METHOD_REGISTRY, MASTERY_MAX
-        hm_bonus = get_heart_method_bonus(player.heart_method, player.heart_method_mastery)
-        if hm_bonus["exp_multiplier"] > 0:
-            total_exp = int(total_exp * (1.0 + hm_bonus["exp_multiplier"]))
+            # 心法经验加成
+            from .constants import get_heart_method_bonus, HEART_METHOD_REGISTRY, MASTERY_MAX
+            hm_bonus = get_heart_method_bonus(player.heart_method, player.heart_method_mastery)
+            if hm_bonus["exp_multiplier"] > 0:
+                total_exp = int(total_exp * (1.0 + hm_bonus["exp_multiplier"]))
 
-        player.exp += total_exp
+            player.exp += total_exp
 
-        extra_msgs: list[str] = []
+            extra_msgs: list[str] = []
 
-        # 挂机期间心法经验（每分钟1点基础）
-        hm = HEART_METHOD_REGISTRY.get(player.heart_method)
-        if hm and player.heart_method_mastery < MASTERY_MAX:
-            hm_exp_gain = duration_min * (1 + hm.quality)
-            player.heart_method_exp += hm_exp_gain
-            while (player.heart_method_mastery < MASTERY_MAX
-                   and player.heart_method_exp >= hm.mastery_exp):
-                player.heart_method_exp -= hm.mastery_exp
-                player.heart_method_mastery += 1
-                from .constants import MASTERY_LEVELS
-                extra_msgs.append(
-                    f"心法【{hm.name}】修炼至{MASTERY_LEVELS[player.heart_method_mastery]}！"
-                )
-
-        # 挂机期间功法经验（每分钟1点/功法，境界不够则不涨）
-        for slot in ("gongfa_1", "gongfa_2", "gongfa_3"):
-            gongfa_id = getattr(player, slot, "无")
-            if not gongfa_id or gongfa_id == "无":
-                continue
-            gf = GONGFA_REGISTRY.get(gongfa_id)
-            if not gf:
-                continue
-            if not can_cultivate_gongfa(player.realm, gf.tier):
-                continue
-            mastery_attr = f"{slot}_mastery"
-            exp_attr = f"{slot}_exp"
-            mastery = getattr(player, mastery_attr, 0)
-            if mastery >= MASTERY_MAX:
-                continue
-            player_exp = getattr(player, exp_attr, 0) + duration_min
-            while player_exp >= gf.mastery_exp and mastery < MASTERY_MAX:
-                if gf.tier >= 2 and mastery == 2 and gf.dao_yun_cost > 0:
-                    if player.dao_yun < gf.dao_yun_cost:
-                        player_exp = gf.mastery_exp - 1
-                        break
-                    player.dao_yun -= gf.dao_yun_cost
-                    extra_msgs.append(f"消耗道韵{gf.dao_yun_cost}，助功法【{gf.name}】突破")
-                player_exp -= gf.mastery_exp
-                mastery += 1
-                if mastery <= MASTERY_MAX:
+            # 挂机期间心法经验（每分钟1点基础）
+            hm = HEART_METHOD_REGISTRY.get(player.heart_method)
+            if hm and player.heart_method_mastery < MASTERY_MAX:
+                hm_exp_gain = duration_min * (1 + hm.quality)
+                player.heart_method_exp += hm_exp_gain
+                while (player.heart_method_mastery < MASTERY_MAX
+                       and player.heart_method_exp >= hm.mastery_exp):
+                    player.heart_method_exp -= hm.mastery_exp
+                    player.heart_method_mastery += 1
                     from .constants import MASTERY_LEVELS
-                    extra_msgs.append(f"功法【{gf.name}】修炼至{MASTERY_LEVELS[mastery]}！")
-            setattr(player, mastery_attr, mastery)
-            setattr(player, exp_attr, max(0, int(player_exp)))
+                    extra_msgs.append(
+                        f"心法【{hm.name}】修炼至{MASTERY_LEVELS[player.heart_method_mastery]}！"
+                    )
 
-        # 挂机期间功法回血/回灵
-        gf_total = get_total_gongfa_bonus(player)
-        if gf_total["hp_regen"] > 0 and player.hp < player.max_hp:
-            heal = min(gf_total["hp_regen"] * duration_min, player.max_hp - player.hp)
-            player.hp += heal
-            extra_msgs.append(f"功法回血+{heal}")
-        if gf_total["lingqi_regen"] > 0:
-            regen = gf_total["lingqi_regen"] * duration_min
-            max_lq = get_player_base_max_lingqi(player)
-            actual = min(regen, max(0, max_lq - player.lingqi))
-            if actual > 0:
-                player.lingqi += actual
-                extra_msgs.append(f"功法回灵+{actual}")
+            # 挂机期间功法经验（每分钟1点/功法，境界不够则不涨）
+            for slot in ("gongfa_1", "gongfa_2", "gongfa_3"):
+                gongfa_id = getattr(player, slot, "无")
+                if not gongfa_id or gongfa_id == "无":
+                    continue
+                gf = GONGFA_REGISTRY.get(gongfa_id)
+                if not gf:
+                    continue
+                if not can_cultivate_gongfa(player.realm, gf.tier):
+                    extra_msgs.append(f"功法【{gf.name}】需更高境界方可继续修炼")
+                    continue
+                mastery_attr = f"{slot}_mastery"
+                exp_attr = f"{slot}_exp"
+                mastery = getattr(player, mastery_attr, 0)
+                if mastery >= MASTERY_MAX:
+                    continue
+                player_exp = getattr(player, exp_attr, 0) + duration_min
+                while player_exp >= gf.mastery_exp and mastery < MASTERY_MAX:
+                    if gf.tier >= 2 and mastery == 2 and gf.dao_yun_cost > 0:
+                        if player.dao_yun < gf.dao_yun_cost:
+                            player_exp = gf.mastery_exp - 1
+                            break
+                        player.dao_yun -= gf.dao_yun_cost
+                        extra_msgs.append(f"消耗道韵{gf.dao_yun_cost}，助功法【{gf.name}】突破")
+                    player_exp -= gf.mastery_exp
+                    mastery += 1
+                    if mastery <= MASTERY_MAX:
+                        from .constants import MASTERY_LEVELS
+                        extra_msgs.append(f"功法【{gf.name}】修炼至{MASTERY_LEVELS[mastery]}！")
+                setattr(player, mastery_attr, mastery)
+                setattr(player, exp_attr, max(0, int(player_exp)))
 
-        # 挂机期间道韵（仅化神期及以上心法生效）
-        if hm and hm.realm >= RealmLevel.DEITY_TRANSFORM and hm_bonus["dao_yun_rate"] > 0:
-            dao_gain = int(duration_min * hm_bonus["dao_yun_rate"] * 0.3)
-            if dao_gain > 0:
-                player.dao_yun += dao_gain
-                extra_msgs.append(f"感悟道韵+{dao_gain}")
+            # 挂机期间功法回血/回灵
+            gf_total = get_total_gongfa_bonus(player)
+            if gf_total["hp_regen"] > 0 and player.hp < player.max_hp:
+                heal = min(gf_total["hp_regen"] * duration_min, player.max_hp - player.hp)
+                player.hp += heal
+                extra_msgs.append(f"功法回血+{heal}")
+            if gf_total["lingqi_regen"] > 0:
+                regen = gf_total["lingqi_regen"] * duration_min
+                max_lq = get_player_base_max_lingqi(player)
+                actual = min(regen, max(0, max_lq - player.lingqi))
+                if actual > 0:
+                    player.lingqi += actual
+                    extra_msgs.append(f"功法回灵+{actual}")
 
-        # 处理小境界自动升级
-        sub_level_ups = 0
-        if has_sub_realm(player.realm):
-            sub_exp = realm_cfg.get("sub_exp_to_next", 0)
-            max_sr = get_max_sub_realm(player.realm)
-            while (sub_exp > 0
-                   and player.sub_realm < max_sr
-                   and player.exp >= sub_exp):
-                # 高阶境界小境界升级需要道韵
-                dao_cost = get_sub_realm_dao_yun_cost(player.realm, player.sub_realm)
-                if dao_cost > 0 and player.dao_yun < dao_cost:
-                    break
-                if dao_cost > 0:
-                    player.dao_yun -= dao_cost
-                    extra_msgs.append(f"消耗道韵{dao_cost}")
-                player.exp -= sub_exp
-                player.sub_realm += 1
-                sub_level_ups += 1
-                hp_bonus = int(realm_cfg["base_hp"] * 0.08)
-                atk_bonus = int(realm_cfg["base_attack"] * 0.06)
-                def_bonus = int(realm_cfg["base_defense"] * 0.06)
-                lingqi_bonus = max(1, int(realm_cfg.get("base_lingqi", 0) * 0.08))
-                player.max_hp += hp_bonus
-                player.hp = player.max_hp
-                player.attack += atk_bonus
-                player.defense += def_bonus
-                player.lingqi += lingqi_bonus
+            # 挂机期间道韵（仅化神期及以上心法生效）
+            if hm and hm.realm >= RealmLevel.DEITY_TRANSFORM and hm_bonus["dao_yun_rate"] > 0:
+                dao_gain = int(duration_min * hm_bonus["dao_yun_rate"] * 0.3)
+                if dao_gain > 0:
+                    player.dao_yun += dao_gain
+                    extra_msgs.append(f"感悟道韵+{dao_gain}")
 
-        # 重置挂机状态
-        player.afk_cultivate_start = 0.0
-        player.afk_cultivate_end = 0.0
-        await self._save_player(player)
+            # 处理小境界自动升级
+            sub_level_ups = 0
+            if has_sub_realm(player.realm):
+                sub_exp = realm_cfg.get("sub_exp_to_next", 0)
+                max_sr = get_max_sub_realm(player.realm)
+                while (sub_exp > 0
+                       and player.sub_realm < max_sr
+                       and player.exp >= sub_exp):
+                    # 高阶境界小境界升级需要道韵
+                    dao_cost = get_sub_realm_dao_yun_cost(player.realm, player.sub_realm)
+                    if dao_cost > 0 and player.dao_yun < dao_cost:
+                        break
+                    if dao_cost > 0:
+                        player.dao_yun -= dao_cost
+                        extra_msgs.append(f"消耗道韵{dao_cost}")
+                    player.exp -= sub_exp
+                    player.sub_realm += 1
+                    sub_level_ups += 1
+                    hp_bonus = int(realm_cfg["base_hp"] * 0.08)
+                    atk_bonus = int(realm_cfg["base_attack"] * 0.06)
+                    def_bonus = int(realm_cfg["base_defense"] * 0.06)
+                    lingqi_bonus = max(1, int(realm_cfg.get("base_lingqi", 0) * 0.08))
+                    player.max_hp += hp_bonus
+                    player.hp = player.max_hp
+                    player.attack += atk_bonus
+                    player.defense += def_bonus
+                    player.lingqi += lingqi_bonus
+
+            # 重置挂机状态
+            player.afk_cultivate_start = 0.0
+            player.afk_cultivate_end = 0.0
+            await self._save_player(player)
 
         realm_name = get_realm_name(player.realm, player.sub_realm)
         msg = f"挂机修炼{duration_min}分钟完成！获得{total_exp}修为"
@@ -545,21 +552,22 @@ class GameEngine:
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
 
-        if player.afk_cultivate_end <= 0:
-            return {"success": False, "message": "当前没有挂机修炼记录"}
+        async with self._get_player_lock(user_id):
+            if player.afk_cultivate_end <= 0:
+                return {"success": False, "message": "当前没有挂机修炼记录"}
 
-        now = time.time()
-        if now < player.afk_cultivate_end:
-            remaining = int(player.afk_cultivate_end - now)
-            mins = remaining // 60
-            secs = remaining % 60
-            msg = f"已取消挂机修炼（原剩余{mins}分{secs}秒），本次挂机收益已放弃"
-        else:
-            msg = "已取消未结算的挂机修炼，本次挂机收益已放弃"
+            now = time.time()
+            if now < player.afk_cultivate_end:
+                remaining = int(player.afk_cultivate_end - now)
+                mins = remaining // 60
+                secs = remaining % 60
+                msg = f"已取消挂机修炼（原剩余{mins}分{secs}秒），本次挂机收益已放弃"
+            else:
+                msg = "已取消未结算的挂机修炼，本次挂机收益已放弃"
 
-        player.afk_cultivate_start = 0.0
-        player.afk_cultivate_end = 0.0
-        await self._save_player(player)
+            player.afk_cultivate_start = 0.0
+            player.afk_cultivate_end = 0.0
+            await self._save_player(player)
         return {"success": True, "message": msg}
 
     async def adventure(self, user_id: str) -> dict:
@@ -1888,6 +1896,20 @@ class GameEngine:
         if cleaned_count > 0:
             await self._notify_market_changed("cleanup", cleaned_count)
 
+    async def _periodic_cleanup(self):
+        """每5分钟清理过期数据（Token/绑定 + 坊市过期商品）。"""
+        while True:
+            await asyncio.sleep(300)
+            try:
+                if self.auth:
+                    await self.auth.save()
+            except Exception:
+                logger.exception("修仙世界：定时清理认证数据异常")
+            try:
+                await self._process_market_cleanup()
+            except Exception:
+                logger.exception("修仙世界：定时清理坊市过期商品异常")
+
     def _auto_unequip_invalid_equipment(self, player: Player) -> list[str]:
         """自动卸下当前境界无法装备的物品并放回背包。"""
         removed: list[str] = []
@@ -1989,167 +2011,181 @@ class GameEngine:
         if not player:
             return []
 
-        items: list[dict] = []
-        snapshot_index = 0
+        async with self._get_player_lock(user_id):
+            # 已有快照则直接返回，禁止覆盖（防止选择性保留漏洞）
+            existing = self._pending_deaths.get(user_id)
+            if existing:
+                return existing["items"]
 
-        def make_snapshot_item(item_id: str, item_type: str, **extra) -> dict:
-            nonlocal snapshot_index
-            snapshot_index += 1
-            return {
-                "id": f"death:{snapshot_index}:{item_type}:{item_id}",
-                "item_id": item_id,
-                "type": item_type,
-                **extra,
-            }
+            items: list[dict] = []
+            snapshot_index = 0
 
-        # 已装备的心法
-        if player.heart_method and player.heart_method != "无":
-            hm = HEART_METHOD_REGISTRY.get(player.heart_method)
-            if hm:
-                items.append(make_snapshot_item(
-                    player.heart_method,
-                    "heart_method",
-                    name=hm.name,
-                    count=1,
-                    description=hm.description,
-                    quality_name=HEART_METHOD_QUALITY_NAMES.get(hm.quality, "普通"),
-                ))
+            def make_snapshot_item(item_id: str, item_type: str, **extra) -> dict:
+                nonlocal snapshot_index
+                snapshot_index += 1
+                return {
+                    "id": f"death:{snapshot_index}:{item_type}:{item_id}",
+                    "item_id": item_id,
+                    "type": item_type,
+                    **extra,
+                }
 
-        # 已装备的武器
-        if player.weapon and player.weapon != "无":
-            eq = EQUIPMENT_REGISTRY.get(player.weapon)
-            if eq:
-                items.append(make_snapshot_item(
-                    player.weapon,
-                    "weapon",
-                    name=eq.name,
-                    count=1,
-                    description=eq.description,
-                    tier_name=EQUIPMENT_TIER_NAMES.get(eq.tier, "未知"),
-                    slot=eq.slot,
-                ))
-
-        # 已装备的护甲
-        if player.armor and player.armor != "无":
-            eq = EQUIPMENT_REGISTRY.get(player.armor)
-            if eq:
-                items.append(make_snapshot_item(
-                    player.armor,
-                    "armor",
-                    name=eq.name,
-                    count=1,
-                    description=eq.description,
-                    tier_name=EQUIPMENT_TIER_NAMES.get(eq.tier, "未知"),
-                    slot=eq.slot,
-                ))
-
-        # 已装备的功法
-        for gf_slot in ("gongfa_1", "gongfa_2", "gongfa_3"):
-            gongfa_id = getattr(player, gf_slot, "无")
-            if gongfa_id and gongfa_id != "无":
-                gf = GONGFA_REGISTRY.get(gongfa_id)
-                if gf:
+            # 已装备的心法
+            if player.heart_method and player.heart_method != "无":
+                hm = HEART_METHOD_REGISTRY.get(player.heart_method)
+                if hm:
                     items.append(make_snapshot_item(
-                        gongfa_id,
-                        "gongfa",
-                        name=gf.name,
+                        player.heart_method,
+                        "heart_method",
+                        name=hm.name,
                         count=1,
-                        description=gf.description,
-                        tier_name=GONGFA_TIER_NAMES.get(gf.tier, "未知"),
-                        gongfa_slot=gf_slot,
+                        description=hm.description,
+                        quality_name=HEART_METHOD_QUALITY_NAMES.get(hm.quality, "普通"),
                     ))
 
-        # 背包物品
-        for item_id, count in player.inventory.items():
-            item_def = ITEM_REGISTRY.get(item_id)
-            if not item_def:
-                continue
-            entry = make_snapshot_item(
-                item_id,
-                "item",
-                name=item_def.name,
-                count=count,
-                description=item_def.description,
-            )
-            eq = EQUIPMENT_REGISTRY.get(item_id)
-            if eq:
-                entry["tier_name"] = EQUIPMENT_TIER_NAMES.get(eq.tier, "未知")
-                entry["slot"] = eq.slot
-            items.append(entry)
+            # 已装备的武器
+            if player.weapon and player.weapon != "无":
+                eq = EQUIPMENT_REGISTRY.get(player.weapon)
+                if eq:
+                    items.append(make_snapshot_item(
+                        player.weapon,
+                        "weapon",
+                        name=eq.name,
+                        count=1,
+                        description=eq.description,
+                        tier_name=EQUIPMENT_TIER_NAMES.get(eq.tier, "未知"),
+                        slot=eq.slot,
+                    ))
 
-        self._pending_deaths[user_id] = {"items": items}
-        return items
+            # 已装备的护甲
+            if player.armor and player.armor != "无":
+                eq = EQUIPMENT_REGISTRY.get(player.armor)
+                if eq:
+                    items.append(make_snapshot_item(
+                        player.armor,
+                        "armor",
+                        name=eq.name,
+                        count=1,
+                        description=eq.description,
+                        tier_name=EQUIPMENT_TIER_NAMES.get(eq.tier, "未知"),
+                        slot=eq.slot,
+                    ))
+
+            # 已装备的功法
+            for gf_slot in ("gongfa_1", "gongfa_2", "gongfa_3"):
+                gongfa_id = getattr(player, gf_slot, "无")
+                if gongfa_id and gongfa_id != "无":
+                    gf = GONGFA_REGISTRY.get(gongfa_id)
+                    if gf:
+                        items.append(make_snapshot_item(
+                            gongfa_id,
+                            "gongfa",
+                            name=gf.name,
+                            count=1,
+                            description=gf.description,
+                            tier_name=GONGFA_TIER_NAMES.get(gf.tier, "未知"),
+                            gongfa_slot=gf_slot,
+                        ))
+
+            # 背包物品
+            for item_id, count in player.inventory.items():
+                item_def = ITEM_REGISTRY.get(item_id)
+                if not item_def:
+                    continue
+                entry = make_snapshot_item(
+                    item_id,
+                    "item",
+                    name=item_def.name,
+                    count=count,
+                    description=item_def.description,
+                )
+                eq = EQUIPMENT_REGISTRY.get(item_id)
+                if eq:
+                    entry["tier_name"] = EQUIPMENT_TIER_NAMES.get(eq.tier, "未知")
+                    entry["slot"] = eq.slot
+                items.append(entry)
+
+            self._pending_deaths[user_id] = {"items": items}
+            return items
 
     async def confirm_death(self, user_id: str, kept_ids: list[str]) -> dict:
         """校验 kept_ids ≤ 3，执行死亡重置后把保留的物品/装备/心法还给玩家。"""
-        snapshot = self._pending_deaths.pop(user_id, None)
-        if not snapshot:
-            return {"success": False, "message": "没有待确认的死亡记录"}
+        async with self._get_player_lock(user_id):
+            snapshot = self._pending_deaths.pop(user_id, None)
+            if not snapshot:
+                return {"success": False, "message": "没有待确认的死亡记录"}
 
-        player = self._players.get(user_id)
-        if not player:
-            return {"success": False, "message": "角色不存在"}
+            player = self._players.get(user_id)
+            if not player:
+                return {"success": False, "message": "角色不存在"}
 
-        if len(kept_ids) > 3:
-            self._pending_deaths[user_id] = snapshot  # 放回
-            return {"success": False, "message": "最多只能保留3样物品"}
+            if len(kept_ids) > 3:
+                self._pending_deaths[user_id] = snapshot  # 放回
+                return {"success": False, "message": "最多只能保留3样物品"}
 
-        # 从快照中找到要保留的物品
-        snapshot_items = snapshot["items"]
-        snapshot_map = {item["id"]: item for item in snapshot_items}
-        invalid_ids = [snapshot_id for snapshot_id in kept_ids if snapshot_id not in snapshot_map]
-        if invalid_ids:
-            self._pending_deaths[user_id] = snapshot
-            return {"success": False, "message": "存在无效的保留物品，请重新选择"}
+            # 从快照中找到要保留的物品
+            snapshot_items = snapshot["items"]
+            snapshot_map = {item["id"]: item for item in snapshot_items}
+            invalid_ids = [snapshot_id for snapshot_id in kept_ids if snapshot_id not in snapshot_map]
+            if invalid_ids:
+                self._pending_deaths[user_id] = snapshot
+                return {"success": False, "message": "存在无效的保留物品，请重新选择"}
 
-        kept_items: list[dict] = []
-        seen_ids: set[str] = set()
-        for snapshot_id in kept_ids:
-            if snapshot_id in seen_ids:
-                continue
-            seen_ids.add(snapshot_id)
-            kept_items.append(snapshot_map[snapshot_id])
+            kept_items: list[dict] = []
+            seen_ids: set[str] = set()
+            for snapshot_id in kept_ids:
+                if snapshot_id in seen_ids:
+                    continue
+                seen_ids.add(snapshot_id)
+                kept_items.append(snapshot_map[snapshot_id])
 
-        # 执行原有死亡重置
-        await self._handle_player_death(user_id, player)
+            # 执行原有死亡重置
+            await self._handle_player_death(user_id, player)
 
-        # 把保留的物品还给玩家
-        for ki in kept_items:
-            item_id = ki.get("item_id", ki["id"])
-            ktype = ki["type"]
-            if ktype == "heart_method":
-                hm = HEART_METHOD_REGISTRY.get(item_id)
-                if hm:
-                    player.heart_method = item_id
-                    player.heart_method_mastery = 0
-                    player.heart_method_exp = 0
-                    player.heart_method_value = 0
-            elif ktype == "gongfa":
-                # 恢复功法到原槽位（若槽位已被占用则找第一个空槽）
-                target_slot = str(ki.get("gongfa_slot", "")).strip() or "gongfa_1"
-                if target_slot not in {"gongfa_1", "gongfa_2", "gongfa_3"}:
-                    target_slot = "gongfa_1"
-                if getattr(player, target_slot, "无") != "无":
-                    for s in ("gongfa_1", "gongfa_2", "gongfa_3"):
-                        if getattr(player, s, "无") == "无":
-                            target_slot = s
-                            break
-                if getattr(player, target_slot, "无") == "无" and item_id in GONGFA_REGISTRY:
-                    setattr(player, target_slot, item_id)
-                    setattr(player, f"{target_slot}_mastery", 0)
-                    setattr(player, f"{target_slot}_exp", 0)
-            elif ktype in ("weapon", "armor"):
-                # 装备放入背包（死亡后境界归零，可能无法穿戴）
-                player.inventory[item_id] = player.inventory.get(item_id, 0) + 1
-            else:
-                player.inventory[item_id] = player.inventory.get(item_id, 0) + ki.get("count", 1)
+            # 把保留的物品还给玩家
+            for ki in kept_items:
+                item_id = ki.get("item_id", ki["id"])
+                ktype = ki["type"]
+                if ktype == "heart_method":
+                    hm = HEART_METHOD_REGISTRY.get(item_id)
+                    if hm:
+                        player.heart_method = item_id
+                        player.heart_method_mastery = 0
+                        player.heart_method_exp = 0
+                        player.heart_method_value = 0
+                elif ktype == "gongfa":
+                    # 恢复功法到原槽位（若槽位已被占用则找第一个空槽）
+                    target_slot = str(ki.get("gongfa_slot", "")).strip() or "gongfa_1"
+                    if target_slot not in {"gongfa_1", "gongfa_2", "gongfa_3"}:
+                        target_slot = "gongfa_1"
+                    if getattr(player, target_slot, "无") != "无":
+                        for s in ("gongfa_1", "gongfa_2", "gongfa_3"):
+                            if getattr(player, s, "无") == "无":
+                                target_slot = s
+                                break
+                    if getattr(player, target_slot, "无") == "无" and item_id in GONGFA_REGISTRY:
+                        setattr(player, target_slot, item_id)
+                        setattr(player, f"{target_slot}_mastery", 0)
+                        setattr(player, f"{target_slot}_exp", 0)
+                elif ktype in ("weapon", "armor"):
+                    # 装备放入背包（死亡后境界归零，可能无法穿戴）
+                    player.inventory[item_id] = player.inventory.get(item_id, 0) + 1
+                else:
+                    player.inventory[item_id] = player.inventory.get(item_id, 0) + ki.get("count", 1)
 
-        await self._save_player(player)
-        await self._notify_player_update(player)
-        return {"success": True, "message": "携宝重生成功"}
+            await self._save_player(player)
+            await self._notify_player_update(player)
+            return {"success": True, "message": "携宝重生成功"}
 
     async def shutdown(self):
         """关闭时保存所有数据并关闭数据库。"""
+        # 取消定时清理任务
+        if hasattr(self, "_cleanup_task"):
+            self._cleanup_task.cancel()
+            try:
+                await self._cleanup_task
+            except asyncio.CancelledError:
+                pass
         if self._ws_manager and hasattr(self._ws_manager, "stop_chat_cleanup_task"):
             await self._ws_manager.stop_chat_cleanup_task()
         for player in self._players.values():
@@ -2196,6 +2232,9 @@ class GameEngine:
 
     def _local_name_risk_check(self, name: str) -> tuple[bool, str]:
         """本地敏感词兜底检测。"""
+        # 基础字符校验：只允许中文、英文、数字、部分符号，长度1-12
+        if not re.match(r'^[\u4e00-\u9fa5a-zA-Z0-9_·\-]{1,12}$', name or ""):
+            return False, "道号仅允许中文、英文、数字，长度1-12"
         normalized = re.sub(r"[\s·•・_\-]", "", str(name or "")).lower()
         for kw in _BAD_NAME_KEYWORDS:
             if kw and kw in normalized:
@@ -2293,6 +2332,22 @@ class GameEngine:
         if not player:
             return {"success": False, "message": "玩家不存在"}
         name = player.name
+
+        # 清理宗门成员记录
+        try:
+            sect_info = await self._data_manager.load_player_sect(user_id)
+            if sect_info:
+                sect_id = sect_info["sect_id"]
+                await self._data_manager.delete_sect_member(user_id)
+                # 若是宗主且无其他成员，解散宗门
+                if sect_info.get("role") == "leader":
+                    members = await self._data_manager.load_sect_members(sect_id)
+                    remaining = [m for m in members if m.get("user_id") != user_id]
+                    if not remaining:
+                        await self._data_manager.delete_sect(sect_id)
+        except Exception:
+            logger.exception("修仙世界：删除玩家时清理宗门数据异常 user_id=%s", user_id)
+
         if self.auth:
             await self.auth.revoke_user(user_id)
         if self._ws_manager and hasattr(self._ws_manager, "disconnect"):

@@ -25,12 +25,29 @@ class AccessGuard:
 
     @staticmethod
     def normalize_ip(raw: str) -> str:
-        """将字符串规范化为 IP，失败返回空串。"""
+        """将字符串规范化为 IP，失败返回空串。
+
+        对于逗号分隔的多个 IP（如 X-Forwarded-For），
+        取最右侧的 IP（最近一跳代理添加的，最不易被伪造）。
+        """
         value = str(raw or "").strip().strip("\"'")
         if not value:
             return ""
         if "," in value:
-            value = value.split(",", 1)[0].strip()
+            # 取最右侧 IP（最近一跳代理添加的）
+            parts = [p.strip() for p in value.split(",")]
+            for candidate in reversed(parts):
+                candidate = candidate.strip().strip("\"'")
+                if candidate.lower().startswith("for="):
+                    candidate = candidate[4:].strip().strip("\"'")
+                if candidate.startswith("[") and "]" in candidate:
+                    candidate = candidate[1:candidate.index("]")]
+                try:
+                    ipaddress.ip_address(candidate)
+                    return candidate[:64]
+                except ValueError:
+                    continue
+            return ""
         if value.lower().startswith("for="):
             value = value[4:].strip().strip("\"'")
         if value.startswith("[") and "]" in value:

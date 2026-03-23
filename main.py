@@ -47,14 +47,14 @@ class XiuxianPlugin(Star):
                     if hasattr(source, "get"):
                         return source.get(key)
                     return source[key]
-            except Exception:
+            except (KeyError, TypeError, IndexError, AttributeError):
                 pass
             try:
                 if hasattr(source, "get"):
                     value = source.get(key, _MISSING)
                     if value is not _MISSING:
                         return value
-            except Exception:
+            except (KeyError, TypeError, AttributeError):
                 continue
         return default
 
@@ -127,8 +127,8 @@ class XiuxianPlugin(Star):
                             os.remove(p)
                         except OSError:
                             pass
-            except Exception:
-                pass
+            except OSError:
+                logger.debug("修仙世界：缓存清理失败")
 
             return file_path
         except Exception:
@@ -253,7 +253,7 @@ class XiuxianPlugin(Star):
                 allow = bool(obj.get("allow", obj.get("ok", False)))
                 reason = str(obj.get("reason", "")).strip()
                 return {"allow": allow, "reason": reason}
-        except Exception:
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             pass
 
         # JSON 解析失败时做文本兜底（宽松策略：仅明确违规才拒绝）
@@ -338,7 +338,7 @@ class XiuxianPlugin(Star):
                 allow = bool(obj.get("allow", obj.get("ok", False)))
                 reason = str(obj.get("reason", "")).strip()
                 return {"allow": allow, "reason": reason}
-        except Exception:
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             pass
 
         text = raw.lower()
@@ -408,7 +408,7 @@ class XiuxianPlugin(Star):
                 allow = bool(obj.get("allow", obj.get("ok", False)))
                 reason = str(obj.get("reason", "")).strip()
                 return {"allow": allow, "reason": reason}
-        except Exception:
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
             pass
 
         text = raw.lower()
@@ -902,8 +902,7 @@ class XiuxianPlugin(Star):
             yield event.plain_result("你当前没有绑定角色")
             return
 
-        self._engine.auth.unbind_chat(chat_user_id)
-        await self._engine.auth.save()
+        await self._engine.auth.unbind_chat(chat_user_id)
         yield event.plain_result("已解除角色绑定")
 
     @xiuxian_group.command("排行")

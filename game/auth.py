@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -42,6 +43,8 @@ class AuthManager:
         self._chat_bindings: dict[str, dict] = {}
         # 上次绑定失败的错误信息
         self.last_bind_error: str = ""
+        # 串行化所有认证状态写入，防止并发修改+save()互相踩踏
+        self._auth_lock = asyncio.Lock()
 
     async def initialize(self):
         """建表并加载数据到内存缓存。"""
@@ -133,8 +136,8 @@ class AuthManager:
             async for row in cur:
                 self._chat_bindings[row[0]] = {"user_id": row[1], "expires_at": row[2]}
 
-    async def save(self):
-        """将内存缓存同步到数据库。"""
+    async def _save_unlocked(self):
+        """将内存缓存同步到数据库（调用方需已持有 _auth_lock）。"""
         self._cleanup_expired()
         # web_tokens
         await self._db.execute("DELETE FROM web_tokens")
@@ -159,6 +162,11 @@ class AuthManager:
             )
         await self._db.commit()
 
+    async def save(self):
+        """将内存缓存同步到数据库。"""
+        async with self._auth_lock:
+            await self._save_unlocked()
+
     # ==================== 密码 ====================
 
     @staticmethod
@@ -173,18 +181,19 @@ class AuthManager:
 
     async def create_web_token(self, user_id: str) -> str:
         """为玩家生成 Web 登录 Token（7天有效）。"""
-        # 清除该玩家旧 token
-        self._web_tokens = {
-            k: v for k, v in self._web_tokens.items()
-            if v["user_id"] != user_id
-        }
-        token = secrets.token_urlsafe(32)
-        self._web_tokens[token] = {
-            "user_id": user_id,
-            "expires_at": time.time() + TOKEN_EXPIRY,
-        }
-        await self.save()
-        return token
+        async with self._auth_lock:
+            # 清除该玩家旧 token
+            self._web_tokens = {
+                k: v for k, v in self._web_tokens.items()
+                if v["user_id"] != user_id
+            }
+            token = secrets.token_urlsafe(32)
+            self._web_tokens[token] = {
+                "user_id": user_id,
+                "expires_at": time.time() + TOKEN_EXPIRY,
+            }
+            await self._save_unlocked()
+            return token
 
     def verify_web_token(self, token: str) -> Optional[str]:
         """验证 Web Token，返回 user_id 或 None。"""
@@ -192,7 +201,6 @@ class AuthManager:
         if not info:
             return None
         if time.time() > info["expires_at"]:
-            del self._web_tokens[token]
             return None
         return info["user_id"]
 
@@ -200,52 +208,55 @@ class AuthManager:
 
     async def create_bind_key(self, user_id: str) -> str:
         """为玩家生成6位数绑定密钥（7天有效）。"""
-        # 清除该玩家旧密钥
-        self._bind_keys = {
-            k: v for k, v in self._bind_keys.items()
-            if v["user_id"] != user_id
-        }
-        # 生成不重复的6位数
-        while True:
-            key = str(secrets.randbelow(900000) + 100000)
-            if key not in self._bind_keys:
-                break
-        self._bind_keys[key] = {
-            "user_id": user_id,
-            "expires_at": time.time() + TOKEN_EXPIRY,
-        }
-        await self.save()
-        return key
+        async with self._auth_lock:
+            # 清除该玩家旧密钥
+            self._bind_keys = {
+                k: v for k, v in self._bind_keys.items()
+                if v["user_id"] != user_id
+            }
+            # 生成不重复的6位数
+            while True:
+                key = str(secrets.randbelow(900000) + 100000)
+                if key not in self._bind_keys:
+                    break
+            self._bind_keys[key] = {
+                "user_id": user_id,
+                "expires_at": time.time() + TOKEN_EXPIRY,
+            }
+            await self._save_unlocked()
+            return key
 
     async def verify_bind_key(self, key: str, chat_user_id: str) -> Optional[str]:
         """验证绑定密钥，成功则创建聊天绑定，返回 user_id。"""
-        self.last_bind_error = ""
-        info = self._bind_keys.get(key)
-        if not info:
-            self.last_bind_error = "密钥无效或已过期"
-            return None
-        if time.time() > info["expires_at"]:
+        async with self._auth_lock:
+            self.last_bind_error = ""
+            info = self._bind_keys.get(key)
+            if not info:
+                self.last_bind_error = "密钥无效或已过期"
+                return None
+            if time.time() > info["expires_at"]:
+                del self._bind_keys[key]
+                self.last_bind_error = "密钥无效或已过期"
+                await self._save_unlocked()
+                return None
+            user_id = info["user_id"]
+            # 消耗密钥
             del self._bind_keys[key]
-            self.last_bind_error = "密钥无效或已过期"
-            return None
-        user_id = info["user_id"]
-        # 消耗密钥
-        del self._bind_keys[key]
-        # 检查该角色是否已被其他QQ绑定
-        now = time.time()
-        for cid, binding in self._chat_bindings.items():
-            if binding["user_id"] == user_id and cid != chat_user_id:
-                if now <= binding["expires_at"]:
-                    self.last_bind_error = "该角色已绑定其他QQ，不可重复绑定"
-                    await self.save()
-                    return None
-        # 创建聊天绑定
-        self._chat_bindings[chat_user_id] = {
-            "user_id": user_id,
-            "expires_at": time.time() + TOKEN_EXPIRY,
-        }
-        await self.save()
-        return user_id
+            # 检查该角色是否已被其他QQ绑定
+            now = time.time()
+            for cid, binding in self._chat_bindings.items():
+                if binding["user_id"] == user_id and cid != chat_user_id:
+                    if now <= binding["expires_at"]:
+                        self.last_bind_error = "该角色已绑定其他QQ，不可重复绑定"
+                        await self._save_unlocked()
+                        return None
+            # 创建聊天绑定
+            self._chat_bindings[chat_user_id] = {
+                "user_id": user_id,
+                "expires_at": time.time() + TOKEN_EXPIRY,
+            }
+            await self._save_unlocked()
+            return user_id
 
     # ==================== 聊天绑定查询 ====================
 
@@ -255,13 +266,14 @@ class AuthManager:
         if not info:
             return None
         if time.time() > info["expires_at"]:
-            del self._chat_bindings[chat_user_id]
             return None
         return info["user_id"]
 
-    def unbind_chat(self, chat_user_id: str):
+    async def unbind_chat(self, chat_user_id: str):
         """解除聊天绑定。"""
-        self._chat_bindings.pop(chat_user_id, None)
+        async with self._auth_lock:
+            if self._chat_bindings.pop(chat_user_id, None) is not None:
+                await self._save_unlocked()
 
     async def revoke_user(self, user_id: str):
         """清除指定玩家的所有认证数据。"""
@@ -269,46 +281,48 @@ class AuthManager:
 
     async def revoke_users(self, user_ids: list[str]):
         """批量清除玩家认证数据。"""
-        target_ids = {str(uid) for uid in user_ids if uid}
-        if not target_ids:
-            return
+        async with self._auth_lock:
+            target_ids = {str(uid) for uid in user_ids if uid}
+            if not target_ids:
+                return
 
-        old_web = len(self._web_tokens)
-        old_keys = len(self._bind_keys)
-        old_chat = len(self._chat_bindings)
+            old_web = len(self._web_tokens)
+            old_keys = len(self._bind_keys)
+            old_chat = len(self._chat_bindings)
 
-        self._web_tokens = {
-            token: info
-            for token, info in self._web_tokens.items()
-            if info.get("user_id") not in target_ids
-        }
-        self._bind_keys = {
-            key: info
-            for key, info in self._bind_keys.items()
-            if info.get("user_id") not in target_ids
-        }
-        self._chat_bindings = {
-            chat_id: info
-            for chat_id, info in self._chat_bindings.items()
-            if info.get("user_id") not in target_ids
-        }
+            self._web_tokens = {
+                token: info
+                for token, info in self._web_tokens.items()
+                if info.get("user_id") not in target_ids
+            }
+            self._bind_keys = {
+                key: info
+                for key, info in self._bind_keys.items()
+                if info.get("user_id") not in target_ids
+            }
+            self._chat_bindings = {
+                chat_id: info
+                for chat_id, info in self._chat_bindings.items()
+                if info.get("user_id") not in target_ids
+            }
 
-        changed = (
-            len(self._web_tokens) != old_web
-            or len(self._bind_keys) != old_keys
-            or len(self._chat_bindings) != old_chat
-        )
-        if changed:
-            await self.save()
+            changed = (
+                len(self._web_tokens) != old_web
+                or len(self._bind_keys) != old_keys
+                or len(self._chat_bindings) != old_chat
+            )
+            if changed:
+                await self._save_unlocked()
 
     async def clear_all(self):
         """清空全部认证数据。"""
-        if not self._web_tokens and not self._bind_keys and not self._chat_bindings:
-            return
-        self._web_tokens.clear()
-        self._bind_keys.clear()
-        self._chat_bindings.clear()
-        await self.save()
+        async with self._auth_lock:
+            if not self._web_tokens and not self._bind_keys and not self._chat_bindings:
+                return
+            self._web_tokens.clear()
+            self._bind_keys.clear()
+            self._chat_bindings.clear()
+            await self._save_unlocked()
 
     # ==================== 内部 ====================
 

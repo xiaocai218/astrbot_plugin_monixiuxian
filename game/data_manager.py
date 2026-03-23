@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
+import re
 import shutil
 import time
 from datetime import datetime
@@ -14,6 +16,17 @@ from typing import Optional, Any
 import aiosqlite
 
 from .models import Player
+
+logger = logging.getLogger(__name__)
+
+# 用于 _alter_add_column 的标识符和类型安全校验
+_SAFE_IDENT = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+# DEFAULT 值仅允许：数字/小数、单引号字符串（内部无引号）、NULL
+_SAFE_COL_TYPE = re.compile(
+    r"^[A-Z ]+(?:\(\d+\))?"
+    r"(?:\s+DEFAULT\s+(?:-?\d+(?:\.\d+)?|'[^']*'|NULL))?$",
+    re.I,
+)
 
 # 玩家表所有列（与 Player 字段一一对应）
 _PLAYER_COLUMNS = [
@@ -542,11 +555,20 @@ class DataManager:
         await self.db.commit()
 
     async def save_all_players(self, players: dict[str, Player]):
-        """批量保存所有玩家数据（事务：清空 + 重插）。"""
-        await self.db.execute("DELETE FROM players")
+        """批量保存所有玩家数据（UPSERT模式，分批提交）。"""
+        batch_size = 50
+        batch: list[Player] = []
         for player in players.values():
-            await self._upsert_player(player)
-        await self.db.commit()
+            batch.append(player)
+            if len(batch) >= batch_size:
+                for p in batch:
+                    await self._upsert_player(p)
+                await self.db.commit()
+                batch.clear()
+        if batch:
+            for p in batch:
+                await self._upsert_player(p)
+            await self.db.commit()
 
     async def delete_player(self, user_id: str):
         """删除单个玩家。"""
@@ -674,11 +696,16 @@ class DataManager:
 
     async def _alter_add_column(self, table: str, column: str, col_type: str):
         """安全地为表添加新列（已存在则忽略）。"""
+        if not _SAFE_IDENT.match(table) or not _SAFE_IDENT.match(column):
+            raise ValueError(f"非法标识符: table={table}, column={column}")
+        if not _SAFE_COL_TYPE.match(col_type):
+            raise ValueError(f"非法列类型: {col_type}")
         try:
             await self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
             await self.db.commit()
-        except Exception:
-            pass  # 列已存在
+        except Exception as e:
+            if "duplicate column name" not in str(e).lower():
+                logger.warning("添加列失败 %s.%s: %s", table, column, e)  # 列已存在
 
     async def _ensure_sect_schema(self, force: bool = False):
         """确保宗门相关旧表已经自动升级到当前结构。"""

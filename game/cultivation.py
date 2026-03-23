@@ -197,12 +197,8 @@ def _accumulate_gongfa_exp(player: Player) -> list[str]:
 
         # 境界不够则不涨熟练度
         if not can_cultivate_gongfa(player.realm, gf.tier):
+            msgs.append(f"功法【{gf.name}】需更高境界方可继续修炼")
             continue
-
-        # 地阶+功法的大成→圆满需消耗道韵（不够则暂停累积）
-        if gf.tier >= 2 and mastery >= 2 and gf.dao_yun_cost > 0:
-            # 仅在尝试从大成(2)突破到圆满(3)时扣除
-            pass
 
         gf_exp_gain = random.randint(1, 3)
         cur_exp = getattr(player, exp_attr, 0) + gf_exp_gain
@@ -214,6 +210,7 @@ def _accumulate_gongfa_exp(player: Player) -> list[str]:
                     cur_exp = gf.mastery_exp - 1
                     setattr(player, exp_attr, cur_exp)
                     continue
+                # 道韵扣除和升级绑定执行
                 player.dao_yun -= gf.dao_yun_cost
                 msgs.append(f"消耗道韵{gf.dao_yun_cost}，助功法【{gf.name}】突破")
             cur_exp -= gf.mastery_exp
