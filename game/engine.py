@@ -24,7 +24,9 @@ from .constants import (
     get_realm_name, has_sub_realm, can_equip, get_realm_heart_methods,
     get_player_base_max_lingqi, get_player_base_stats, get_realm_base_stats, calc_gongfa_lingqi_cost,
     get_max_sub_realm, get_sub_realm_dao_yun_cost, is_high_realm,
-    get_nearest_realm_level,
+    get_nearest_realm_level, get_dao_yun_rate,
+    MATERIAL_REGISTRY, MATERIAL_RARITY_NAMES, MATERIAL_CATEGORIES,
+    PILL_REGISTRY, PILL_TIER_NAMES, PILL_GRADE_NAMES,
     RealmLevel,
 )
 from .cultivation import attempt_breakthrough, perform_cultivate
@@ -81,7 +83,7 @@ class GameEngine:
     async def initialize(self):
         """加载所有玩家数据到内存。"""
         # 启动时先从独立心法表加载定义，再进入玩家数据归一化流程
-        from .constants import set_heart_method_registry, set_equipment_registry, set_gongfa_registry, set_realm_config
+        from .constants import set_heart_method_registry, set_equipment_registry, set_gongfa_registry, set_realm_config, set_pill_registry
         from .pills import clean_expired_buffs
 
         realms = await self._data_manager.load_realms()
@@ -92,6 +94,8 @@ class GameEngine:
         set_heart_method_registry(heart_methods)
         gongfas = await self._data_manager.load_gongfas()
         set_gongfa_registry(gongfas)
+        pills = await self._data_manager.load_pills()
+        set_pill_registry(pills)
 
         self._players = await self._data_manager.load_all_players()
         normalized = False
@@ -497,6 +501,14 @@ class GameEngine:
                     player.dao_yun += dao_gain
                     extra_msgs.append(f"感悟道韵+{dao_gain}")
 
+            # 挂机期间境界道韵产出（化神期及以上独立触发，可与心法叠加）
+            realm_dao_rate = get_dao_yun_rate(player.realm, player.sub_realm)
+            if realm_dao_rate > 0:
+                dao_gain = int(duration_min * realm_dao_rate * 0.3)
+                if dao_gain > 0:
+                    player.dao_yun += dao_gain
+                    extra_msgs.append(f"感悟道韵+{dao_gain}")
+
             # 处理小境界自动升级
             sub_level_ups = 0
             if has_sub_realm(player.realm):
@@ -602,13 +614,10 @@ class GameEngine:
 
         return await self.dungeon.start(player)
 
-    async def get_adventure_scenes(self) -> list[dict]:
-        """获取所有历练场景列表。"""
-        return await self._data_manager.get_adventure_scenes()
-
     async def _reload_runtime_registries(self):
-        """从数据库重载境界、装备、心法、功法定义到运行时注册表。"""
-        from .constants import set_equipment_registry, set_heart_method_registry, set_gongfa_registry, set_realm_config
+        """从数据库重载境界、装备、心法、功法、材料、丹方定义到运行时注册表。"""
+        from .constants import set_equipment_registry, set_heart_method_registry, set_gongfa_registry, set_realm_config, set_pill_registry
+        from .constants import set_material_registry, set_pill_recipe_registry
 
         realms = await self._data_manager.load_realms()
         set_realm_config(realms)
@@ -618,6 +627,12 @@ class GameEngine:
         set_heart_method_registry(heart_methods)
         gongfas = await self._data_manager.load_gongfas()
         set_gongfa_registry(gongfas)
+        pills = await self._data_manager.load_pills()
+        set_pill_registry(pills)
+        materials = await self._data_manager.load_materials()
+        set_material_registry(materials)
+        pill_recipes = await self._data_manager.load_pill_recipes()
+        set_pill_recipe_registry(pill_recipes)
 
     async def _normalize_players_after_registry_change(self):
         """当定义表变化后，归一化玩家境界与装备/心法状态。"""
@@ -633,45 +648,6 @@ class GameEngine:
                 changed = True
         if changed:
             await self._data_manager.save_all_players(self._players)
-
-    async def admin_list_adventure_scenes(self) -> list[dict]:
-        return await self._data_manager.admin_list_adventure_scenes()
-
-    async def admin_create_adventure_scene(self, category: str, name: str, description: str) -> dict:
-        category = str(category or "").strip()
-        name = str(name or "").strip()
-        description = str(description or "").strip()
-        if not category or not name or not description:
-            return {"success": False, "message": "分类、场景名、描述不能为空"}
-        if await self._data_manager.admin_has_adventure_scene_name(name):
-            return {"success": False, "message": f"历练场景名称「{name}」已存在，禁止重名"}
-        scene_id = await self._data_manager.admin_create_adventure_scene(category, name, description)
-        return {"success": True, "message": "历练场景已新增", "id": scene_id}
-
-    async def admin_update_adventure_scene(self, scene_id: int, category: str, name: str, description: str) -> dict:
-        try:
-            scene_id = int(scene_id)
-        except (TypeError, ValueError):
-            return {"success": False, "message": "场景ID无效"}
-        category = str(category or "").strip()
-        name = str(name or "").strip()
-        description = str(description or "").strip()
-        if not category or not name or not description:
-            return {"success": False, "message": "分类、场景名、描述不能为空"}
-        ok = await self._data_manager.admin_update_adventure_scene(scene_id, category, name, description)
-        if not ok:
-            return {"success": False, "message": "场景不存在"}
-        return {"success": True, "message": "历练场景已更新"}
-
-    async def admin_delete_adventure_scene(self, scene_id: int) -> dict:
-        try:
-            scene_id = int(scene_id)
-        except (TypeError, ValueError):
-            return {"success": False, "message": "场景ID无效"}
-        ok = await self._data_manager.admin_delete_adventure_scene(scene_id)
-        if not ok:
-            return {"success": False, "message": "场景不存在"}
-        return {"success": True, "message": "历练场景已删除"}
 
     # ── 公告管理 ────────────────────────────────────────────
     async def get_active_announcements(self) -> list[dict]:
@@ -914,6 +890,327 @@ class GameEngine:
         await self._normalize_players_after_registry_change()
         return {"success": True, "message": "功法已删除"}
 
+    # ── 丹药管理 ───────────────────────────────────────────
+
+    async def admin_list_pills(self) -> list[dict]:
+        import json as _json
+
+        rows = await self._data_manager.admin_list_pills()
+        recipe_rows = await self._data_manager.admin_list_pill_recipes()
+        recipe_map = {(row["pill_id"], int(row.get("grade", 0))): row for row in recipe_rows}
+        result = []
+
+        def _enrich_material(entry):
+            if not isinstance(entry, dict):
+                return {"item_id": "", "qty": 1, "material_name": "--"}
+            item_id = str(entry.get("item_id", "")).strip()
+            try:
+                qty = max(1, int(entry.get("qty", 1) or 1))
+            except (TypeError, ValueError):
+                qty = 1
+            material = MATERIAL_REGISTRY.get(item_id)
+            return {
+                "item_id": item_id,
+                "qty": qty,
+                "material_name": material.name if material else (item_id or "--"),
+            }
+
+        for row in rows:
+            item = dict(row)
+            grade = int(item.get("grade", 0))
+            item["tier_name"] = PILL_TIER_NAMES.get(int(item.get("tier", 0)), str(item.get("tier", 0)))
+            item["grade_name"] = PILL_GRADE_NAMES.get(grade, str(grade))
+            for key in ("effects", "side_effects"):
+                raw = item.get(key, "{}")
+                if isinstance(raw, str):
+                    try:
+                        parsed = _json.loads(raw)
+                        item[key] = parsed if isinstance(parsed, dict) else {}
+                    except Exception:
+                        item[key] = {}
+            recipe = recipe_map.get((item["pill_id"], grade), {})
+            item["main_material"] = _enrich_material(recipe.get("main_material"))
+            item["auxiliary_material"] = _enrich_material(recipe.get("auxiliary_material"))
+            item["catalyst"] = _enrich_material(recipe.get("catalyst"))
+            item["forming_material"] = _enrich_material(recipe.get("forming_material"))
+            result.append(item)
+        return result
+
+    async def admin_create_pill(self, payload: dict) -> dict:
+        import json as _json
+
+        pill_id = str(payload.get("pill_id", "")).strip()
+        if not re.fullmatch(r"[a-z0-9_]{3,64}", pill_id):
+            return {"success": False, "message": "丹药ID仅支持3-64位小写字母/数字/下划线"}
+        data = {
+            "pill_id": pill_id,
+            "name": str(payload.get("name", "")).strip(),
+            "tier": int(payload.get("tier", 0)),
+            "grade": int(payload.get("grade", 0)),
+            "category": str(payload.get("category", "healing")).strip(),
+            "description": str(payload.get("description", "")).strip(),
+            "price": max(0, int(payload.get("price", 0))),
+            "effects": payload.get("effects", {}),
+            "is_temp": self._normalize_enabled_flag(payload.get("is_temp", 0)),
+            "duration": max(0, int(payload.get("duration", 0))),
+            "side_effects": payload.get("side_effects", {}),
+            "side_effect_desc": str(payload.get("side_effect_desc", "")).strip(),
+            "enabled": self._normalize_enabled_flag(payload.get("enabled", 1)),
+        }
+        if not data["name"]:
+            return {"success": False, "message": "丹药名称不能为空"}
+        if data["tier"] not in {0, 1, 2, 3, 4}:
+            return {"success": False, "message": "丹药品阶无效（0-4）"}
+        if data["grade"] not in {0, 1, 2}:
+            return {"success": False, "message": "丹药品级无效（0-2）"}
+        if not data["category"]:
+            return {"success": False, "message": "丹药类别不能为空"}
+        if not isinstance(data["effects"], dict):
+            try:
+                data["effects"] = _json.loads(str(data["effects"] or "{}"))
+            except Exception:
+                return {"success": False, "message": "effects 必须是 JSON 对象"}
+        if not isinstance(data["side_effects"], dict):
+            try:
+                data["side_effects"] = _json.loads(str(data["side_effects"] or "{}"))
+            except Exception:
+                return {"success": False, "message": "side_effects 必须是 JSON 对象"}
+        if await self._data_manager.admin_has_pill_name(data["name"]):
+            return {"success": False, "message": f"丹药名称「{data['name']}」已存在，禁止重名"}
+        ok = await self._data_manager.admin_create_pill(data)
+        if not ok:
+            return {"success": False, "message": "丹药ID已存在"}
+        await self._reload_runtime_registries()
+        return {"success": True, "message": "丹药已新增"}
+
+    async def admin_update_pill(self, pill_id: str, payload: dict) -> dict:
+        import json as _json
+
+        pill_id = str(pill_id or "").strip()
+        if not pill_id:
+            return {"success": False, "message": "缺少丹药ID"}
+        data = {
+            "name": str(payload.get("name", "")).strip(),
+            "tier": int(payload.get("tier", 0)),
+            "grade": int(payload.get("grade", 0)),
+            "category": str(payload.get("category", "healing")).strip(),
+            "description": str(payload.get("description", "")).strip(),
+            "price": max(0, int(payload.get("price", 0))),
+            "effects": payload.get("effects", {}),
+            "is_temp": self._normalize_enabled_flag(payload.get("is_temp", 0)),
+            "duration": max(0, int(payload.get("duration", 0))),
+            "side_effects": payload.get("side_effects", {}),
+            "side_effect_desc": str(payload.get("side_effect_desc", "")).strip(),
+            "enabled": self._normalize_enabled_flag(payload.get("enabled", 1)),
+        }
+        if not data["name"]:
+            return {"success": False, "message": "丹药名称不能为空"}
+        if data["tier"] not in {0, 1, 2, 3, 4}:
+            return {"success": False, "message": "丹药品阶无效（0-4）"}
+        if data["grade"] not in {0, 1, 2}:
+            return {"success": False, "message": "丹药品级无效（0-2）"}
+        if not data["category"]:
+            return {"success": False, "message": "丹药类别不能为空"}
+        if not isinstance(data["effects"], dict):
+            try:
+                data["effects"] = _json.loads(str(data["effects"] or "{}"))
+            except Exception:
+                return {"success": False, "message": "effects 必须是 JSON 对象"}
+        if not isinstance(data["side_effects"], dict):
+            try:
+                data["side_effects"] = _json.loads(str(data["side_effects"] or "{}"))
+            except Exception:
+                return {"success": False, "message": "side_effects 必须是 JSON 对象"}
+        ok = await self._data_manager.admin_update_pill(pill_id, data)
+        if not ok:
+            return {"success": False, "message": "丹药不存在"}
+        await self._reload_runtime_registries()
+        return {"success": True, "message": "丹药已更新"}
+
+    async def admin_delete_pill(self, pill_id: str) -> dict:
+        pill_id = str(pill_id or "").strip()
+        if not pill_id:
+            return {"success": False, "message": "缺少丹药ID"}
+        ok = await self._data_manager.admin_delete_pill(pill_id)
+        if not ok:
+            return {"success": False, "message": "丹药不存在"}
+        await self._reload_runtime_registries()
+        return {"success": True, "message": "丹药已删除"}
+
+    # ── 材料管理 ───────────────────────────────────────────
+
+    async def admin_list_materials(self) -> list[dict]:
+        rows = await self._data_manager.admin_list_materials()
+        result = []
+        for row in rows:
+            item = dict(row)
+            rarity = int(item.get("rarity", 0))
+            item["rarity_name"] = MATERIAL_RARITY_NAMES.get(rarity, str(rarity))
+            result.append(item)
+        return result
+
+    async def admin_create_material(self, payload: dict) -> dict:
+        import re
+        item_id = str(payload.get("item_id", "")).strip()
+        if not re.fullmatch(r"[a-z0-9_]{3,64}", item_id):
+            return {"success": False, "message": "材料ID仅支持3-64位小写字母/数字/下划线"}
+        data = {
+            "item_id": item_id,
+            "name": str(payload.get("name", "")).strip(),
+            "rarity": int(payload.get("rarity", 0)),
+            "category": str(payload.get("category", "herb")),
+            "source": str(payload.get("source", "")),
+            "description": str(payload.get("description", "")),
+            "recycle_price": int(payload.get("recycle_price", 0)),
+        }
+        if not data["name"]:
+            return {"success": False, "message": "材料名称不能为空"}
+        if data["rarity"] not in {0, 1, 2, 3, 4, 5}:
+            return {"success": False, "message": "稀有度值无效（0-5）"}
+        if data["category"] not in MATERIAL_CATEGORIES:
+            return {"success": False, "message": "材料类别无效"}
+        if await self._data_manager.admin_has_material_name(data["name"]):
+            return {"success": False, "message": f"材料名称「{data['name']}」已存在，禁止重名"}
+        ok = await self._data_manager.admin_create_material(data)
+        if not ok:
+            return {"success": False, "message": "材料ID已存在"}
+        await self._reload_runtime_registries()
+        return {"success": True, "message": "材料已新增"}
+
+    async def admin_update_material(self, item_id: str, payload: dict) -> dict:
+        item_id = str(item_id or "").strip()
+        if not item_id:
+            return {"success": False, "message": "缺少材料ID"}
+        data = {
+            "name": str(payload.get("name", "")).strip(),
+            "rarity": int(payload.get("rarity", 0)),
+            "category": str(payload.get("category", "herb")),
+            "source": str(payload.get("source", "")),
+            "description": str(payload.get("description", "")),
+            "recycle_price": int(payload.get("recycle_price", 0)),
+        }
+        if not data["name"]:
+            return {"success": False, "message": "材料名称不能为空"}
+        if data["rarity"] not in {0, 1, 2, 3, 4, 5}:
+            return {"success": False, "message": "稀有度值无效（0-5）"}
+        if data["category"] not in MATERIAL_CATEGORIES:
+            return {"success": False, "message": "材料类别无效"}
+        ok = await self._data_manager.admin_update_material(item_id, data)
+        if not ok:
+            return {"success": False, "message": "材料不存在"}
+        await self._reload_runtime_registries()
+        return {"success": True, "message": "材料已更新"}
+
+    async def admin_delete_material(self, item_id: str) -> dict:
+        item_id = str(item_id or "").strip()
+        if not item_id:
+            return {"success": False, "message": "缺少材料ID"}
+        ok = await self._data_manager.admin_delete_material(item_id)
+        if not ok:
+            return {"success": False, "message": "材料不存在"}
+        await self._reload_runtime_registries()
+        return {"success": True, "message": "材料已删除"}
+
+    # ── 丹方管理 ───────────────────────────────────────────
+
+    async def admin_list_pill_recipes(self) -> list[dict]:
+        rows = await self._data_manager.admin_list_pill_recipes()
+        result = []
+
+        def _enrich_material(entry):
+            if not isinstance(entry, dict):
+                return {"item_id": "", "qty": 1, "material_name": "--"}
+            item_id = str(entry.get("item_id", "")).strip()
+            try:
+                qty = max(1, int(entry.get("qty", 1) or 1))
+            except (TypeError, ValueError):
+                qty = 1
+            material = MATERIAL_REGISTRY.get(item_id)
+            return {
+                "item_id": item_id,
+                "qty": qty,
+                "material_name": material.name if material else (item_id or "--"),
+            }
+
+        for row in rows:
+            item = dict(row)
+            grade = int(item.get("grade", 0))
+            item["grade_name"] = PILL_GRADE_NAMES.get(grade, str(grade))
+            pill = PILL_REGISTRY.get(item["pill_id"])
+            item["pill_name"] = pill.name if pill else item["pill_id"]
+            item["main_material"] = _enrich_material(item.get("main_material"))
+            item["auxiliary_material"] = _enrich_material(item.get("auxiliary_material"))
+            item["catalyst"] = _enrich_material(item.get("catalyst"))
+            item["forming_material"] = _enrich_material(item.get("forming_material"))
+            result.append(item)
+        return result
+
+    async def admin_create_pill_recipe(self, payload: dict) -> dict:
+        import re
+        recipe_id = str(payload.get("recipe_id", "")).strip()
+        if not re.fullmatch(r"[a-z0-9_]{3,64}", recipe_id):
+            return {"success": False, "message": "丹方ID仅支持3-64位小写字母/数字/下划线"}
+        pill_id = str(payload.get("pill_id", "")).strip()
+        if not pill_id:
+            return {"success": False, "message": "丹药ID不能为空"}
+        if pill_id not in PILL_REGISTRY:
+            return {"success": False, "message": f"丹药ID「{pill_id}」不存在于PILL_REGISTRY"}
+        grade = int(payload.get("grade", 0))
+        if grade not in {0, 1, 2}:
+            return {"success": False, "message": "品级值无效（0=下品, 1=上品, 2=无垢）"}
+        data = {
+            "recipe_id": recipe_id,
+            "pill_id": pill_id,
+            "grade": grade,
+            "main_material": payload.get("main_material", {}),
+            "auxiliary_material": payload.get("auxiliary_material", {}),
+            "catalyst": payload.get("catalyst", {}),
+            "forming_material": payload.get("forming_material", {}),
+        }
+        if await self._data_manager.admin_has_pill_recipe(pill_id, grade):
+            return {"success": False, "message": f"丹药「{pill_id}」品级「{grade}」的丹方已存在"}
+        ok = await self._data_manager.admin_create_pill_recipe(data)
+        if not ok:
+            return {"success": False, "message": "丹方ID已存在"}
+        await self._reload_runtime_registries()
+        return {"success": True, "message": "丹方已新增"}
+
+    async def admin_update_pill_recipe(self, recipe_id: str, payload: dict) -> dict:
+        recipe_id = str(recipe_id or "").strip()
+        if not recipe_id:
+            return {"success": False, "message": "缺少丹方ID"}
+        pill_id = str(payload.get("pill_id", "")).strip()
+        if not pill_id:
+            return {"success": False, "message": "丹药ID不能为空"}
+        if pill_id not in PILL_REGISTRY:
+            return {"success": False, "message": f"丹药ID「{pill_id}」不存在于PILL_REGISTRY"}
+        grade = int(payload.get("grade", 0))
+        if grade not in {0, 1, 2}:
+            return {"success": False, "message": "品级值无效（0=下品, 1=上品, 2=无垢）"}
+        data = {
+            "pill_id": pill_id,
+            "grade": grade,
+            "main_material": payload.get("main_material", {}),
+            "auxiliary_material": payload.get("auxiliary_material", {}),
+            "catalyst": payload.get("catalyst", {}),
+            "forming_material": payload.get("forming_material", {}),
+        }
+        ok = await self._data_manager.admin_update_pill_recipe(recipe_id, data)
+        if not ok:
+            return {"success": False, "message": "丹方不存在"}
+        await self._reload_runtime_registries()
+        return {"success": True, "message": "丹方已更新"}
+
+    async def admin_delete_pill_recipe(self, recipe_id: str) -> dict:
+        recipe_id = str(recipe_id or "").strip()
+        if not recipe_id:
+            return {"success": False, "message": "缺少丹方ID"}
+        ok = await self._data_manager.admin_delete_pill_recipe(recipe_id)
+        if not ok:
+            return {"success": False, "message": "丹方不存在"}
+        await self._reload_runtime_registries()
+        return {"success": True, "message": "丹方已删除"}
+
     # ---- 境界管理 CRUD ----
 
     async def admin_list_realms(self) -> list[dict]:
@@ -946,6 +1243,8 @@ class GameEngine:
             "death_rate": max(0.0, min(1.0, float(payload.get("death_rate", 0.0)))),
             "sub_dao_yun_costs": str(payload.get("sub_dao_yun_costs", "")),
             "breakthrough_dao_yun_cost": max(0, int(payload.get("breakthrough_dao_yun_cost", 0))),
+            "dao_yun_base_rate": max(0.0, float(payload.get("dao_yun_base_rate", 0.0))),
+            "dao_yun_per_sub_realm": max(0.0, float(payload.get("dao_yun_per_sub_realm", 0.0))),
         }
         ok = await self._data_manager.admin_create_realm(data)
         if not ok:
@@ -974,6 +1273,8 @@ class GameEngine:
             "death_rate": max(0.0, min(1.0, float(payload.get("death_rate", 0.0)))),
             "sub_dao_yun_costs": str(payload.get("sub_dao_yun_costs", "")),
             "breakthrough_dao_yun_cost": max(0, int(payload.get("breakthrough_dao_yun_cost", 0))),
+            "dao_yun_base_rate": max(0.0, float(payload.get("dao_yun_base_rate", 0.0))),
+            "dao_yun_per_sub_realm": max(0.0, float(payload.get("dao_yun_per_sub_realm", 0.0))),
         }
         ok = await self._data_manager.admin_update_realm(level, data)
         if not ok:

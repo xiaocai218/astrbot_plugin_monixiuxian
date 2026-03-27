@@ -17,6 +17,7 @@ from .constants import (
     EQUIPMENT_TIER_NAMES,
     HEART_METHOD_QUALITY_NAMES,
     GONGFA_TIER_NAMES,
+    REALM_CONFIG,
     parse_heart_method_manual_id,
     parse_stored_heart_method_item_id,
     parse_gongfa_scroll_id,
@@ -750,6 +751,78 @@ async def warehouse_exchange(
     }
 
 
+def _get_item_detail(item_id: str) -> dict:
+    """获取物品的完整展示信息（供仓库物品详情弹窗使用）。"""
+    from .pills import PILL_REGISTRY, PILL_TIER_NAMES, PILL_GRADE_NAMES
+
+    detail: dict = {"name": _get_item_display_name(item_id)}
+    item_def = ITEM_REGISTRY.get(item_id)
+    if item_def:
+        detail["type"] = item_def.item_type
+        detail["description"] = item_def.description
+
+    eq = EQUIPMENT_REGISTRY.get(item_id)
+    if eq:
+        detail["type"] = "equipment"
+        detail["tier"] = eq.tier
+        detail["tier_name"] = EQUIPMENT_TIER_NAMES.get(eq.tier, "未知")
+        detail["slot"] = eq.slot
+        detail["attack"] = eq.attack
+        detail["defense"] = eq.defense
+        detail["element"] = eq.element
+        detail["element_damage"] = eq.element_damage
+        return detail
+
+    pill = PILL_REGISTRY.get(item_id)
+    if pill:
+        detail["type"] = "pill"
+        detail["description"] = pill.description
+        detail["pill_tier"] = pill.tier
+        detail["pill_tier_name"] = PILL_TIER_NAMES.get(pill.tier, "")
+        detail["pill_grade"] = pill.grade
+        detail["pill_grade_name"] = PILL_GRADE_NAMES.get(pill.grade, "")
+        detail["is_temp"] = pill.is_temp
+        if pill.is_temp:
+            detail["duration"] = pill.duration
+        if pill.side_effect_desc:
+            detail["side_effect_desc"] = pill.side_effect_desc
+        return detail
+
+    hm_id = parse_heart_method_manual_id(item_id)
+    if not hm_id:
+        hm_id = parse_stored_heart_method_item_id(item_id)
+    if hm_id:
+        hm = HEART_METHOD_REGISTRY.get(hm_id)
+        if hm:
+            detail["type"] = "heart_method"
+            detail["description"] = hm.description or detail.get("description", "")
+            detail["heart_method_quality"] = hm.quality
+            detail["hm_quality_name"] = HEART_METHOD_QUALITY_NAMES.get(hm.quality, "普通")
+            detail["realm_name"] = REALM_CONFIG.get(hm.realm, {}).get("name", "未知境界")
+            detail["attack_bonus"] = hm.attack_bonus
+            detail["defense_bonus"] = hm.defense_bonus
+            detail["exp_multiplier"] = hm.exp_multiplier
+            detail["dao_yun_rate"] = hm.dao_yun_rate
+        return detail
+
+    gf_id = parse_gongfa_scroll_id(item_id)
+    if gf_id:
+        gf = GONGFA_REGISTRY.get(gf_id)
+        if gf:
+            detail["type"] = "gongfa"
+            detail["description"] = gf.description or detail.get("description", "")
+            detail["gongfa_tier"] = gf.tier
+            detail["gf_tier_name"] = GONGFA_TIER_NAMES.get(gf.tier, "未知")
+            detail["attack_bonus"] = gf.attack_bonus
+            detail["defense_bonus"] = gf.defense_bonus
+            detail["hp_regen"] = gf.hp_regen
+            detail["lingqi_regen"] = gf.lingqi_regen
+            detail["lingqi_cost"] = gf.lingqi_cost
+        return detail
+
+    return detail
+
+
 async def warehouse_list(user_id: str, dm: "DataManager") -> dict:
     """查看宗门仓库物品列表及个人贡献信息。"""
     membership = await dm.load_player_sect(user_id)
@@ -773,14 +846,15 @@ async def warehouse_list(user_id: str, dm: "DataManager") -> dict:
     for entry in items:
         iid = entry["item_id"]
         base_pts = await get_exchange_points(sect_id, iid, dm)
-        display_items.append({
+        detail = _get_item_detail(iid)
+        detail.update({
             "item_id": iid,
-            "name": _get_item_display_name(iid),
             "quantity": entry["quantity"],
             "quality_category": get_item_quality_category(iid),
             "quality_name": QUALITY_CATEGORY_NAMES.get(get_item_quality_category(iid), "未知"),
             "exchange_points_base": base_pts,
         })
+        display_items.append(detail)
 
     return {
         "success": True,

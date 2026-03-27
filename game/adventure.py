@@ -24,69 +24,6 @@ _COMBO_SIZES = (4, 3, 2, 1)  # 1+1+1+1, 1+1+1, 1+1, 1
 _HEART_METHOD_DROP_BASE_RATE = 0.18
 
 
-async def attempt_adventure(player: Player, scene: dict, difficulty: str) -> dict:
-    """执行一次历练。
-
-    历练先进行一次攻防对抗判定（攻击/防御都会参与），胜利后根据组合规则发放奖励。
-    """
-    diff_labels = {"easy": "轻松", "normal": "正常", "hard": "困难"}
-    diff_label = diff_labels.get(difficulty, "正常")
-
-    # 记录开始时是否满血
-    is_full_hp = player.hp >= player.max_hp
-
-    enemy_realm = _resolve_enemy_realm(player.realm, difficulty)
-    battle = _build_battle_context(player, enemy_realm, difficulty)
-    win = random.random() <= battle["win_prob"]
-
-    result = {
-        "success": True,
-        "outcome": "battle",
-        "scene_name": scene["name"],
-        "category": scene["category"],
-        "description": scene["description"],
-        "difficulty_label": diff_label,
-        "message": "",
-        "died": False,
-        "realm_changed": False,
-        "player_power": battle["player_power"],
-        "enemy_power": battle["enemy_power"],
-        "win_prob": round(battle["win_prob"], 3),
-        "enemy_realm_name": get_realm_name(enemy_realm, 0),
-    }
-
-    if win:
-        await _apply_victory_rewards(player, result, battle["enemy_scale"])
-        return result
-
-    # 战败：满血开始则只受伤，否则正常判定
-    if is_full_hp:
-        lose_outcome = "injured"
-    else:
-        if battle["power_ratio"] < 0.7:
-            lose_weights = [50, 49, 1]  # 受伤, 跌境, 死亡(1%)
-        elif battle["power_ratio"] < 0.9:
-            lose_weights = [60, 39, 1]
-        else:
-            lose_weights = [73, 26, 1]
-        lose_outcome = random.choices(
-            ["injured", "injured_realm_down", "death"],
-            weights=lose_weights,
-            k=1,
-        )[0]
-    result["outcome"] = lose_outcome
-    if lose_outcome == "injured":
-        _apply_injured(player, result, battle["enemy_attack"])
-    elif lose_outcome == "injured_realm_down":
-        _apply_injured_realm_down(player, result, battle["enemy_attack"])
-    else:
-        result["died"] = True
-        result["message"] = (
-            f"在【{scene['category']}·{scene['name']}】中遭遇{diff_label}强敌（{result['enemy_realm_name']}），"
-            f"力战不支，不幸陨落……"
-        )
-    return result
-
 
 def _resolve_enemy_realm(player_realm: int, difficulty: str) -> int:
     """根据难度匹配敌方境界。"""

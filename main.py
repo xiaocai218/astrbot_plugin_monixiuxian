@@ -567,11 +567,6 @@ class XiuxianPlugin(Star):
         result = await self._engine.adventure(player_id)
         yield event.plain_result(result["message"])
 
-    @xiuxian_group.command("历练场景")
-    async def show_scenes(self, event: AstrMessageEvent):
-        """提示旧版历练场景已停用。"""
-        yield event.plain_result("旧版历练场景已停用，历练现已改为 Web 端的秘境副本探索。")
-
     @xiuxian_group.command("突破")
     async def breakthrough(self, event: AstrMessageEvent):
         """尝试突破境界。"""

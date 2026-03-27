@@ -40,7 +40,6 @@ _PENDING_DEATH_ALLOWED_TYPES = {
     "get_my_listings",
     "get_panel",
     "get_rankings",
-    "get_scenes",
     "get_shop",
     "get_world_chat_history",
     "dungeon_state",
@@ -688,10 +687,6 @@ async def _handle_message(
     elif msg_type == "adventure":
         result = await engine.adventure(user_id)
         return {"type": "action_result", "action": "dungeon_start", "data": result}
-
-    elif msg_type == "get_scenes":
-        scenes = await engine.get_adventure_scenes()
-        return {"type": "scenes", "data": scenes}
 
     elif msg_type == "get_announcements":
         announcements = await engine.get_active_announcements()

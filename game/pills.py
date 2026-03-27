@@ -291,6 +291,18 @@ def _generate_pills() -> dict[str, PillDef]:
 PILL_REGISTRY: dict[str, PillDef] = _generate_pills()
 
 
+def set_pill_registry(pills: dict[str, PillDef]):
+    """替换运行时丹药注册表。"""
+    new_data = {
+        k: PillDef(**v) if not isinstance(v, PillDef) else v
+        for k, v in pills.items()
+    }
+    stale = [k for k in PILL_REGISTRY if k not in new_data]
+    for k in stale:
+        del PILL_REGISTRY[k]
+    PILL_REGISTRY.update(new_data)
+
+
 # ═══════════════════════ ItemDef 桥接 ═══════════════════════
 
 def get_pill_item_defs() -> dict:

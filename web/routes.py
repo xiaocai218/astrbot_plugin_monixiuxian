@@ -88,7 +88,7 @@ def create_router(
         """按路径和 UA 选择限流阈值。"""
         if path in {"/api/register", "/api/login", "/api/admin/login"}:
             limit, window = auth_limit
-        elif path in {"/api/rankings", "/api/status", "/api/adventure-scenes", "/api/realm-names"}:
+        elif path in {"/api/rankings", "/api/status", "/api/realm-names"}:
             limit, window = public_limit
         elif path.startswith("/api/admin/"):
             limit, window = admin_limit
@@ -438,12 +438,6 @@ def create_router(
         result = await engine.adventure(user_id)
         return result
 
-    @router.get("/api/adventure-scenes")
-    async def get_scenes():
-        """获取历练场景列表。"""
-        scenes = await engine.get_adventure_scenes()
-        return {"success": True, "scenes": scenes}
-
     # ==================== 管理员 API ====================
 
     @router.post("/api/admin/login")
@@ -490,61 +484,6 @@ def create_router(
                 status_code=401,
             )
         return {"success": True, "is_admin": True}
-
-    @router.post("/api/admin/adventure-scenes/list")
-    async def admin_list_adventure_scenes(request: Request):
-        """管理员接口：历练场景列表。"""
-        body = await request.json()
-        admin_token = str(body.get("admin_token", ""))
-        if not _verify_admin_token(admin_token):
-            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
-        scenes = await engine.admin_list_adventure_scenes()
-        return {"success": True, "scenes": scenes}
-
-    @router.post("/api/admin/adventure-scenes/create")
-    async def admin_create_adventure_scene(request: Request):
-        """管理员接口：新增历练场景。"""
-        body = await request.json()
-        admin_token = str(body.get("admin_token", ""))
-        if not _verify_admin_token(admin_token):
-            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
-        result = await engine.admin_create_adventure_scene(
-            body.get("category", ""),
-            body.get("name", ""),
-            body.get("description", ""),
-        )
-        if not result.get("success"):
-            return JSONResponse(result, status_code=400)
-        return result
-
-    @router.post("/api/admin/adventure-scenes/update")
-    async def admin_update_adventure_scene(request: Request):
-        """管理员接口：修改历练场景。"""
-        body = await request.json()
-        admin_token = str(body.get("admin_token", ""))
-        if not _verify_admin_token(admin_token):
-            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
-        result = await engine.admin_update_adventure_scene(
-            body.get("id"),
-            body.get("category", ""),
-            body.get("name", ""),
-            body.get("description", ""),
-        )
-        if not result.get("success"):
-            return JSONResponse(result, status_code=400)
-        return result
-
-    @router.post("/api/admin/adventure-scenes/delete")
-    async def admin_delete_adventure_scene(request: Request):
-        """管理员接口：删除历练场景。"""
-        body = await request.json()
-        admin_token = str(body.get("admin_token", ""))
-        if not _verify_admin_token(admin_token):
-            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
-        result = await engine.admin_delete_adventure_scene(body.get("id"))
-        if not result.get("success"):
-            return JSONResponse(result, status_code=400)
-        return result
 
     # ── 公告管理 ────────────────────────────────────────────
     @router.post("/api/admin/announcements/list")
@@ -710,6 +649,177 @@ def create_router(
             return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
         gongfa_id = str(body.get("gongfa_id", "")).strip()
         result = await engine.admin_delete_gongfa(gongfa_id)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    # ── 丹药管理 ────────────────────────────────────────────
+    @router.post("/api/admin/pills/list")
+    async def admin_list_pills(request: Request):
+        """管理员接口：丹药列表。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        pills = await engine.admin_list_pills()
+        return {"success": True, "pills": pills}
+
+    @router.post("/api/admin/pills/create")
+    async def admin_create_pill(request: Request):
+        """管理员接口：新增丹药。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        payload = body.get("pill", {})
+        if not isinstance(payload, dict):
+            return JSONResponse({"success": False, "message": "参数 pill 无效"}, status_code=400)
+        result = await engine.admin_create_pill(payload)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    @router.post("/api/admin/pills/update")
+    async def admin_update_pill(request: Request):
+        """管理员接口：更新丹药。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        pill_id = str(body.get("pill_id", "")).strip()
+        payload = body.get("pill", {})
+        if not pill_id:
+            return JSONResponse({"success": False, "message": "缺少 pill_id"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"success": False, "message": "参数 pill 无效"}, status_code=400)
+        result = await engine.admin_update_pill(pill_id, payload)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    @router.post("/api/admin/pills/delete")
+    async def admin_delete_pill(request: Request):
+        """管理员接口：删除丹药。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        pill_id = str(body.get("pill_id", "")).strip()
+        result = await engine.admin_delete_pill(pill_id)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    # ── 材料管理 ────────────────────────────────────────────
+    @router.post("/api/admin/materials/list")
+    async def admin_list_materials(request: Request):
+        """管理员接口：材料列表。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        materials = await engine.admin_list_materials()
+        return {"success": True, "materials": materials}
+
+    @router.post("/api/admin/materials/create")
+    async def admin_create_material(request: Request):
+        """管理员接口：新增材料。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        payload = body.get("material", {})
+        if not isinstance(payload, dict):
+            return JSONResponse({"success": False, "message": "参数 material 无效"}, status_code=400)
+        result = await engine.admin_create_material(payload)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    @router.post("/api/admin/materials/update")
+    async def admin_update_material(request: Request):
+        """管理员接口：更新材料。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        item_id = str(body.get("item_id", "")).strip()
+        payload = body.get("material", {})
+        if not item_id:
+            return JSONResponse({"success": False, "message": "缺少 item_id"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"success": False, "message": "参数 material 无效"}, status_code=400)
+        result = await engine.admin_update_material(item_id, payload)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    @router.post("/api/admin/materials/delete")
+    async def admin_delete_material(request: Request):
+        """管理员接口：删除材料。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        item_id = str(body.get("item_id", "")).strip()
+        result = await engine.admin_delete_material(item_id)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    # ── 丹方管理 ────────────────────────────────────────────
+    @router.post("/api/admin/pill-recipes/list")
+    async def admin_list_pill_recipes(request: Request):
+        """管理员接口：丹方列表。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        recipes = await engine.admin_list_pill_recipes()
+        return {"success": True, "pill_recipes": recipes}
+
+    @router.post("/api/admin/pill-recipes/create")
+    async def admin_create_pill_recipe(request: Request):
+        """管理员接口：新增丹方。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        payload = body.get("pill_recipe", {})
+        if not isinstance(payload, dict):
+            return JSONResponse({"success": False, "message": "参数 pill_recipe 无效"}, status_code=400)
+        result = await engine.admin_create_pill_recipe(payload)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    @router.post("/api/admin/pill-recipes/update")
+    async def admin_update_pill_recipe(request: Request):
+        """管理员接口：更新丹方。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        recipe_id = str(body.get("recipe_id", "")).strip()
+        payload = body.get("pill_recipe", {})
+        if not recipe_id:
+            return JSONResponse({"success": False, "message": "缺少 recipe_id"}, status_code=400)
+        if not isinstance(payload, dict):
+            return JSONResponse({"success": False, "message": "参数 pill_recipe 无效"}, status_code=400)
+        result = await engine.admin_update_pill_recipe(recipe_id, payload)
+        if not result.get("success"):
+            return JSONResponse(result, status_code=400)
+        return result
+
+    @router.post("/api/admin/pill-recipes/delete")
+    async def admin_delete_pill_recipe(request: Request):
+        """管理员接口：删除丹方。"""
+        body = await request.json()
+        admin_token = str(body.get("admin_token", ""))
+        if not _verify_admin_token(admin_token):
+            return JSONResponse({"success": False, "message": "管理员登录已过期"}, status_code=401)
+        recipe_id = str(body.get("recipe_id", "")).strip()
+        result = await engine.admin_delete_pill_recipe(recipe_id)
         if not result.get("success"):
             return JSONResponse(result, status_code=400)
         return result
@@ -992,7 +1102,6 @@ def create_router(
         weapon_count = len(await engine.admin_list_weapons())
         heart_method_count = len(await engine.admin_list_heart_methods())
         gongfa_count = len(await engine.admin_list_gongfas())
-        scene_count = len(await engine.admin_list_adventure_scenes())
         announcement_count = len(await engine.admin_list_announcements())
         return {
             "success": True,
@@ -1003,7 +1112,6 @@ def create_router(
                 "weapons_total": weapon_count,
                 "heart_methods_total": heart_method_count,
                 "gongfas_total": gongfa_count,
-                "scenes_total": scene_count,
                 "announcements_total": announcement_count,
             },
         }

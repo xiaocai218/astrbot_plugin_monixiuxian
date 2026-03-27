@@ -521,43 +521,6 @@ def render_adventure(data: dict) -> bytes:
     return buf.getvalue()
 
 
-def render_scenes(scenes: list[dict]) -> bytes:
-    """绘制历练场景列表图片。"""
-    categories = {}
-    for s in scenes:
-        cat = s["category"]
-        if cat not in categories:
-            categories[cat] = []
-        categories[cat].append(s["name"])
-
-    # 计算高度：标题 + 每个分类标题 + 每个场景行
-    cat_count = len(categories)
-    total_items = sum(len(v) for v in categories.values())
-    h = 50 + cat_count * 35 + total_items * 22 + 30
-    w = 420
-    img = Image.new("RGB", (w, h), BG_COLOR)
-    draw = ImageDraw.Draw(img)
-
-    _draw_rounded_rect(draw, (10, 10, w - 10, h - 10), CARD_BG, radius=12)
-
-    font_title = _get_font(20)
-    font_cat = _get_font(16)
-    font_item = _get_font(13)
-
-    draw.text((w // 2, 25), "历练场景一览", fill=ACCENT_GOLD, font=font_title, anchor="mt")
-
-    y = 55
-    for cat, names in categories.items():
-        draw.text((30, y), f"【{cat}】", fill=ACCENT_CYAN, font=font_cat)
-        y += 28
-        for name in names:
-            draw.text((50, y), f"· {name}", fill=TEXT_PRIMARY, font=font_item)
-            y += 22
-        y += 5
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
 
 
 # 物品效果文本映射

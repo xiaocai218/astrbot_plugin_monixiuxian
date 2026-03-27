@@ -162,18 +162,27 @@ class DataManager:
                 breakthrough_rate REAL DEFAULT 1.0,
                 death_rate        REAL DEFAULT 0.0,
                 sub_dao_yun_costs TEXT DEFAULT '',
-                breakthrough_dao_yun_cost INTEGER DEFAULT 0
+                breakthrough_dao_yun_cost INTEGER DEFAULT 0,
+                dao_yun_base_rate REAL DEFAULT 0.0,
+                dao_yun_per_sub_realm REAL DEFAULT 0.0,
+                dao_yun_rate_initialized INTEGER DEFAULT 0
             )
         """)
-        # 历练场景表
-        await self.db.execute("""
-            CREATE TABLE IF NOT EXISTS adventure_scenes (
-                id          INTEGER PRIMARY KEY,
-                category    TEXT NOT NULL,
-                name        TEXT NOT NULL,
-                description TEXT NOT NULL
+        # 迁移：新版道韵产出字段（已存在的表可能没有这两列）
+        try:
+            await self.db.execute(
+                "ALTER TABLE realms ADD COLUMN dao_yun_base_rate REAL DEFAULT 0.0"
             )
-        """)
+        except Exception:
+            pass
+        try:
+            await self.db.execute(
+                "ALTER TABLE realms ADD COLUMN dao_yun_per_sub_realm REAL DEFAULT 0.0"
+            )
+        except Exception:
+            pass
+        # 移除已废弃的历练场景表
+        await self.db.execute("DROP TABLE IF EXISTS adventure_scenes")
         # 心法定义独立表（可在数据库中独立维护）
         await self.db.execute("""
             CREATE TABLE IF NOT EXISTS heart_methods (
@@ -295,6 +304,48 @@ class DataManager:
                 recycle_price INTEGER DEFAULT 1000,
                 lingqi_cost   INTEGER DEFAULT 0,
                 enabled       INTEGER DEFAULT 1
+            )
+        """)
+        # 丹药定义独立表（管理员可维护）
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS pills (
+                pill_id           TEXT PRIMARY KEY,
+                name              TEXT NOT NULL,
+                tier              INTEGER NOT NULL DEFAULT 0,
+                grade             INTEGER NOT NULL DEFAULT 0,
+                category          TEXT NOT NULL DEFAULT 'healing',
+                description       TEXT DEFAULT '',
+                price             INTEGER NOT NULL DEFAULT 0,
+                effects           TEXT NOT NULL DEFAULT '{}',
+                is_temp           INTEGER NOT NULL DEFAULT 0,
+                duration          INTEGER NOT NULL DEFAULT 0,
+                side_effects      TEXT NOT NULL DEFAULT '{}',
+                side_effect_desc  TEXT DEFAULT '',
+                enabled           INTEGER NOT NULL DEFAULT 1
+            )
+        """)
+        # 材料定义独立表（管理员可维护）
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS materials (
+                item_id         TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                rarity          INTEGER NOT NULL DEFAULT 0,
+                category        TEXT NOT NULL DEFAULT 'herb',
+                source          TEXT DEFAULT '',
+                description     TEXT DEFAULT '',
+                recycle_price   INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        # 丹方/炼丹配方表
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS pill_recipes (
+                recipe_id           TEXT PRIMARY KEY,
+                pill_id             TEXT NOT NULL,
+                grade               INTEGER NOT NULL DEFAULT 0,
+                main_material       TEXT NOT NULL DEFAULT '{}',
+                auxiliary_material  TEXT NOT NULL DEFAULT '{}',
+                catalyst            TEXT NOT NULL DEFAULT '{}',
+                forming_material    TEXT NOT NULL DEFAULT '{}'
             )
         """)
         # 世界频道消息表
@@ -430,12 +481,11 @@ class DataManager:
         # 境界表迁移：新增道韵字段
         await self._alter_add_column("realms", "sub_dao_yun_costs", "TEXT DEFAULT ''")
         await self._alter_add_column("realms", "breakthrough_dao_yun_cost", "INTEGER DEFAULT 0")
+        await self._alter_add_column("realms", "dao_yun_rate_initialized", "INTEGER DEFAULT 0")
         # 境界表首次创建时写入一份默认数据；之后完全以数据库内容为准
         if not realms_table_exists:
             await self._seed_realms()
         await self._backfill_realm_dao_yun_defaults()
-        # 填充场景数据
-        await self._seed_adventure_scenes()
         # 填充心法定义（仅补齐缺失，不覆盖已有配置）
         await self._seed_heart_methods()
         # 填充装备定义（仅补齐缺失，不覆盖已有配置）
@@ -443,6 +493,12 @@ class DataManager:
         # 填充功法定义（仅补齐缺失，不覆盖已有配置）
         await self._seed_gongfas()
         await self._sync_gongfa_lingqi_costs()
+        # 填充丹药定义（仅补齐缺失，不覆盖已有配置）
+        await self._seed_pills()
+        # 填充材料定义（仅补齐缺失，不覆盖已有配置）
+        await self._seed_materials()
+        # 填充丹方定义（仅补齐缺失）
+        await self._seed_pill_recipes()
 
     async def _migrate_json_data(self):
         """若存在旧 players.json 且数据库为空，则自动迁移。"""
@@ -757,6 +813,9 @@ class DataManager:
                 float(cfg.get("death_rate", 0.0)),
                 _json.dumps(sub_costs) if sub_costs else "",
                 int(cfg.get("breakthrough_dao_yun_cost", 0)),
+                float(cfg.get("dao_yun_base_rate", 0.0)),
+                float(cfg.get("dao_yun_per_sub_realm", 0.0)),
+                1,
             ))
         await self.db.executemany(
             """
@@ -765,15 +824,17 @@ class DataManager:
                 exp_to_next, sub_exp_to_next,
                 base_hp, base_attack, base_defense, base_lingqi,
                 breakthrough_rate, death_rate,
-                sub_dao_yun_costs, breakthrough_dao_yun_cost
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sub_dao_yun_costs, breakthrough_dao_yun_cost,
+                dao_yun_base_rate, dao_yun_per_sub_realm,
+                dao_yun_rate_initialized
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
         await self.db.commit()
 
     async def _backfill_realm_dao_yun_defaults(self):
-        """为旧 realms 表补齐新增的道韵字段默认值，不覆盖已编辑数据。"""
+        """为旧 realms 表补齐兼容状态，不覆盖已编辑数据。"""
         import json as _json
         from .constants import REALM_CONFIG as DEFAULT_REALM_CONFIG
 
@@ -795,8 +856,36 @@ class DataManager:
             )
             if (cur.rowcount or 0) > 0:
                 changed = True
+            cur = await self.db.execute(
+                """
+                UPDATE realms
+                SET dao_yun_rate_initialized = 1
+                WHERE level = ?
+                  AND COALESCE(dao_yun_rate_initialized, 0) = 0
+                  AND (
+                    COALESCE(dao_yun_base_rate, 0.0) > 0
+                    OR COALESCE(dao_yun_per_sub_realm, 0.0) > 0
+                  )
+                """,
+                (int(level),),
+            )
+            if (cur.rowcount or 0) > 0:
+                changed = True
         if changed:
             await self.db.commit()
+
+    @staticmethod
+    def _resolve_realm_dao_yun_rates(row: Any, default_cfg: dict[str, Any]) -> tuple[float, float, bool]:
+        stored_base = float(row["dao_yun_base_rate"] or 0.0)
+        stored_per_sub = float(row["dao_yun_per_sub_realm"] or 0.0)
+        initialized = bool(int(row["dao_yun_rate_initialized"] or 0))
+        if initialized or stored_base > 0 or stored_per_sub > 0:
+            return stored_base, stored_per_sub, initialized
+        return (
+            float(default_cfg.get("dao_yun_base_rate", 0.0)),
+            float(default_cfg.get("dao_yun_per_sub_realm", 0.0)),
+            initialized,
+        )
 
     async def load_realms(self) -> dict[int, dict]:
         """加载境界配置（独立表 -> 运行时 REALM_CONFIG）。"""
@@ -811,7 +900,9 @@ class DataManager:
                        exp_to_next, sub_exp_to_next,
                        base_hp, base_attack, base_defense, base_lingqi,
                        breakthrough_rate, death_rate,
-                       sub_dao_yun_costs, breakthrough_dao_yun_cost
+                       sub_dao_yun_costs, breakthrough_dao_yun_cost,
+                       dao_yun_base_rate, dao_yun_per_sub_realm,
+                       dao_yun_rate_initialized
                 FROM realms
                 ORDER BY level ASC
                 """
@@ -841,12 +932,25 @@ class DataManager:
                     bt_cost = int(row["breakthrough_dao_yun_cost"] or 0)
                     if bt_cost > 0:
                         cfg["breakthrough_dao_yun_cost"] = bt_cost
+                    default_cfg = DEFAULT_REALM_CONFIG.get(level, {})
+                    base_rate, per_sub, dao_initialized = self._resolve_realm_dao_yun_rates(row, default_cfg)
+                    if (
+                        dao_initialized
+                        or base_rate > 0
+                        or per_sub > 0
+                        or "dao_yun_base_rate" in default_cfg
+                        or "dao_yun_per_sub_realm" in default_cfg
+                    ):
+                        cfg["dao_yun_base_rate"] = base_rate
+                        cfg["dao_yun_per_sub_realm"] = per_sub
                     realms[level] = cfg
         except Exception:
             return dict(DEFAULT_REALM_CONFIG)
         return realms if realms else dict(DEFAULT_REALM_CONFIG)
 
     async def admin_list_realms(self) -> list[dict[str, Any]]:
+        from .constants import REALM_CONFIG as DEFAULT_REALM_CONFIG
+
         result = []
         async with self.db.execute(
             """
@@ -854,13 +958,21 @@ class DataManager:
                    exp_to_next, sub_exp_to_next,
                    base_hp, base_attack, base_defense, base_lingqi,
                    breakthrough_rate, death_rate,
-                   sub_dao_yun_costs, breakthrough_dao_yun_cost
+                   sub_dao_yun_costs, breakthrough_dao_yun_cost,
+                   dao_yun_base_rate, dao_yun_per_sub_realm,
+                   dao_yun_rate_initialized
             FROM realms
             ORDER BY level ASC
             """
         ) as cur:
             async for row in cur:
-                result.append(dict(row))
+                item = dict(row)
+                default_cfg = DEFAULT_REALM_CONFIG.get(int(item["level"]), {})
+                base_rate, per_sub, _ = self._resolve_realm_dao_yun_rates(item, default_cfg)
+                item["dao_yun_base_rate"] = base_rate
+                item["dao_yun_per_sub_realm"] = per_sub
+                item.pop("dao_yun_rate_initialized", None)
+                result.append(item)
         return result
 
     async def admin_has_realm_name(self, name: str, exclude_level: int | None = None) -> bool:
@@ -883,8 +995,10 @@ class DataManager:
                 exp_to_next, sub_exp_to_next,
                 base_hp, base_attack, base_defense, base_lingqi,
                 breakthrough_rate, death_rate,
-                sub_dao_yun_costs, breakthrough_dao_yun_cost
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                sub_dao_yun_costs, breakthrough_dao_yun_cost,
+                dao_yun_base_rate, dao_yun_per_sub_realm,
+                dao_yun_rate_initialized
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(data["level"]),
@@ -901,6 +1015,9 @@ class DataManager:
                 float(data.get("death_rate", 0.0)),
                 str(data.get("sub_dao_yun_costs", "")),
                 int(data.get("breakthrough_dao_yun_cost", 0)),
+                float(data.get("dao_yun_base_rate", 0.0)),
+                float(data.get("dao_yun_per_sub_realm", 0.0)),
+                1,
             ),
         )
         await self.db.commit()
@@ -914,7 +1031,9 @@ class DataManager:
                 exp_to_next = ?, sub_exp_to_next = ?,
                 base_hp = ?, base_attack = ?, base_defense = ?, base_lingqi = ?,
                 breakthrough_rate = ?, death_rate = ?,
-                sub_dao_yun_costs = ?, breakthrough_dao_yun_cost = ?
+                sub_dao_yun_costs = ?, breakthrough_dao_yun_cost = ?,
+                dao_yun_base_rate = ?, dao_yun_per_sub_realm = ?,
+                dao_yun_rate_initialized = 1
             WHERE level = ?
             """,
             (
@@ -931,6 +1050,8 @@ class DataManager:
                 float(data.get("death_rate", 0.0)),
                 str(data.get("sub_dao_yun_costs", "")),
                 int(data.get("breakthrough_dao_yun_cost", 0)),
+                float(data.get("dao_yun_base_rate", 0.0)),
+                float(data.get("dao_yun_per_sub_realm", 0.0)),
                 level,
             ),
         )
@@ -954,64 +1075,6 @@ class DataManager:
             async for row in cur:
                 result[int(row["level"])] = row["name"]
         return result
-
-    async def _seed_adventure_scenes(self):
-        """若场景表为空，填充40条历练场景数据。"""
-        async with self.db.execute("SELECT COUNT(*) FROM adventure_scenes") as cur:
-            row = await cur.fetchone()
-            if row[0] > 0:
-                return
-        scenes = [
-            # 魔兽森林
-            ("魔兽森林", "幽暗密林", "古树参天，妖兽潜伏于暗处"),
-            ("魔兽森林", "血月狼谷", "狼嚎震天，血月映照下凶兽成群"),
-            ("魔兽森林", "毒瘴沼泽", "瘴气弥漫，毒虫遍地横行"),
-            ("魔兽森林", "万蛇巢穴", "蛇影重重，巨蟒盘踞洞中"),
-            ("魔兽森林", "熊罴险岭", "巨熊咆哮，山石崩裂"),
-            ("魔兽森林", "灵猿古树", "灵猿据守千年古木"),
-            ("魔兽森林", "火鸦荒原", "火鸦群起，烈焰灼天"),
-            ("魔兽森林", "寒冰兽窟", "冰封洞窟中蛰伏着远古凶兽"),
-            ("魔兽森林", "雷鹰崖壁", "崖顶雷鹰振翅带起雷暴"),
-            ("魔兽森林", "九尾狐林", "迷雾中传来蛊惑人心的狐鸣"),
-            # 秘境探险
-            ("秘境探险", "上古遗迹", "断壁残垣中隐藏着远古秘宝"),
-            ("秘境探险", "迷幻阵法", "虚实难辨，一步踏错万劫不复"),
-            ("秘境探险", "地下灵脉", "灵气汹涌的地底矿脉"),
-            ("秘境探险", "沉没宫殿", "水下宫殿中封印着未知力量"),
-            ("秘境探险", "时空裂隙", "时空紊乱的裂缝中危机四伏"),
-            ("秘境探险", "藏经阁废墟", "残破典籍中暗藏逆天功法"),
-            ("秘境探险", "炼丹古洞", "古修士遗留的炼丹福地"),
-            ("秘境探险", "星辰迷宫", "星光指引下的层层考验"),
-            ("秘境探险", "天机棋盘", "以命为棋，一局定生死"),
-            ("秘境探险", "虚空秘境", "虚空中飘浮的远古修炼之地"),
-            # 除魔卫道
-            ("除魔卫道", "魔修巢穴", "魔修聚集的阴暗地窟"),
-            ("除魔卫道", "血祭祭坛", "邪修正在进行血祭仪式"),
-            ("除魔卫道", "鬼蜮幽都", "阴气冲天，厉鬼横行"),
-            ("除魔卫道", "堕落仙山", "被魔气侵蚀的昔日仙门"),
-            ("除魔卫道", "尸傀战场", "操控尸傀的邪修正在为祸"),
-            ("除魔卫道", "妖邪峡谷", "妖邪盘踞的深幽峡谷"),
-            ("除魔卫道", "噬魂阵法", "以魂为引的禁忌大阵"),
-            ("除魔卫道", "天魔分身", "天魔降临世间的一缕分身"),
-            ("除魔卫道", "邪道拍卖", "暗中交易违禁之物的黑市"),
-            ("除魔卫道", "魔道入侵", "魔道大军入侵，需奋力抵御"),
-            # 红尘历练
-            ("红尘历练", "繁华集市", "凡人集市中暗流涌动"),
-            ("红尘历练", "仙门试炼", "仙门弟子间的切磋比试"),
-            ("红尘历练", "悬赏猎杀", "接取悬赏任务追捕通缉犯"),
-            ("红尘历练", "护送商队", "护送灵材商队穿越危险地带"),
-            ("红尘历练", "擂台争霸", "修仙界武斗擂台赛"),
-            ("红尘历练", "奇遇仙缘", "偶遇高人，机缘降临"),
-            ("红尘历练", "山贼劫道", "路遇山贼拦路打劫"),
-            ("红尘历练", "江湖恩怨", "卷入江湖恩怨纷争"),
-            ("红尘历练", "天灾降临", "天降异象，妖兽暴动"),
-            ("红尘历练", "论道大会", "各路修士齐聚论道"),
-        ]
-        await self.db.executemany(
-            "INSERT INTO adventure_scenes (category, name, description) VALUES (?, ?, ?)",
-            scenes,
-        )
-        await self.db.commit()
 
     async def _seed_heart_methods(self):
         """若心法表为空或有缺失，按代码内置定义补齐。"""
@@ -1179,6 +1242,140 @@ class DataManager:
         )
         await self.db.commit()
 
+    async def _seed_pills(self):
+        """若丹药表为空或有缺失，按代码内置定义补齐。"""
+        import json as _json
+        from .pills import PILL_REGISTRY as DEFAULT_PILL_REGISTRY
+
+        existing = set()
+        async with self.db.execute("SELECT pill_id FROM pills") as cur:
+            async for row in cur:
+                existing.add(row[0])
+
+        rows = []
+        for pill in DEFAULT_PILL_REGISTRY.values():
+            if pill.pill_id in existing:
+                continue
+            rows.append((
+                pill.pill_id,
+                pill.name,
+                int(pill.tier),
+                int(pill.grade),
+                pill.category,
+                pill.description,
+                int(pill.price),
+                _json.dumps(dict(pill.effects), ensure_ascii=False),
+                1 if pill.is_temp else 0,
+                int(pill.duration or 0),
+                _json.dumps(dict(pill.side_effects), ensure_ascii=False),
+                pill.side_effect_desc or "",
+                1,
+            ))
+
+        if not rows:
+            return
+
+        await self.db.executemany(
+            """
+            INSERT OR IGNORE INTO pills (
+                pill_id, name, tier, grade, category, description, price,
+                effects, is_temp, duration, side_effects, side_effect_desc, enabled
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        await self.db.commit()
+
+    # ── 种子数据：材料 ──────────────────────────────────────
+
+    async def _seed_materials(self):
+        """若材料表为空或有缺失，按代码内置默认数据补齐。"""
+        from .constants import _DEFAULT_MATERIALS
+
+        existing = set()
+        async with self.db.execute("SELECT item_id FROM materials") as cur:
+            async for row in cur:
+                existing.add(row[0])
+
+        rows = []
+        for mat in _DEFAULT_MATERIALS.values():
+            if mat.item_id in existing:
+                continue
+            rows.append((
+                mat.item_id,
+                mat.name,
+                int(mat.rarity),
+                mat.category,
+                mat.source,
+                mat.description,
+                int(mat.recycle_price),
+            ))
+
+        if not rows:
+            return
+
+        await self.db.executemany(
+            """
+            INSERT OR IGNORE INTO materials (
+                item_id, name, rarity, category, source, description, recycle_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        await self.db.commit()
+
+    # ── 种子数据：丹方 ──────────────────────────────────────
+
+    async def _seed_pill_recipes(self):
+        """若丹方表为空或有缺失，按代码内置默认数据补齐（5种特殊丹药）；同时修正已知的错误 pill_id。"""
+        from .constants import _DEFAULT_PILL_RECIPES
+        import json as _json
+
+        # 修正已知的错误 pill_id（数据库中可能存了旧数据）
+        known_fixes = {
+            "pill_special_rebirth": "pill_special_reborn",
+            "pill_special_formless": "pill_special_wuxiang",
+        }
+        for old_id, new_id in known_fixes.items():
+            await self.db.execute(
+                "UPDATE pill_recipes SET pill_id = ? WHERE pill_id = ?",
+                (new_id, old_id),
+            )
+        await self.db.commit()
+
+        existing = set()
+        async with self.db.execute("SELECT recipe_id FROM pill_recipes") as cur:
+            async for row in cur:
+                existing.add(row[0])
+
+        rows = []
+        for recipe in _DEFAULT_PILL_RECIPES.values():
+            if recipe.recipe_id in existing:
+                continue
+            rows.append((
+                recipe.recipe_id,
+                recipe.pill_id,
+                int(recipe.grade),
+                _json.dumps({"item_id": recipe.main_material.item_id, "qty": recipe.main_material.qty}),
+                _json.dumps({"item_id": recipe.auxiliary_material.item_id, "qty": recipe.auxiliary_material.qty}),
+                _json.dumps({"item_id": recipe.catalyst.item_id, "qty": recipe.catalyst.qty}),
+                _json.dumps({"item_id": recipe.forming_material.item_id, "qty": recipe.forming_material.qty}),
+            ))
+
+        if not rows:
+            return
+
+        await self.db.executemany(
+            """
+            INSERT OR IGNORE INTO pill_recipes (
+                recipe_id, pill_id, grade,
+                main_material, auxiliary_material, catalyst, forming_material
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        await self.db.commit()
+
     async def load_gongfas(self) -> dict:
         """加载启用的功法定义（独立表 -> 运行时）。"""
         from .constants import GONGFA_REGISTRY, GongfaDef, calc_gongfa_lingqi_cost
@@ -1225,6 +1422,44 @@ class DataManager:
         except Exception:
             return dict(GONGFA_REGISTRY)
         return gongfas
+
+    async def load_pills(self) -> dict:
+        """加载启用的丹药定义（独立表 -> 运行时）。"""
+        import json as _json
+        from .pills import PILL_REGISTRY as DEFAULT_PILL_REGISTRY, PillDef
+
+        pills = {}
+        try:
+            async with self.db.execute(
+                """
+                SELECT pill_id, name, tier, grade, category, description, price,
+                       effects, is_temp, duration, side_effects, side_effect_desc
+                FROM pills
+                WHERE enabled = 1
+                ORDER BY tier ASC, grade ASC, pill_id ASC
+                """
+            ) as cur:
+                async for row in cur:
+                    pill_id = row["pill_id"]
+                    effects = _json.loads(row["effects"] or "{}")
+                    side_effects = _json.loads(row["side_effects"] or "{}")
+                    pills[pill_id] = PillDef(
+                        pill_id=pill_id,
+                        name=row["name"],
+                        tier=int(row["tier"] or 0),
+                        grade=int(row["grade"] or 0),
+                        category=row["category"] or "healing",
+                        description=row["description"] or "",
+                        price=int(row["price"] or 0),
+                        effects=effects if isinstance(effects, dict) else {},
+                        is_temp=bool(int(row["is_temp"] or 0)),
+                        duration=int(row["duration"] or 0),
+                        side_effects=side_effects if isinstance(side_effects, dict) else {},
+                        side_effect_desc=row["side_effect_desc"] or "",
+                    )
+        except Exception:
+            return dict(DEFAULT_PILL_REGISTRY)
+        return pills if pills else dict(DEFAULT_PILL_REGISTRY)
 
     async def admin_list_gongfas(self) -> list[dict[str, Any]]:
         result = []
@@ -1341,72 +1576,310 @@ class DataManager:
         await self.db.commit()
         return (cur.rowcount or 0) > 0
 
-    async def get_adventure_scenes(self) -> list[dict]:
-        """获取所有历练场景。"""
+    async def admin_list_pills(self) -> list[dict[str, Any]]:
         result = []
         async with self.db.execute(
-            "SELECT id, category, name, description FROM adventure_scenes ORDER BY id"
+            """
+            SELECT pill_id, name, tier, grade, category, description, price,
+                   effects, is_temp, duration, side_effects, side_effect_desc, enabled
+            FROM pills
+            ORDER BY tier ASC, grade ASC, pill_id ASC
+            """
         ) as cur:
             async for row in cur:
-                result.append({
-                    "id": row[0], "category": row[1],
-                    "name": row[2], "description": row[3],
-                })
+                result.append(dict(row))
         return result
 
-    async def get_random_scene(self) -> Optional[dict]:
-        """随机获取一个历练场景。"""
-        async with self.db.execute(
-            "SELECT id, category, name, description FROM adventure_scenes ORDER BY RANDOM() LIMIT 1"
-        ) as cur:
-            row = await cur.fetchone()
-            if row:
-                return {"id": row[0], "category": row[1], "name": row[2], "description": row[3]}
-        return None
-
-    # ==================== 管理员 CRUD：历练场景 ====================
-
-    async def admin_list_adventure_scenes(self) -> list[dict[str, Any]]:
-        return await self.get_adventure_scenes()
-
-    async def admin_has_adventure_scene_name(self, name: str) -> bool:
-        """检查历练场景名称是否已存在（不区分大小写，忽略首尾空白）。"""
+    async def admin_has_pill_name(self, name: str) -> bool:
         async with self.db.execute(
             """
             SELECT 1
-            FROM adventure_scenes
+            FROM pills
             WHERE LOWER(TRIM(name)) = LOWER(TRIM(?))
             LIMIT 1
             """,
             (name,),
         ) as cur:
-            row = await cur.fetchone()
-            return row is not None
+            return (await cur.fetchone()) is not None
 
-    async def admin_create_adventure_scene(self, category: str, name: str, description: str) -> int:
-        cur = await self.db.execute(
-            "INSERT INTO adventure_scenes (category, name, description) VALUES (?, ?, ?)",
-            (category, name, description),
-        )
-        await self.db.commit()
-        return int(cur.lastrowid or 0)
+    async def admin_create_pill(self, data: dict[str, Any]) -> bool:
+        import json as _json
 
-    async def admin_update_adventure_scene(self, scene_id: int, category: str, name: str, description: str) -> bool:
         cur = await self.db.execute(
             """
-            UPDATE adventure_scenes
-            SET category = ?, name = ?, description = ?
-            WHERE id = ?
+            INSERT OR IGNORE INTO pills (
+                pill_id, name, tier, grade, category, description, price,
+                effects, is_temp, duration, side_effects, side_effect_desc, enabled
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (category, name, description, scene_id),
+            (
+                data["pill_id"],
+                data["name"],
+                int(data["tier"]),
+                int(data["grade"]),
+                str(data.get("category", "healing")),
+                str(data.get("description", "")),
+                int(data.get("price", 0)),
+                _json.dumps(data.get("effects", {}), ensure_ascii=False),
+                int(data.get("is_temp", 0)),
+                int(data.get("duration", 0)),
+                _json.dumps(data.get("side_effects", {}), ensure_ascii=False),
+                str(data.get("side_effect_desc", "")),
+                int(data.get("enabled", 1)),
+            ),
         )
         await self.db.commit()
         return (cur.rowcount or 0) > 0
 
-    async def admin_delete_adventure_scene(self, scene_id: int) -> bool:
+    async def admin_update_pill(self, pill_id: str, data: dict[str, Any]) -> bool:
+        import json as _json
+
         cur = await self.db.execute(
-            "DELETE FROM adventure_scenes WHERE id = ?",
-            (scene_id,),
+            """
+            UPDATE pills
+            SET name = ?, tier = ?, grade = ?, category = ?, description = ?, price = ?,
+                effects = ?, is_temp = ?, duration = ?, side_effects = ?, side_effect_desc = ?, enabled = ?
+            WHERE pill_id = ?
+            """,
+            (
+                data["name"],
+                int(data["tier"]),
+                int(data["grade"]),
+                str(data.get("category", "healing")),
+                str(data.get("description", "")),
+                int(data.get("price", 0)),
+                _json.dumps(data.get("effects", {}), ensure_ascii=False),
+                int(data.get("is_temp", 0)),
+                int(data.get("duration", 0)),
+                _json.dumps(data.get("side_effects", {}), ensure_ascii=False),
+                str(data.get("side_effect_desc", "")),
+                int(data.get("enabled", 1)),
+                pill_id,
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_delete_pill(self, pill_id: str) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM pills WHERE pill_id = ?",
+            (pill_id,),
+        )
+        if (cur.rowcount or 0) > 0:
+            await self.db.execute(
+                "DELETE FROM pill_recipes WHERE pill_id = ?",
+                (pill_id,),
+            )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    # ── 管理员 CRUD：材料 ──────────────────────────────────
+
+    async def load_materials(self) -> dict:
+        """加载材料定义（独立表 -> 运行时 MATERIAL_REGISTRY）。"""
+        from .constants import MaterialDef, _DEFAULT_MATERIALS
+
+        materials = {}
+        try:
+            async with self.db.execute(
+                """
+                SELECT item_id, name, rarity, category, source, description, recycle_price
+                FROM materials
+                ORDER BY rarity ASC, category ASC, item_id ASC
+                """
+            ) as cur:
+                async for row in cur:
+                    materials[row["item_id"]] = MaterialDef(
+                        item_id=row["item_id"],
+                        name=row["name"],
+                        rarity=int(row["rarity"] or 0),
+                        category=row["category"] or "herb",
+                        source=row["source"] or "",
+                        description=row["description"] or "",
+                        recycle_price=int(row["recycle_price"] or 0),
+                    )
+        except Exception:
+            return dict(_DEFAULT_MATERIALS)
+        return materials
+
+    async def admin_list_materials(self) -> list[dict[str, Any]]:
+        result = []
+        async with self.db.execute(
+            """
+            SELECT item_id, name, rarity, category, source, description, recycle_price
+            FROM materials
+            ORDER BY rarity ASC, category ASC, item_id ASC
+            """
+        ) as cur:
+            async for row in cur:
+                result.append(dict(row))
+        return result
+
+    async def admin_has_material_name(self, name: str) -> bool:
+        async with self.db.execute(
+            "SELECT 1 FROM materials WHERE LOWER(TRIM(name)) = LOWER(TRIM(?)) LIMIT 1",
+            (name,),
+        ) as cur:
+            return (await cur.fetchone()) is not None
+
+    async def admin_create_material(self, data: dict[str, Any]) -> bool:
+        cur = await self.db.execute(
+            """
+            INSERT OR IGNORE INTO materials (
+                item_id, name, rarity, category, source, description, recycle_price
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["item_id"],
+                data["name"],
+                int(data.get("rarity", 0)),
+                str(data.get("category", "herb")),
+                str(data.get("source", "")),
+                str(data.get("description", "")),
+                int(data.get("recycle_price", 0)),
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_update_material(self, item_id: str, data: dict[str, Any]) -> bool:
+        cur = await self.db.execute(
+            """
+            UPDATE materials
+            SET name = ?, rarity = ?, category = ?, source = ?, description = ?, recycle_price = ?
+            WHERE item_id = ?
+            """,
+            (
+                data["name"],
+                int(data.get("rarity", 0)),
+                str(data.get("category", "herb")),
+                str(data.get("source", "")),
+                str(data.get("description", "")),
+                int(data.get("recycle_price", 0)),
+                item_id,
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_delete_material(self, item_id: str) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM materials WHERE item_id = ?",
+            (item_id,),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    # ── 管理员 CRUD：丹方 ──────────────────────────────────
+
+    async def load_pill_recipes(self) -> dict:
+        """加载丹方定义（独立表 -> 运行时 PILL_RECIPE_REGISTRY）。"""
+        import json as _json
+        from .constants import PillRecipeDef, PillRecipeMaterial, _DEFAULT_PILL_RECIPES
+
+        recipes = {}
+        try:
+            async with self.db.execute(
+                """
+                SELECT recipe_id, pill_id, grade,
+                       main_material, auxiliary_material, catalyst, forming_material
+                FROM pill_recipes
+                ORDER BY pill_id ASC, grade ASC
+                """
+            ) as cur:
+                async for row in cur:
+                    def _mat(j: dict) -> PillRecipeMaterial:
+                        d = _json.loads(j) if isinstance(j, str) else (j or {})
+                        return PillRecipeMaterial(item_id=d.get("item_id", ""), qty=d.get("qty", 1))
+                    recipes[row["recipe_id"]] = PillRecipeDef(
+                        recipe_id=row["recipe_id"],
+                        pill_id=row["pill_id"],
+                        grade=int(row["grade"] or 0),
+                        main_material=_mat(row["main_material"]),
+                        auxiliary_material=_mat(row["auxiliary_material"]),
+                        catalyst=_mat(row["catalyst"]),
+                        forming_material=_mat(row["forming_material"]),
+                    )
+        except Exception:
+            return dict(_DEFAULT_PILL_RECIPES)
+        return recipes
+
+    async def admin_list_pill_recipes(self) -> list[dict[str, Any]]:
+        import json as _json
+        result = []
+        async with self.db.execute(
+            """
+            SELECT recipe_id, pill_id, grade,
+                   main_material, auxiliary_material, catalyst, forming_material
+            FROM pill_recipes
+            ORDER BY pill_id ASC, grade ASC
+            """
+        ) as cur:
+            async for row in cur:
+                item = dict(row)
+                item["main_material"] = _json.loads(row["main_material"] or "{}")
+                item["auxiliary_material"] = _json.loads(row["auxiliary_material"] or "{}")
+                item["catalyst"] = _json.loads(row["catalyst"] or "{}")
+                item["forming_material"] = _json.loads(row["forming_material"] or "{}")
+                result.append(item)
+        return result
+
+    async def admin_has_pill_recipe(self, pill_id: str, grade: int) -> bool:
+        async with self.db.execute(
+            "SELECT 1 FROM pill_recipes WHERE pill_id = ? AND grade = ? LIMIT 1",
+            (pill_id, grade),
+        ) as cur:
+            return (await cur.fetchone()) is not None
+
+    async def admin_create_pill_recipe(self, data: dict[str, Any]) -> bool:
+        import json as _json
+        cur = await self.db.execute(
+            """
+            INSERT OR IGNORE INTO pill_recipes (
+                recipe_id, pill_id, grade,
+                main_material, auxiliary_material, catalyst, forming_material
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                data["recipe_id"],
+                data["pill_id"],
+                int(data.get("grade", 0)),
+                _json.dumps(data.get("main_material", {})),
+                _json.dumps(data.get("auxiliary_material", {})),
+                _json.dumps(data.get("catalyst", {})),
+                _json.dumps(data.get("forming_material", {})),
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_update_pill_recipe(self, recipe_id: str, data: dict[str, Any]) -> bool:
+        import json as _json
+        cur = await self.db.execute(
+            """
+            UPDATE pill_recipes
+            SET pill_id = ?, grade = ?,
+                main_material = ?, auxiliary_material = ?,
+                catalyst = ?, forming_material = ?
+            WHERE recipe_id = ?
+            """,
+            (
+                data["pill_id"],
+                int(data.get("grade", 0)),
+                _json.dumps(data.get("main_material", {})),
+                _json.dumps(data.get("auxiliary_material", {})),
+                _json.dumps(data.get("catalyst", {})),
+                _json.dumps(data.get("forming_material", {})),
+                recipe_id,
+            ),
+        )
+        await self.db.commit()
+        return (cur.rowcount or 0) > 0
+
+    async def admin_delete_pill_recipe(self, recipe_id: str) -> bool:
+        cur = await self.db.execute(
+            "DELETE FROM pill_recipes WHERE recipe_id = ?",
+            (recipe_id,),
         )
         await self.db.commit()
         return (cur.rowcount or 0) > 0

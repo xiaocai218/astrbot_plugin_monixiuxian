@@ -111,6 +111,8 @@ REALM_CONFIG: dict[int, dict] = {
         "death_rate": 0.10,
         "sub_dao_yun_costs": [50, 80, 100, 120],
         "breakthrough_dao_yun_cost": 120,
+        "dao_yun_base_rate": 0.10,      # 化神初期基础道韵产出概率
+        "dao_yun_per_sub_realm": 0.05,  # 每个小境界 +5%
     },
     RealmLevel.VOID_MERGE: {
         "name": "合虚期",
@@ -126,6 +128,8 @@ REALM_CONFIG: dict[int, dict] = {
         "death_rate": 0.15,
         "sub_dao_yun_costs": [240, 260, 280, 300],
         "breakthrough_dao_yun_cost": 300,
+        "dao_yun_base_rate": 0.10,
+        "dao_yun_per_sub_realm": 0.05,
     },
     RealmLevel.TRIBULATION: {
         "name": "渡劫期",
@@ -141,6 +145,8 @@ REALM_CONFIG: dict[int, dict] = {
         "death_rate": 0.20,
         "sub_dao_yun_costs": [600, 640, 680, 720],
         "breakthrough_dao_yun_cost": 720,
+        "dao_yun_base_rate": 0.10,
+        "dao_yun_per_sub_realm": 0.05,
     },
     RealmLevel.MAHAYANA: {
         "name": "大乘期",
@@ -156,6 +162,8 @@ REALM_CONFIG: dict[int, dict] = {
         "death_rate": 0.30,
         "sub_dao_yun_costs": [1440, 1520, 1600, 1680],
         "breakthrough_dao_yun_cost": 1680,
+        "dao_yun_base_rate": 0.10,
+        "dao_yun_per_sub_realm": 0.05,
     },
 }
 
@@ -216,8 +224,27 @@ ITEM_REGISTRY: dict[str, ItemDef] = {
 }
 
 # ── 注册 200 种新丹药到 ITEM_REGISTRY ──
-from .pills import get_pill_item_defs as _get_pill_item_defs  # noqa: E402
+from .pills import PILL_REGISTRY, PILL_TIER_NAMES, PillDef, set_pill_registry as _set_runtime_pill_registry, get_pill_item_defs as _get_pill_item_defs  # noqa: E402
 ITEM_REGISTRY.update(_get_pill_item_defs())
+
+
+def _refresh_pill_items():
+    """根据当前 PILL_REGISTRY 同步刷新丹药物品定义。"""
+    new_items = _get_pill_item_defs()
+    ITEM_REGISTRY.update(new_items)
+    stale = [
+        item_id for item_id in list(ITEM_REGISTRY.keys())
+        if item_id.startswith("pill_") and item_id not in new_items
+    ]
+    for item_id in stale:
+        ITEM_REGISTRY.pop(item_id, None)
+
+
+def set_pill_registry(pills: dict[str, PillDef]):
+    """替换丹药注册表（供数据库加载后同步到运行时）。"""
+    with _registry_lock:
+        _set_runtime_pill_registry(pills)
+        _refresh_pill_items()
 
 # 签到丹药权重表：(item_id, weight)
 CHECKIN_PILL_WEIGHTS: list[tuple[str, int]] = [
@@ -1276,6 +1303,437 @@ def get_total_gongfa_bonus(player) -> dict:
 _refresh_gongfa_scroll_items()
 
 
+# ═══════════════════════════════════════════════════════════════════
+#   材料系统
+# ═══════════════════════════════════════════════════════════════════
+
+
+class MaterialRarity(IntEnum):
+    """材料稀有度。"""
+    COMMON = 0     # 普通
+    RARE = 1       # 稀有
+    PRECIOUS = 2   # 珍稀
+    EPIC = 3       # 史诗
+    LEGENDARY = 4  # 传说
+    MYTHIC = 5     # 神话
+
+
+MATERIAL_RARITY_NAMES: dict[int, str] = {
+    MaterialRarity.COMMON: "普通",
+    MaterialRarity.RARE: "稀有",
+    MaterialRarity.PRECIOUS: "珍稀",
+    MaterialRarity.EPIC: "史诗",
+    MaterialRarity.LEGENDARY: "传说",
+    MaterialRarity.MYTHIC: "神话",
+}
+
+MATERIAL_CATEGORIES: dict[str, str] = {
+    "herb": "草药类",
+    "mineral": "矿石类",
+    "beast": "妖兽材料",
+    "spirit_fluid": "灵液类",
+    "special": "特殊材料",
+}
+
+
+@dataclass
+class MaterialDef:
+    """材料定义。"""
+    item_id: str
+    name: str
+    rarity: int           # MaterialRarity
+    category: str          # MATERIAL_CATEGORIES key
+    source: str = ""       # 来源描述
+    description: str = ""
+    recycle_price: int = 0  # 灵石回收价
+
+
+MATERIAL_REGISTRY: dict[str, MaterialDef] = {}
+
+
+def set_material_registry(materials: dict[str, MaterialDef]):
+    """替换材料注册表（供数据库加载后同步到运行时）。"""
+    new_data = {k: MaterialDef(**v) if not isinstance(v, MaterialDef) else v
+                 for k, v in materials.items()}
+    with _registry_lock:
+        stale = [k for k in MATERIAL_REGISTRY if k not in new_data]
+        for k in stale:
+            del MATERIAL_REGISTRY[k]
+        MATERIAL_REGISTRY.update(new_data)
+        # 同步到 ITEM_REGISTRY（type="material"）
+        new_items = {}
+        for mat in MATERIAL_REGISTRY.values():
+            new_items[mat.item_id] = ItemDef(
+                item_id=mat.item_id,
+                name=mat.name,
+                item_type="material",
+                description=mat.description,
+                effect={"material_id": mat.item_id},
+            )
+        stale_items = [
+            i for i, it in ITEM_REGISTRY.items()
+            if getattr(it, "item_type", "") == "material" and i not in new_items
+        ]
+        for i in stale_items:
+            ITEM_REGISTRY.pop(i, None)
+        ITEM_REGISTRY.update(new_items)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#   丹方 / 炼丹配方系统
+# ═══════════════════════════════════════════════════════════════════
+
+
+class PillGrade(IntEnum):
+    """丹药品级（对应炼丹产出的品质）。"""
+    LOW = 0    # 下品
+    HIGH = 1   # 上品
+    PURE = 2   # 无垢
+
+
+PILL_GRADE_NAMES: dict[int, str] = {
+    PillGrade.LOW: "下品",
+    PillGrade.HIGH: "上品",
+    PillGrade.PURE: "无垢",
+}
+
+
+@dataclass
+class PillRecipeMaterial:
+    """配方中的单一材料需求。"""
+    item_id: str
+    qty: int
+
+
+@dataclass
+class PillRecipeDef:
+    """丹方定义。"""
+    recipe_id: str
+    pill_id: str          # 关联 PILL_REGISTRY
+    grade: int            # PillGrade
+    main_material: PillRecipeMaterial
+    auxiliary_material: PillRecipeMaterial
+    catalyst: PillRecipeMaterial
+    forming_material: PillRecipeMaterial
+
+
+PILL_RECIPE_REGISTRY: dict[str, PillRecipeDef] = {}
+
+
+def set_pill_recipe_registry(recipes: dict[str, PillRecipeDef]):
+    """替换丹方注册表（供数据库加载后同步到运行时）。"""
+    def _make(v):
+        if isinstance(v, PillRecipeDef):
+            return v
+        def _mat(m):
+            if isinstance(m, PillRecipeMaterial):
+                return m
+            return PillRecipeMaterial(item_id=m.get("item_id", ""), qty=m.get("qty", 1))
+        return PillRecipeDef(
+            recipe_id=v["recipe_id"],
+            pill_id=v["pill_id"],
+            grade=int(v.get("grade", 0)),
+            main_material=_mat(v.get("main_material", {})),
+            auxiliary_material=_mat(v.get("auxiliary_material", {})),
+            catalyst=_mat(v.get("catalyst", {})),
+            forming_material=_mat(v.get("forming_material", {})),
+        )
+    new_data = {k: _make(v) for k, v in recipes.items()}
+    with _registry_lock:
+        stale = [k for k in PILL_RECIPE_REGISTRY if k not in new_data]
+        for k in stale:
+            del PILL_RECIPE_REGISTRY[k]
+        PILL_RECIPE_REGISTRY.update(new_data)
+
+
+_PILL_FORMING_MATERIAL_BY_GRADE: dict[int, tuple[str, int]] = {
+    PillGrade.LOW: ("ningdan_sha", 1),
+    PillGrade.HIGH: ("yusuilo", 1),
+    PillGrade.PURE: ("wugou_quan", 1),
+}
+
+_PILL_RECIPE_TEMPLATES: dict[str, dict[int, tuple[tuple[str, int], tuple[str, int], tuple[str, int]]]] = {
+    "healing": {
+        0: (("huichuncao", 3), ("zhixuecao", 2), ("ganlu", 1)),
+        1: (("xuemingcao", 3), ("mingxin_hua", 2), ("lingquanshui", 1)),
+        2: (("huanhunhua", 2), ("yusuiye", 2), ("qingxu_ye", 1)),
+        3: (("taishang_shenglian", 1), ("zaohua_guo", 1), ("lingmai_sui", 1)),
+        4: (("taishang_shenglian", 1), ("changsheng_quan", 1), ("xianlu_zhi", 2)),
+    },
+    "attack": {
+        0: (("heli_sha", 2), ("man_niujin", 2), ("xiongshou_xue", 1)),
+        1: (("xiongshou_xue", 2), ("xuantie_sha", 1), ("man_niujin", 2)),
+        2: (("longxue_teng", 2), ("mo_yanhe", 1), ("jingang_gufen", 1)),
+        3: (("zhanshi_guf", 2), ("tiangang_jing", 1), ("bubie_shisui", 1)),
+        4: (("hunyuan_zhan", 1), ("zhenlong_jingxue", 1), ("shenshi_xuesui", 1)),
+    },
+    "defense": {
+        0: (("xuantie_sha", 2), ("guben_gen", 2), ("ningdan_sha", 1)),
+        1: (("xuantie_sha", 2), ("jingang_gufen", 1), ("lingquanshui", 1)),
+        2: (("jingang_gufen", 2), ("bubie_shisui", 1), ("qingxu_ye", 1)),
+        3: (("bubie_shisui", 1), ("tiangang_jing", 1), ("lingmai_sui", 1)),
+        4: (("xuanji_bei", 1), ("taiqing_xuan", 1), ("wudaowen_yu", 1)),
+    },
+    "lingqi": {
+        0: (("juanqiicao", 3), ("ganlu", 2), ("ningdan_sha", 1)),
+        1: (("lingquanshui", 2), ("peiyuan_zhi", 1), ("yusuiye", 1)),
+        2: (("yusuiye", 2), ("yuanqi_ye", 1), ("qingxu_ye", 1)),
+        3: (("lingmai_sui", 1), ("jiuxiangquan", 1), ("zaohua_guo", 1)),
+        4: (("xianmai_heixin", 1), ("taiqing_lingchao", 1), ("taichu_qingqi", 1)),
+    },
+    "dao_yun": {
+        0: (("wudao_ye", 3), ("gutaoyao", 2), ("ganlu", 1)),
+        1: (("mingxin_hua", 2), ("lingquanshui", 1), ("yusuilo", 1)),
+        2: (("tongxuan_teng", 2), ("qingxu_ye", 1), ("tianji_shieru", 1)),
+        3: (("tianji_shilu", 1), ("zaohua_guo", 1), ("yunwen_daoguo", 1)),
+        4: (("hunyuandaguo", 1), ("wudaowen_yu", 1), ("taichu_qingqi", 1)),
+    },
+    "exp": {
+        0: (("juanqiicao", 3), ("gutaoyao", 2), ("ganlu", 1)),
+        1: (("mingxin_hua", 1), ("peiyuan_zhi", 2), ("lingquanshui", 1)),
+        2: (("tianyuan_guo", 1), ("qingxu_ye", 1), ("yuanqi_ye", 1)),
+        3: (("zaohua_guo", 1), ("tianji_shilu", 1), ("lingmai_sui", 1)),
+        4: (("taiqing_lu", 1), ("yunwen_daoguo", 1), ("hunyuandaguo", 1)),
+    },
+    "max_hp": {
+        0: (("guben_gen", 3), ("zhixuecao", 2), ("ganlu", 1)),
+        1: (("peiyuan_zhi", 2), ("gutaoyao", 2), ("lingquanshui", 1)),
+        2: (("tianyuan_guo", 2), ("yuanqi_ye", 1), ("yusuiye", 1)),
+        3: (("zaohua_guo", 1), ("lingmai_sui", 1), ("jiuxiangquan", 1)),
+        4: (("changsheng_quan", 1), ("xianlu_zhi", 2), ("taishi_yeyuan", 1)),
+    },
+    "breakthrough": {
+        0: (("puzhangcao", 3), ("tongmai_teng", 2), ("ningdan_sha", 1)),
+        1: (("puzhangcao", 2), ("lingquanshui", 1), ("yusuilo", 1)),
+        2: (("tianji_shieru", 1), ("tongxuan_teng", 1), ("qingxu_ye", 1)),
+        3: (("tianji_shilu", 1), ("zaohua_guo", 1), ("tiangang_jing", 1)),
+        4: (("taichu_lu", 1), ("hunyuandaguo", 1), ("taichu_qingqi", 1)),
+    },
+    "temp_attack": {
+        0: (("xiongshou_xue", 2), ("heli_sha", 2), ("dihuofen", 1)),
+        1: (("xiongshou_xue", 2), ("man_niujin", 2), ("xuantie_sha", 1)),
+        2: (("mo_yanhe", 1), ("longxue_teng", 2), ("jingang_gufen", 1)),
+        3: (("tianmo_shaohao", 1), ("zhanshi_guf", 1), ("tiangang_jing", 1)),
+        4: (("tianmo_xinban", 1), ("shenshi_xuesui", 1), ("wuxiang_huozhong", 1)),
+    },
+    "temp_defense": {
+        0: (("xuantie_sha", 2), ("guben_gen", 2), ("dihuofen", 1)),
+        1: (("xuantie_sha", 2), ("man_niujin", 1), ("yusuiye", 1)),
+        2: (("jingang_gufen", 2), ("qingxu_ye", 1), ("yuanqi_ye", 1)),
+        3: (("bubie_shisui", 1), ("tiangang_jing", 1), ("lingmai_sui", 1)),
+        4: (("xuanji_bei", 1), ("taiqing_xuan", 1), ("wugou_quan", 1)),
+    },
+    "temp_lingqi": {
+        0: (("juanqiicao", 2), ("ganlu", 2), ("ningdan_sha", 1)),
+        1: (("lingquanshui", 2), ("yusuiye", 1), ("yusuilo", 1)),
+        2: (("qingxu_ye", 1), ("yuanqi_ye", 1), ("tianji_shieru", 1)),
+        3: (("lingmai_sui", 1), ("jiuxiangquan", 1), ("tianji_shilu", 1)),
+        4: (("xianmai_heixin", 1), ("taiqing_lingchao", 1), ("taichu_qingqi", 1)),
+    },
+    "temp_cultivate": {
+        0: (("gutaoyao", 3), ("wudao_ye", 2), ("ganlu", 1)),
+        1: (("mingxin_hua", 2), ("peiyuan_zhi", 1), ("lingquanshui", 1)),
+        2: (("tongxuan_teng", 1), ("qingxu_ye", 1), ("yuanqi_ye", 1)),
+        3: (("zaohua_guo", 1), ("tianji_shilu", 1), ("lingmai_sui", 1)),
+        4: (("taiqing_lu", 1), ("hunyuandaguo", 1), ("wugou_quan", 1)),
+    },
+    "temp_all": {
+        0: (("juanqiicao", 2), ("guben_gen", 2), ("dihuofen", 1)),
+        1: (("peiyuan_zhi", 2), ("mingxin_hua", 1), ("yusuilo", 1)),
+        2: (("tianyuan_guo", 1), ("tongxuan_teng", 1), ("qingxu_ye", 1)),
+        3: (("zaohua_guo", 1), ("tianji_shilu", 1), ("lingmai_sui", 1)),
+        4: (("hunyuandaguo", 1), ("taiqing_lingchao", 1), ("wudaowen_yu", 1)),
+    },
+}
+
+
+def _pill_recipe_mat(item_id: str, qty: int = 1) -> PillRecipeMaterial:
+    return PillRecipeMaterial(item_id=item_id, qty=qty)
+
+
+# ── 默认种子数据 ────────────────────────────────────────────────
+
+def _build_default_materials() -> dict[str, MaterialDef]:
+    """构建内置默认材料（来自 丹药炼丹材料清单.md）。"""
+    mats = {}
+
+    def _add(item_id, name, rarity, category, source="", description="", recycle_price=0):
+        mats[item_id] = MaterialDef(
+            item_id=item_id, name=name, rarity=rarity,
+            category=category, source=source, description=description,
+            recycle_price=recycle_price,
+        )
+
+    # 草药类 - 普通
+    _add("zhixuecao", "止血草", MaterialRarity.COMMON, "herb", "新手药园", "基础止血药材", 2)
+    _add("juanqiicao", "聚气草", MaterialRarity.COMMON, "herb", "新手药园", "聚集灵气的草本", 2)
+    _add("puzhangcao", "破障草", MaterialRarity.RARE, "herb", "灵田/黄阶秘境", "辅助突破的灵草", 10)
+    _add("huichuncao", "回春草", MaterialRarity.COMMON, "herb", "新手药园", "疗伤用草药", 2)
+    _add("xuemingcao", "续命藤", MaterialRarity.RARE, "herb", "灵田", "续命灵藤", 15)
+    _add("huanhunhua", "还魂花", MaterialRarity.PRECIOUS, "herb", "玄阶秘境", "起死回生之花", 80)
+    _add("tianji_shilu", "天道碎片", MaterialRarity.EPIC, "herb", "地阶秘境", "蕴含天道法则的碎片", 500)
+    _add("wudao_ye", "悟道叶", MaterialRarity.COMMON, "herb", "新手药园", "辅助悟道的灵叶", 3)
+    _add("mingxin_hua", "明心花", MaterialRarity.RARE, "herb", "灵田", "明心见性的灵花", 20)
+    _add("tongxuan_teng", "通玄藤", MaterialRarity.PRECIOUS, "herb", "玄阶秘境", "通达玄妙的灵藤", 100)
+    _add("zaohua_guo", "造化果", MaterialRarity.EPIC, "herb", "地阶秘境", "蕴含造化之力的果实", 600)
+    _add("guben_gen", "固本根", MaterialRarity.COMMON, "herb", "新手药园", "稳固本元的灵根", 2)
+    _add("peiyuan_zhi", "培元芝", MaterialRarity.RARE, "herb", "灵田", "培补元气的灵芝", 18)
+    _add("tianyuan_guo", "天元果", MaterialRarity.PRECIOUS, "herb", "玄阶秘境", "天元凝丹之果", 120)
+    _add("gutaoyao", "固元草", MaterialRarity.COMMON, "herb", "新手药园", "巩固修为的草药", 3)
+    _add("tianji_shieru", "天机石乳", MaterialRarity.PRECIOUS, "herb", "玄阶秘境", "天机石所化灵乳", 150)
+
+    # 草药类 - 传说/神话
+    _add("taishang_shenglian", "太上生机莲", MaterialRarity.LEGENDARY, "herb", "天阶秘境", "太上道祖遗留的生机莲花", 2000)
+    _add("hunyuandaguo", "混元道果", MaterialRarity.MYTHIC, "herb", "顶级秘境", "混元大道凝结的道果", 10000)
+    _add("tuotai_yusui", "脱胎玉髓", MaterialRarity.MYTHIC, "herb", "终局副本", "脱胎换骨的玉髓", 15000)
+    _add("wuxiang_shitai", "无相石胎", MaterialRarity.MYTHIC, "herb", "顶级秘境", "无相天成的石胎", 20000)
+    _add("wanshou_pantaoh", "万寿蟠桃核", MaterialRarity.LEGENDARY, "herb", "天阶秘境/活动", "蟠桃仙果之核", 3000)
+    _add("duwu_puti", "顿悟菩提子", MaterialRarity.LEGENDARY, "herb", "顶级秘境", "触发顿悟的菩提种子", 5000)
+    _add("taiqing_lu", "太上悟道露", MaterialRarity.LEGENDARY, "herb", "天阶秘境", "太上道祖的悟道甘露", 4000)
+
+    # 矿石类 - 普通
+    _add("dihuofen", "地火粉", MaterialRarity.COMMON, "mineral", "新手药园/商店", "炼丹基础辅材", 5)
+    _add("heli_sha", "烈火砂", MaterialRarity.COMMON, "mineral", "新手药园", "火属性基础灵材", 3)
+    _add("xuantie_sha", "玄铁砂", MaterialRarity.RARE, "mineral", "灵田", "玄铁研磨所得", 20)
+    _add("jingang_gufen", "金刚骨粉", MaterialRarity.PRECIOUS, "mineral", "玄阶秘境", "金刚锻造残余骨粉", 150)
+    _add("bubie_shisui", "不灭石髓", MaterialRarity.EPIC, "mineral", "地阶秘境", "不灭金身的石髓", 800)
+    _add("tiangang_jing", "天罡晶", MaterialRarity.EPIC, "mineral", "地阶秘境", "天罡正气凝结的晶石", 600)
+    _add("yuqie_lou", "玉切露", MaterialRarity.RARE, "mineral", "灵田", "玉矿渗出的灵露", 25)
+
+    # 矿石类 - 传说/神话
+    _add("hunyuan_zhan", "混元战髓", MaterialRarity.LEGENDARY, "mineral", "天阶秘境", "混元战意凝结的战髓", 3000)
+    _add("wanxiang_shay", "万相火种", MaterialRarity.LEGENDARY, "mineral", "天阶秘境", "万般火相本源", 4000)
+    _add("xuanji_bei", "玄武甲片", MaterialRarity.LEGENDARY, "mineral", "天阶秘境", "玄武神兽甲片", 3500)
+    _add("taiqing_xuan", "太清玄液", MaterialRarity.LEGENDARY, "mineral", "天阶秘境", "太清上乘玄液", 5000)
+    _add("taichu_lu", "太初劫液", MaterialRarity.MYTHIC, "mineral", "终局副本", "太初大劫残留灵液", 20000)
+    _add("wuxiang_huozhong", "无相火种", MaterialRarity.LEGENDARY, "mineral", "天阶秘境", "无相天成的火种本源", 6000)
+
+    # 妖兽材料
+    _add("tongmai_teng", "通脉藤", MaterialRarity.RARE, "beast", "黄阶秘境/坊市", "妖兽体内的灵藤", 15)
+    _add("man_niujin", "蛮牛筋", MaterialRarity.RARE, "beast", "黄阶秘境", "蛮牛的筋骨", 20)
+    _add("xiongshou_xue", "凶兽血", MaterialRarity.RARE, "beast", "黄阶秘境", "凶兽精血", 30)
+    _add("baigui_po", "百骸破", MaterialRarity.PRECIOUS, "beast", "玄阶秘境", "妖兽骸骨残片", 120)
+    _add("longxue_teng", "龙血藤", MaterialRarity.PRECIOUS, "beast", "玄阶秘境", "真龙血脉浸润的灵藤", 200)
+    _add("mo_yanhe", "魔炎核", MaterialRarity.PRECIOUS, "beast", "玄阶秘境", "魔兽魔炎核心", 180)
+    _add("zhanshi_guf", "战皇骨粉", MaterialRarity.EPIC, "beast", "地阶秘境", "战皇遗骨研磨的粉末", 700)
+    _add("zhenlong_jingxue", "真龙精血", MaterialRarity.LEGENDARY, "beast", "天阶秘境", "真龙族精血", 5000)
+    _add("shenshi_xuesui", "神魔血髓", MaterialRarity.LEGENDARY, "beast", "天阶秘境", "神魔级血髓", 8000)
+    _add("tianmo_xinban", "天魔心瓣", MaterialRarity.LEGENDARY, "beast", "天阶秘境", "天魔心脉瓣膜", 4000)
+    _add("tianmo_shaohao", "焚杀号角粉", MaterialRarity.EPIC, "beast", "地阶秘境", "天魔战号残粉", 900)
+
+    # 灵液类
+    _add("ganlu", "甘露", MaterialRarity.COMMON, "spirit_fluid", "新手药园", "基础灵露", 2)
+    _add("lingquanshui", "灵泉水", MaterialRarity.RARE, "spirit_fluid", "灵田", "灵泉所出泉水", 15)
+    _add("yusuiye", "玉髓液", MaterialRarity.RARE, "spirit_fluid", "灵田", "玉矿灵液", 25)
+    _add("qingxu_ye", "清虚液", MaterialRarity.PRECIOUS, "spirit_fluid", "玄阶秘境", "清虚凝神的灵液", 120)
+    _add("lingmai_sui", "灵脉髓", MaterialRarity.EPIC, "spirit_fluid", "地阶秘境", "灵脉核心的髓液", 600)
+    _add("yuanqi_ye", "元气液", MaterialRarity.PRECIOUS, "spirit_fluid", "玄阶秘境", "纯净元气的灵液", 100)
+    _add("guixi_ye", "贵息液", MaterialRarity.PRECIOUS, "spirit_fluid", "玄阶秘境", "归息凝神的灵液", 110)
+    _add("jiuxiangquan", "九曲泉", MaterialRarity.EPIC, "spirit_fluid", "地阶秘境", "九曲连环的灵泉", 700)
+    _add("xianmai_heixin", "仙脉核心", MaterialRarity.LEGENDARY, "spirit_fluid", "天阶秘境", "仙脉凝结的核心", 6000)
+    _add("taiqing_lingchao", "太清灵潮液", MaterialRarity.LEGENDARY, "spirit_fluid", "天阶秘境", "太清灵潮凝聚的灵液", 5000)
+
+    # 通用成丹辅材
+    _add("ningdan_sha", "凝丹砂", MaterialRarity.COMMON, "special", "新手药园/商店", "炼丹通用辅材，凝聚丹形", 5)
+    _add("yusuilo", "玉髓露", MaterialRarity.RARE, "special", "灵田/坊市", "炼丹上品辅材，提升丹药品质", 30)
+    _add("jingling_hua", "净灵花", MaterialRarity.LEGENDARY, "special", "顶级秘境", "无垢炼丹传说辅材，净化杂质", 500)
+    _add("wugou_quan", "无垢泉", MaterialRarity.LEGENDARY, "special", "顶级秘境", "无垢炼丹传说辅材，去除所有副作用", 800)
+
+    # 特殊/唯一材料
+    _add("naihuan_huoyu", "涅槃火羽", MaterialRarity.MYTHIC, "special", "顶级秘境", "凤凰涅槃遗留火羽", 20000)
+    _add("zhenhuang_jingxue", "真凰精血", MaterialRarity.MYTHIC, "special", "顶级秘境", "真凤一族的纯净精血", 25000)
+    _add("changsheng_quan", "长生泉", MaterialRarity.LEGENDARY, "special", "天阶秘境/活动", "长生不朽的泉水", 3000)
+    _add("xianlu_zhi", "仙露芝", MaterialRarity.LEGENDARY, "special", "天阶秘境", "蕴含仙气的灵芝", 2000)
+    _add("taishi_yeyuan", "太始元液", MaterialRarity.MYTHIC, "special", "终局副本", "太始时代遗留的元液", 15000)
+    _add("wudaowen_yu", "先天道纹玉", MaterialRarity.LEGENDARY, "special", "顶级秘境", "先天道纹凝结的宝玉", 8000)
+    _add("yunwen_daoguo", "云纹道果", MaterialRarity.LEGENDARY, "special", "天阶秘境", "道韵凝结的道果", 6000)
+    _add("taichu_qingqi", "太初清气", MaterialRarity.LEGENDARY, "special", "天阶秘境", "太初清气，炼丹至宝", 7000)
+    _add("tianji_xianru", "天机仙乳", MaterialRarity.LEGENDARY, "special", "天阶秘境", "高阶天机石乳凝练而成的仙乳", 4000)
+
+    return mats
+
+
+def _build_default_pill_recipes() -> dict[str, PillRecipeDef]:
+    """构建内置默认丹方（普通丹药程序化生成 + 特殊丹药固定丹方）。"""
+    recipes: dict[str, PillRecipeDef] = {}
+
+    for pill in PILL_REGISTRY.values():
+        if pill.category == "special":
+            continue
+        template = _PILL_RECIPE_TEMPLATES.get(pill.category, {})
+        tier_template = template.get(int(pill.tier))
+        if not tier_template:
+            continue
+        forming_id, forming_qty = _PILL_FORMING_MATERIAL_BY_GRADE.get(int(pill.grade), ("ningdan_sha", 1))
+        main_material, auxiliary_material, catalyst = tier_template
+        recipes[f"recipe_{pill.pill_id}"] = PillRecipeDef(
+            recipe_id=f"recipe_{pill.pill_id}",
+            pill_id=pill.pill_id,
+            grade=int(pill.grade),
+            main_material=_pill_recipe_mat(*main_material),
+            auxiliary_material=_pill_recipe_mat(*auxiliary_material),
+            catalyst=_pill_recipe_mat(*catalyst),
+            forming_material=_pill_recipe_mat(forming_id, forming_qty),
+        )
+
+    recipes.update({
+        "recipe_nirvana": PillRecipeDef(
+            recipe_id="recipe_nirvana",
+            pill_id="pill_special_nirvana",
+            grade=PillGrade.PURE,
+            main_material=PillRecipeMaterial("naihuan_huoyu", 1),
+            auxiliary_material=PillRecipeMaterial("zhenhuang_jingxue", 1),
+            catalyst=PillRecipeMaterial("hunyuandaguo", 1),
+            forming_material=PillRecipeMaterial("wugou_quan", 2),
+        ),
+        "recipe_rebirth": PillRecipeDef(
+            recipe_id="recipe_rebirth",
+            pill_id="pill_special_reborn",
+            grade=PillGrade.PURE,
+            main_material=PillRecipeMaterial("tuotai_yusui", 1),
+            auxiliary_material=PillRecipeMaterial("taiqing_xuan", 1),
+            catalyst=PillRecipeMaterial("jingling_hua", 2),
+            forming_material=PillRecipeMaterial("wugou_quan", 2),
+        ),
+        "recipe_formless": PillRecipeDef(
+            recipe_id="recipe_formless",
+            pill_id="pill_special_wuxiang",
+            grade=PillGrade.PURE,
+            main_material=PillRecipeMaterial("wuxiang_shitai", 1),
+            auxiliary_material=PillRecipeMaterial("xuanji_bei", 1),
+            catalyst=PillRecipeMaterial("zhenlong_jingxue", 1),
+            forming_material=PillRecipeMaterial("yusuilo", 2),
+        ),
+        "recipe_longevity": PillRecipeDef(
+            recipe_id="recipe_longevity",
+            pill_id="pill_special_longevity",
+            grade=PillGrade.PURE,
+            main_material=PillRecipeMaterial("wanshou_pantaoh", 1),
+            auxiliary_material=PillRecipeMaterial("changsheng_quan", 1),
+            catalyst=PillRecipeMaterial("xianlu_zhi", 2),
+            forming_material=PillRecipeMaterial("wugou_quan", 2),
+        ),
+        "recipe_insight": PillRecipeDef(
+            recipe_id="recipe_insight",
+            pill_id="pill_special_insight",
+            grade=PillGrade.PURE,
+            main_material=PillRecipeMaterial("duwu_puti", 1),
+            auxiliary_material=PillRecipeMaterial("tianji_xianru", 1),
+            catalyst=PillRecipeMaterial("taishang_shenglian", 1),
+            forming_material=PillRecipeMaterial("jingling_hua", 2),
+        ),
+    })
+    return recipes
+
+
+# 加载种子数据到注册表（启动时即有默认值，数据库后续可覆盖）
+_DEFAULT_MATERIALS = _build_default_materials()
+MATERIAL_REGISTRY.update(_DEFAULT_MATERIALS)
+
+_DEFAULT_PILL_RECIPES = _build_default_pill_recipes()
+PILL_RECIPE_REGISTRY.update(_DEFAULT_PILL_RECIPES)
+
+
 def set_realm_config(realms: dict[int, dict]):
     """替换境界配置（供数据库加载后同步到运行时）。"""
     REALM_CONFIG.clear()
@@ -1366,6 +1824,23 @@ def get_breakthrough_dao_yun_cost(realm: int) -> int:
     """获取从 realm 突破到 realm+1 所需道韵（从 REALM_CONFIG 动态读取）。"""
     cfg = REALM_CONFIG.get(realm, {})
     return int(cfg.get("breakthrough_dao_yun_cost", 0))
+
+
+def get_dao_yun_rate(realm: int, sub_realm: int = 0) -> float:
+    """计算当前境界/小境界的道韵产出概率。
+
+    化神期及以上境界基础10%，每个小境界+5%，无上限。
+    可与心法的道韵概率叠加，独立触发。
+
+    Returns:
+        0.0 表示该境界不触发道韵产出。
+    """
+    cfg = REALM_CONFIG.get(realm, {})
+    base_rate = cfg.get("dao_yun_base_rate", 0.0)
+    if base_rate <= 0:
+        return 0.0
+    per_sub = cfg.get("dao_yun_per_sub_realm", 0.05)
+    return base_rate + per_sub * sub_realm
 
 
 def get_realm_name(realm: int, sub_realm: int = 0) -> str:

@@ -14,7 +14,7 @@ from .constants import (
     get_max_sub_realm, get_player_base_max_lingqi, get_player_base_stats,
     get_sub_realm_dao_yun_cost, get_breakthrough_dao_yun_cost,
     get_nearest_realm_level, get_next_realm_level,
-    DEATH_REALM_START,
+    DEATH_REALM_START, get_dao_yun_rate,
 )
 from .models import Player
 
@@ -108,6 +108,13 @@ async def perform_cultivate(player: Player, cooldown: int = 60) -> dict:
         and hm_bonus["dao_yun_rate"] > 0
         and random.random() < hm_bonus["dao_yun_rate"]
     ):
+        dao_gain = random.randint(1, 3 + player.realm)
+        player.dao_yun += dao_gain
+        extra_msgs.append(f"感悟道韵+{dao_gain}")
+
+    # 境界道韵产出（化神期及以上独立触发，可与心法叠加）
+    realm_dao_rate = get_dao_yun_rate(player.realm, player.sub_realm)
+    if realm_dao_rate > 0 and random.random() < realm_dao_rate:
         dao_gain = random.randint(1, 3 + player.realm)
         player.dao_yun += dao_gain
         extra_msgs.append(f"感悟道韵+{dao_gain}")
