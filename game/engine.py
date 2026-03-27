@@ -1137,7 +1137,11 @@ class GameEngine:
             grade = int(item.get("grade", 0))
             item["grade_name"] = PILL_GRADE_NAMES.get(grade, str(grade))
             pill = PILL_REGISTRY.get(item["pill_id"])
-            item["pill_name"] = pill.name if pill else item["pill_id"]
+            if pill:
+                item["pill_name"] = pill.name
+            else:
+                item_def = ITEM_REGISTRY.get(item["pill_id"])
+                item["pill_name"] = item_def.name if item_def else item["pill_id"]
             item["main_material"] = _enrich_material(item.get("main_material"))
             item["auxiliary_material"] = _enrich_material(item.get("auxiliary_material"))
             item["catalyst"] = _enrich_material(item.get("catalyst"))
@@ -1153,8 +1157,8 @@ class GameEngine:
         pill_id = str(payload.get("pill_id", "")).strip()
         if not pill_id:
             return {"success": False, "message": "丹药ID不能为空"}
-        if pill_id not in PILL_REGISTRY:
-            return {"success": False, "message": f"丹药ID「{pill_id}」不存在于PILL_REGISTRY"}
+        if pill_id not in PILL_REGISTRY and pill_id not in ITEM_REGISTRY:
+            return {"success": False, "message": f"丹药ID「{pill_id}」不存在于丹药或物品注册表"}
         grade = int(payload.get("grade", 0))
         if grade not in {0, 1, 2}:
             return {"success": False, "message": "品级值无效（0=下品, 1=上品, 2=无垢）"}
@@ -1182,8 +1186,8 @@ class GameEngine:
         pill_id = str(payload.get("pill_id", "")).strip()
         if not pill_id:
             return {"success": False, "message": "丹药ID不能为空"}
-        if pill_id not in PILL_REGISTRY:
-            return {"success": False, "message": f"丹药ID「{pill_id}」不存在于PILL_REGISTRY"}
+        if pill_id not in PILL_REGISTRY and pill_id not in ITEM_REGISTRY:
+            return {"success": False, "message": f"丹药ID「{pill_id}」不存在于丹药或物品注册表"}
         grade = int(payload.get("grade", 0))
         if grade not in {0, 1, 2}:
             return {"success": False, "message": "品级值无效（0=下品, 1=上品, 2=无垢）"}

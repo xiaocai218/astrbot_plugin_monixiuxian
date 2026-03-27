@@ -1447,102 +1447,103 @@ def set_pill_recipe_registry(recipes: dict[str, PillRecipeDef]):
 
 
 _PILL_FORMING_MATERIAL_BY_GRADE: dict[int, tuple[str, int]] = {
-    PillGrade.LOW: ("ningdan_sha", 1),
-    PillGrade.HIGH: ("yusuilo", 1),
-    PillGrade.PURE: ("wugou_quan", 1),
+    # 现有模型只有一个成丹辅材槽位，这里将文档中的“双辅材”打包为一个展示材料
+    PillGrade.LOW: ("成丹辅材_下品", 1),   # 凝丹砂×1、地火粉×1
+    PillGrade.HIGH: ("成丹辅材_上品", 1),  # 凝丹砂×1、玉髓露×1
+    PillGrade.PURE: ("成丹辅材_无垢", 1),  # 净灵花×1、无垢泉×1
 }
 
 _PILL_RECIPE_TEMPLATES: dict[str, dict[int, tuple[tuple[str, int], tuple[str, int], tuple[str, int]]]] = {
     "healing": {
-        0: (("huichuncao", 3), ("zhixuecao", 2), ("ganlu", 1)),
-        1: (("xuemingcao", 3), ("mingxin_hua", 2), ("lingquanshui", 1)),
-        2: (("huanhunhua", 2), ("yusuiye", 2), ("qingxu_ye", 1)),
-        3: (("taishang_shenglian", 1), ("zaohua_guo", 1), ("lingmai_sui", 1)),
-        4: (("taishang_shenglian", 1), ("changsheng_quan", 1), ("xianlu_zhi", 2)),
+        0: (("回春草", 3), ("甘露叶", 2), ("止血藤", 1)),
+        1: (("续命藤", 3), ("血灵芝", 2), ("灵泉水", 1)),
+        2: (("还魂花", 2), ("生魂草", 2), ("玉髓液", 1)),
+        3: (("九转魂果", 1), ("还阳参", 2), ("地心乳", 1)),
+        4: (("太上生机莲", 1), ("仙露芝", 2), ("长生泉", 1)),
     },
     "attack": {
-        0: (("heli_sha", 2), ("man_niujin", 2), ("xiongshou_xue", 1)),
-        1: (("xiongshou_xue", 2), ("xuantie_sha", 1), ("man_niujin", 2)),
-        2: (("longxue_teng", 2), ("mo_yanhe", 1), ("jingang_gufen", 1)),
-        3: (("zhanshi_guf", 2), ("tiangang_jing", 1), ("bubie_shisui", 1)),
-        4: (("hunyuan_zhan", 1), ("zhenlong_jingxue", 1), ("shenshi_xuesui", 1)),
+        0: (("赤阳果", 2), ("牛筋草", 2), ("烈火砂", 1)),
+        1: (("虎骨草", 2), ("猛血藤", 2), ("金刚果", 1)),
+        2: (("龙血藤", 2), ("苍角芝", 2), ("炎晶髓", 1)),
+        3: (("天罡晶", 1), ("战皇骨粉", 2), ("烈阳髓", 1)),
+        4: (("混元战髓", 1), ("真龙精血", 1), ("神力果", 2)),
     },
     "defense": {
-        0: (("xuantie_sha", 2), ("guben_gen", 2), ("ningdan_sha", 1)),
-        1: (("xuantie_sha", 2), ("jingang_gufen", 1), ("lingquanshui", 1)),
-        2: (("jingang_gufen", 2), ("bubie_shisui", 1), ("qingxu_ye", 1)),
-        3: (("bubie_shisui", 1), ("tiangang_jing", 1), ("lingmai_sui", 1)),
-        4: (("xuanji_bei", 1), ("taiqing_xuan", 1), ("wudaowen_yu", 1)),
+        0: (("铁皮藤", 3), ("石甲草", 2), ("黑土精", 1)),
+        1: (("玄铁砂", 2), ("厚甲芝", 2), ("山岳根", 1)),
+        2: (("金刚骨粉", 2), ("镇岳花", 2), ("岩心液", 1)),
+        3: (("不灭石髓", 1), ("金身果", 2), ("地脉精华", 1)),
+        4: (("混元护心石", 1), ("玄武甲髓", 1), ("太清玄液", 1)),
     },
     "lingqi": {
-        0: (("juanqiicao", 3), ("ganlu", 2), ("ningdan_sha", 1)),
-        1: (("lingquanshui", 2), ("peiyuan_zhi", 1), ("yusuiye", 1)),
-        2: (("yusuiye", 2), ("yuanqi_ye", 1), ("qingxu_ye", 1)),
-        3: (("lingmai_sui", 1), ("jiuxiangquan", 1), ("zaohua_guo", 1)),
-        4: (("xianmai_heixin", 1), ("taiqing_lingchao", 1), ("taichu_qingqi", 1)),
+        0: (("聚气草", 3), ("清灵叶", 2), ("微光露", 1)),
+        1: (("灵泉晶", 2), ("凝气花", 2), ("山泉髓", 1)),
+        2: (("天灵叶", 2), ("云华露", 2), ("青冥砂", 1)),
+        3: (("九霄云露", 1), ("星辉果", 2), ("灵脉髓", 1)),
+        4: (("太清灵液", 1), ("先天灵核", 1), ("仙云花", 2)),
     },
     "dao_yun": {
-        0: (("wudao_ye", 3), ("gutaoyao", 2), ("ganlu", 1)),
-        1: (("mingxin_hua", 2), ("lingquanshui", 1), ("yusuilo", 1)),
-        2: (("tongxuan_teng", 2), ("qingxu_ye", 1), ("tianji_shieru", 1)),
-        3: (("tianji_shilu", 1), ("zaohua_guo", 1), ("yunwen_daoguo", 1)),
-        4: (("hunyuandaguo", 1), ("wudaowen_yu", 1), ("taichu_qingqi", 1)),
+        0: (("悟道叶", 3), ("静心花", 2), ("灵墨砂", 1)),
+        1: (("明心花", 2), ("澄神露", 2), ("灵台木", 1)),
+        2: (("通玄藤", 2), ("玄思果", 2), ("清虚液", 1)),
+        3: (("天道碎片", 1), ("云纹道果", 1), ("星河沙", 1)),
+        4: (("混元道果", 1), ("先天道纹玉", 1), ("太初清气", 1)),
     },
     "exp": {
-        0: (("juanqiicao", 3), ("gutaoyao", 2), ("ganlu", 1)),
-        1: (("mingxin_hua", 1), ("peiyuan_zhi", 2), ("lingquanshui", 1)),
-        2: (("tianyuan_guo", 1), ("qingxu_ye", 1), ("yuanqi_ye", 1)),
-        3: (("zaohua_guo", 1), ("tianji_shilu", 1), ("lingmai_sui", 1)),
-        4: (("taiqing_lu", 1), ("yunwen_daoguo", 1), ("hunyuandaguo", 1)),
+        0: (("聚灵草", 3), ("明气叶", 2), ("晨露", 1)),
+        1: (("明悟果", 2), ("清心花", 2), ("灵砂", 1)),
+        2: (("天悟花", 2), ("星思叶", 2), ("灵慧液", 1)),
+        3: (("造化果", 1), ("天机露", 2), ("乾坤砂", 1)),
+        4: (("太上悟道露", 1), ("仙机果", 1), ("太初灵壤", 1)),
     },
     "max_hp": {
-        0: (("guben_gen", 3), ("zhixuecao", 2), ("ganlu", 1)),
-        1: (("peiyuan_zhi", 2), ("gutaoyao", 2), ("lingquanshui", 1)),
-        2: (("tianyuan_guo", 2), ("yuanqi_ye", 1), ("yusuiye", 1)),
-        3: (("zaohua_guo", 1), ("lingmai_sui", 1), ("jiuxiangquan", 1)),
-        4: (("changsheng_quan", 1), ("xianlu_zhi", 2), ("taishi_yeyuan", 1)),
+        0: (("固本根", 3), ("参须", 2), ("黄精粉", 1)),
+        1: (("培元芝", 2), ("生机草", 2), ("地脉露", 1)),
+        2: (("天元果", 2), ("玉骨花", 2), ("元气液", 1)),
+        3: (("造化血参", 1), ("长青藤", 2), ("地心玉髓", 1)),
+        4: (("混元本源果", 1), ("长生玉芝", 1), ("太始元液", 1)),
     },
     "breakthrough": {
-        0: (("puzhangcao", 3), ("tongmai_teng", 2), ("ningdan_sha", 1)),
-        1: (("puzhangcao", 2), ("lingquanshui", 1), ("yusuilo", 1)),
-        2: (("tianji_shieru", 1), ("tongxuan_teng", 1), ("qingxu_ye", 1)),
-        3: (("tianji_shilu", 1), ("zaohua_guo", 1), ("tiangang_jing", 1)),
-        4: (("taichu_lu", 1), ("hunyuandaguo", 1), ("taichu_qingqi", 1)),
+        0: (("破障草", 3), ("清窍叶", 2), ("炼心砂", 1)),
+        1: (("筑基灵液", 2), ("凝骨花", 2), ("地灵乳", 1)),
+        2: (("天机石乳", 1), ("通脉藤", 2), ("玄窍果", 1)),
+        3: (("造化破境花", 1), ("劫火石", 1), ("乾元露", 1)),
+        4: (("混元劫晶", 1), ("天道灵胎", 1), ("太初劫液", 1)),
     },
     "temp_attack": {
-        0: (("xiongshou_xue", 2), ("heli_sha", 2), ("dihuofen", 1)),
-        1: (("xiongshou_xue", 2), ("man_niujin", 2), ("xuantie_sha", 1)),
-        2: (("mo_yanhe", 1), ("longxue_teng", 2), ("jingang_gufen", 1)),
-        3: (("tianmo_shaohao", 1), ("zhanshi_guf", 1), ("tiangang_jing", 1)),
-        4: (("tianmo_xinban", 1), ("shenshi_xuesui", 1), ("wuxiang_huozhong", 1)),
+        0: (("狂血草", 2), ("赤炎果", 2), ("燥火粉", 1)),
+        1: (("嗜血花", 2), ("凶兽血", 1), ("烈骨草", 2)),
+        2: (("魔炎核", 1), ("黑煞藤", 2), ("血魄花", 2)),
+        3: (("天魔心瓣", 1), ("焚杀号角粉", 1), ("噬炎露", 1)),
+        4: (("太上狂意晶", 1), ("神魔血髓", 1), ("无相火种", 1)),
     },
     "temp_defense": {
-        0: (("xuantie_sha", 2), ("guben_gen", 2), ("dihuofen", 1)),
-        1: (("xuantie_sha", 2), ("man_niujin", 1), ("yusuiye", 1)),
-        2: (("jingang_gufen", 2), ("qingxu_ye", 1), ("yuanqi_ye", 1)),
-        3: (("bubie_shisui", 1), ("tiangang_jing", 1), ("lingmai_sui", 1)),
-        4: (("xuanji_bei", 1), ("taiqing_xuan", 1), ("wugou_quan", 1)),
+        0: (("铁壁藤", 2), ("厚岩草", 2), ("凝甲粉", 1)),
+        1: (("龟甲片", 2), ("玄壳芝", 2), ("山海盐晶", 1)),
+        2: (("玄武甲粉", 1), ("镇水莲", 2), ("黑曜砂", 1)),
+        3: (("磐石心", 1), ("地脉花", 2), ("山神髓", 1)),
+        4: (("混元壁晶", 1), ("玄武真甲片", 1), ("太岳灵液", 1)),
     },
     "temp_lingqi": {
-        0: (("juanqiicao", 2), ("ganlu", 2), ("ningdan_sha", 1)),
-        1: (("lingquanshui", 2), ("yusuiye", 1), ("yusuilo", 1)),
-        2: (("qingxu_ye", 1), ("yuanqi_ye", 1), ("tianji_shieru", 1)),
-        3: (("lingmai_sui", 1), ("jiuxiangquan", 1), ("tianji_shilu", 1)),
-        4: (("xianmai_heixin", 1), ("taiqing_lingchao", 1), ("taichu_qingqi", 1)),
+        0: (("灵涌草", 2), ("清泉花", 2), ("润脉露", 1)),
+        1: (("灵泉露", 2), ("通脉草", 2), ("月华粉", 1)),
+        2: (("天灵髓", 1), ("云灵花", 2), ("星露砂", 1)),
+        3: (("灵脉晶", 1), ("地灵藤", 2), ("九曲泉", 1)),
+        4: (("太清灵潮液", 1), ("仙脉核心", 1), ("上清云露", 1)),
     },
     "temp_cultivate": {
-        0: (("gutaoyao", 3), ("wudao_ye", 2), ("ganlu", 1)),
-        1: (("mingxin_hua", 2), ("peiyuan_zhi", 1), ("lingquanshui", 1)),
-        2: (("tongxuan_teng", 1), ("qingxu_ye", 1), ("yuanqi_ye", 1)),
-        3: (("zaohua_guo", 1), ("tianji_shilu", 1), ("lingmai_sui", 1)),
-        4: (("taiqing_lu", 1), ("hunyuandaguo", 1), ("wugou_quan", 1)),
+        0: (("静心叶", 2), ("宁神花", 2), ("清苦茶末", 1)),
+        1: (("空明花", 2), ("定神木", 1), ("晨曦露", 2)),
+        2: (("禅定木", 1), ("明台莲", 2), ("清魂砂", 1)),
+        3: (("大定心香", 1), ("天游花", 2), ("归息液", 1)),
+        4: (("太上定神露", 1), ("无念菩提子", 1), ("上清神木汁", 1)),
     },
     "temp_all": {
-        0: (("juanqiicao", 2), ("guben_gen", 2), ("dihuofen", 1)),
-        1: (("peiyuan_zhi", 2), ("mingxin_hua", 1), ("yusuilo", 1)),
-        2: (("tianyuan_guo", 1), ("tongxuan_teng", 1), ("qingxu_ye", 1)),
-        3: (("zaohua_guo", 1), ("tianji_shilu", 1), ("lingmai_sui", 1)),
-        4: (("hunyuandaguo", 1), ("taiqing_lingchao", 1), ("wudaowen_yu", 1)),
+        0: (("全灵草", 2), ("和合花", 2), ("调元露", 1)),
+        1: (("万灵花", 2), ("百草晶", 1), ("平衡叶", 2)),
+        2: (("天地髓", 1), ("阴阳果", 1), ("合灵砂", 1)),
+        3: (("造化合灵果", 1), ("四象花", 2), ("乾坤露", 1)),
+        4: (("太极阴阳液", 1), ("两仪道莲", 1), ("无极灵砂", 1)),
     },
 }
 
@@ -1650,11 +1651,58 @@ def _build_default_materials() -> dict[str, MaterialDef]:
     _add("taichu_qingqi", "太初清气", MaterialRarity.LEGENDARY, "special", "天阶秘境", "太初清气，炼丹至宝", 7000)
     _add("tianji_xianru", "天机仙乳", MaterialRarity.LEGENDARY, "special", "天阶秘境", "高阶天机石乳凝练而成的仙乳", 4000)
 
+    # 文档中的成丹辅材组合（现有模型单槽位，使用组合材料承载）
+    _add("成丹辅材_下品", "凝丹砂×1、地火粉×1", MaterialRarity.COMMON, "special", "配方规则", "下品固定成丹辅材组合", 6)
+    _add("成丹辅材_上品", "凝丹砂×1、玉髓露×1", MaterialRarity.RARE, "special", "配方规则", "上品固定成丹辅材组合", 35)
+    _add("成丹辅材_无垢", "净灵花×1、无垢泉×1", MaterialRarity.LEGENDARY, "special", "配方规则", "无垢固定成丹辅材组合", 1000)
+
+    # 特殊丹药组合辅材包
+    _add("特丹辅材_涅槃", "长生玉芝×1、无垢泉×2", MaterialRarity.MYTHIC, "special", "特殊丹方", "涅槃天丹辅材组合", 20000)
+    _add("特丹辅材_脱胎", "太清玄液×1、无垢泉×2", MaterialRarity.MYTHIC, "special", "特殊丹方", "脱胎换骨丹辅材组合", 18000)
+    _add("特丹辅材_无相", "先天道纹玉×1、玉髓露×2", MaterialRarity.LEGENDARY, "special", "特殊丹方", "无相丹辅材组合", 10000)
+    _add("特丹辅材_万寿", "太始元液×1、无垢泉×2", MaterialRarity.MYTHIC, "special", "特殊丹方", "万寿丹辅材组合", 22000)
+    _add("特丹辅材_顿悟", "云纹道果×1、净灵花×2", MaterialRarity.LEGENDARY, "special", "特殊丹方", "顿悟丹辅材组合", 12000)
+
+    # 按文档丹方自动补齐缺失材料，避免配方引用到“未知材料”
+    def _ensure_material(item_id: str, *, rarity: int = MaterialRarity.COMMON, category: str = "special"):
+        if not item_id or item_id in mats:
+            return
+        _add(
+            item_id=item_id,
+            name=item_id,
+            rarity=rarity,
+            category=category,
+            source="丹方文档",
+            description="按丹方文档自动补齐的材料",
+            recycle_price=10,
+        )
+
+    required_material_ids: set[str] = set()
+    for tier_map in _PILL_RECIPE_TEMPLATES.values():
+        for recipe_tuple in tier_map.values():
+            for item_id, _qty in recipe_tuple:
+                required_material_ids.add(str(item_id))
+    for item_id, _qty in _PILL_FORMING_MATERIAL_BY_GRADE.values():
+        required_material_ids.add(str(item_id))
+
+    # 特殊丹药与旧版兼容丹药的额外材料
+    required_material_ids.update({
+        "涅槃火羽", "真凰精血", "混元道果", "脱胎玉髓", "还阳参",
+        "净灵花", "无相石胎", "玄武甲髓", "真龙精血", "万寿蟠桃核",
+        "长生泉", "仙露芝", "顿悟菩提子", "天机仙乳", "太上悟道露",
+        "止血草", "回气叶", "甘露花", "聚气草", "明灵叶", "晨露",
+        "破障草", "通脉藤", "定心果", "淬骨草", "蛮牛筋", "赤土精",
+        "凝丹砂",
+    })
+
+    for material_id in sorted(required_material_ids):
+        _ensure_material(material_id)
+
     return mats
 
 
 def _build_default_pill_recipes() -> dict[str, PillRecipeDef]:
-    """构建内置默认丹方（普通丹药程序化生成 + 特殊丹药固定丹方）。"""
+    """构建内置默认丹方（程序化丹药 + 特殊丹药 + 旧版兼容丹药）。"""
     recipes: dict[str, PillRecipeDef] = {}
 
     for pill in PILL_REGISTRY.values():
@@ -1664,7 +1712,7 @@ def _build_default_pill_recipes() -> dict[str, PillRecipeDef]:
         tier_template = template.get(int(pill.tier))
         if not tier_template:
             continue
-        forming_id, forming_qty = _PILL_FORMING_MATERIAL_BY_GRADE.get(int(pill.grade), ("ningdan_sha", 1))
+        forming_id, forming_qty = _PILL_FORMING_MATERIAL_BY_GRADE.get(int(pill.grade), ("成丹辅材_下品", 1))
         main_material, auxiliary_material, catalyst = tier_template
         recipes[f"recipe_{pill.pill_id}"] = PillRecipeDef(
             recipe_id=f"recipe_{pill.pill_id}",
@@ -1677,50 +1725,91 @@ def _build_default_pill_recipes() -> dict[str, PillRecipeDef]:
         )
 
     recipes.update({
+        # 特殊丹药：沿用 4 槽位模型，最后两味材料以“辅材包”形式落在 forming_material
         "recipe_nirvana": PillRecipeDef(
             recipe_id="recipe_nirvana",
             pill_id="pill_special_nirvana",
             grade=PillGrade.PURE,
-            main_material=PillRecipeMaterial("naihuan_huoyu", 1),
-            auxiliary_material=PillRecipeMaterial("zhenhuang_jingxue", 1),
-            catalyst=PillRecipeMaterial("hunyuandaguo", 1),
-            forming_material=PillRecipeMaterial("wugou_quan", 2),
+            main_material=PillRecipeMaterial("涅槃火羽", 1),
+            auxiliary_material=PillRecipeMaterial("真凰精血", 1),
+            catalyst=PillRecipeMaterial("混元道果", 1),
+            forming_material=PillRecipeMaterial("特丹辅材_涅槃", 1),  # 长生玉芝×1、无垢泉×2
         ),
         "recipe_rebirth": PillRecipeDef(
             recipe_id="recipe_rebirth",
             pill_id="pill_special_reborn",
             grade=PillGrade.PURE,
-            main_material=PillRecipeMaterial("tuotai_yusui", 1),
-            auxiliary_material=PillRecipeMaterial("taiqing_xuan", 1),
-            catalyst=PillRecipeMaterial("jingling_hua", 2),
-            forming_material=PillRecipeMaterial("wugou_quan", 2),
+            main_material=PillRecipeMaterial("脱胎玉髓", 1),
+            auxiliary_material=PillRecipeMaterial("还阳参", 1),
+            catalyst=PillRecipeMaterial("净灵花", 2),
+            forming_material=PillRecipeMaterial("特丹辅材_脱胎", 1),  # 太清玄液×1、无垢泉×2
         ),
         "recipe_formless": PillRecipeDef(
             recipe_id="recipe_formless",
             pill_id="pill_special_wuxiang",
             grade=PillGrade.PURE,
-            main_material=PillRecipeMaterial("wuxiang_shitai", 1),
-            auxiliary_material=PillRecipeMaterial("xuanji_bei", 1),
-            catalyst=PillRecipeMaterial("zhenlong_jingxue", 1),
-            forming_material=PillRecipeMaterial("yusuilo", 2),
+            main_material=PillRecipeMaterial("无相石胎", 1),
+            auxiliary_material=PillRecipeMaterial("玄武甲髓", 1),
+            catalyst=PillRecipeMaterial("真龙精血", 1),
+            forming_material=PillRecipeMaterial("特丹辅材_无相", 1),  # 先天道纹玉×1、玉髓露×2
         ),
         "recipe_longevity": PillRecipeDef(
             recipe_id="recipe_longevity",
             pill_id="pill_special_longevity",
             grade=PillGrade.PURE,
-            main_material=PillRecipeMaterial("wanshou_pantaoh", 1),
-            auxiliary_material=PillRecipeMaterial("changsheng_quan", 1),
-            catalyst=PillRecipeMaterial("xianlu_zhi", 2),
-            forming_material=PillRecipeMaterial("wugou_quan", 2),
+            main_material=PillRecipeMaterial("万寿蟠桃核", 1),
+            auxiliary_material=PillRecipeMaterial("长生泉", 1),
+            catalyst=PillRecipeMaterial("仙露芝", 2),
+            forming_material=PillRecipeMaterial("特丹辅材_万寿", 1),  # 太始元液×1、无垢泉×2
         ),
         "recipe_insight": PillRecipeDef(
             recipe_id="recipe_insight",
             pill_id="pill_special_insight",
             grade=PillGrade.PURE,
-            main_material=PillRecipeMaterial("duwu_puti", 1),
-            auxiliary_material=PillRecipeMaterial("tianji_xianru", 1),
-            catalyst=PillRecipeMaterial("taishang_shenglian", 1),
-            forming_material=PillRecipeMaterial("jingling_hua", 2),
+            main_material=PillRecipeMaterial("顿悟菩提子", 1),
+            auxiliary_material=PillRecipeMaterial("天机仙乳", 1),
+            catalyst=PillRecipeMaterial("太上悟道露", 1),
+            forming_material=PillRecipeMaterial("特丹辅材_顿悟", 1),  # 云纹道果×1、净灵花×2
+        ),
+    })
+
+    # 旧版兼容丹药（文档保留条目）
+    recipes.update({
+        "recipe_legacy_healing_pill": PillRecipeDef(
+            recipe_id="recipe_legacy_healing_pill",
+            pill_id="healing_pill",
+            grade=PillGrade.LOW,
+            main_material=PillRecipeMaterial("止血草", 3),
+            auxiliary_material=PillRecipeMaterial("回气叶", 2),
+            catalyst=PillRecipeMaterial("甘露花", 1),
+            forming_material=PillRecipeMaterial("凝丹砂", 1),
+        ),
+        "recipe_legacy_exp_pill": PillRecipeDef(
+            recipe_id="recipe_legacy_exp_pill",
+            pill_id="exp_pill",
+            grade=PillGrade.LOW,
+            main_material=PillRecipeMaterial("聚气草", 3),
+            auxiliary_material=PillRecipeMaterial("明灵叶", 2),
+            catalyst=PillRecipeMaterial("晨露", 1),
+            forming_material=PillRecipeMaterial("凝丹砂", 1),
+        ),
+        "recipe_legacy_breakthrough_pill": PillRecipeDef(
+            recipe_id="recipe_legacy_breakthrough_pill",
+            pill_id="breakthrough_pill",
+            grade=PillGrade.LOW,
+            main_material=PillRecipeMaterial("破障草", 2),
+            auxiliary_material=PillRecipeMaterial("通脉藤", 2),
+            catalyst=PillRecipeMaterial("定心果", 1),
+            forming_material=PillRecipeMaterial("凝丹砂", 1),
+        ),
+        "recipe_legacy_body_tempering_pill": PillRecipeDef(
+            recipe_id="recipe_legacy_body_tempering_pill",
+            pill_id="body_tempering_pill",
+            grade=PillGrade.LOW,
+            main_material=PillRecipeMaterial("淬骨草", 3),
+            auxiliary_material=PillRecipeMaterial("蛮牛筋", 1),
+            catalyst=PillRecipeMaterial("赤土精", 1),
+            forming_material=PillRecipeMaterial("凝丹砂", 1),
         ),
     })
     return recipes

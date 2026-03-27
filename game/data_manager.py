@@ -1327,7 +1327,7 @@ class DataManager:
     # ── 种子数据：丹方 ──────────────────────────────────────
 
     async def _seed_pill_recipes(self):
-        """若丹方表为空或有缺失，按代码内置默认数据补齐（5种特殊丹药）；同时修正已知的错误 pill_id。"""
+        """若丹方表为空或有缺失，按代码内置默认数据补齐（程序化+特殊+旧版兼容）；同时修正已知的错误 pill_id。"""
         from .constants import _DEFAULT_PILL_RECIPES
         import json as _json
 
@@ -1343,15 +1343,8 @@ class DataManager:
             )
         await self.db.commit()
 
-        existing = set()
-        async with self.db.execute("SELECT recipe_id FROM pill_recipes") as cur:
-            async for row in cur:
-                existing.add(row[0])
-
         rows = []
         for recipe in _DEFAULT_PILL_RECIPES.values():
-            if recipe.recipe_id in existing:
-                continue
             rows.append((
                 recipe.recipe_id,
                 recipe.pill_id,
@@ -1367,10 +1360,17 @@ class DataManager:
 
         await self.db.executemany(
             """
-            INSERT OR IGNORE INTO pill_recipes (
+            INSERT INTO pill_recipes (
                 recipe_id, pill_id, grade,
                 main_material, auxiliary_material, catalyst, forming_material
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(recipe_id) DO UPDATE SET
+                pill_id = excluded.pill_id,
+                grade = excluded.grade,
+                main_material = excluded.main_material,
+                auxiliary_material = excluded.auxiliary_material,
+                catalyst = excluded.catalyst,
+                forming_material = excluded.forming_material
             """,
             rows,
         )
