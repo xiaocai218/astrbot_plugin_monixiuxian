@@ -1189,6 +1189,19 @@ async def _handle_message(
         data = await engine.sect_get_contribution_rules(user_id)
         return {"type": "sect_contribution_rules_data", "data": data}
 
+    elif msg_type == "sect_shop_list":
+        data = await engine.sect_shop_get_items(user_id)
+        return {"type": "sect_shop_data", "data": data}
+
+    elif msg_type == "sect_shop_buy":
+        d = msg.get("data", {})
+        item_id = str(d.get("item_id", "")).strip()
+        quantity = max(1, int(d.get("quantity", 1) or 1))
+        if not item_id:
+            return {"type": "error", "message": "缺少商品ID"}
+        result = await engine.sect_shop_buy(user_id, item_id, quantity)
+        return {"type": "action_result", "action": "sect_shop_buy", "data": result}
+
     elif msg_type == "sect_set_submit_rule":
         d = msg.get("data", {})
         quality_key = str(d.get("quality_key", "")).strip()
@@ -1214,6 +1227,59 @@ async def _handle_message(
         is_item = raw_is_item is True or (isinstance(raw_is_item, str) and raw_is_item.lower() in ("true", "1"))
         result = await engine.sect_set_exchange_rule(user_id, target_key, points, is_item=is_item)
         return {"type": "action_result", "action": "sect_set_exchange_rule", "data": result}
+
+    # ── 灵田系统 ──────────────────────────────────────────
+    elif msg_type == "spirit_field_status":
+        data = await engine.spirit_field_status(user_id)
+        return {"type": "spirit_field_data", "data": data}
+
+    elif msg_type == "spirit_field_claim":
+        result = await engine.spirit_field_claim(user_id)
+        return {"type": "action_result", "action": "spirit_field_claim", "data": result}
+
+    elif msg_type == "spirit_field_seeds":
+        data = await engine.spirit_field_seeds(user_id)
+        return {"type": "spirit_field_seeds_data", "data": data}
+
+    elif msg_type == "spirit_field_plant":
+        d = msg.get("data", {})
+        try:
+            plot_index = int(d.get("plot_index", -1))
+        except (TypeError, ValueError):
+            return {"type": "error", "message": "无效的格子编号"}
+        seed_id = str(d.get("seed_id", "")).strip()
+        if not seed_id:
+            return {"type": "error", "message": "缺少种子ID"}
+        result = await engine.spirit_field_plant(user_id, plot_index, seed_id)
+        return {"type": "action_result", "action": "spirit_field_plant", "data": result}
+
+    elif msg_type == "spirit_field_harvest":
+        d = msg.get("data", {})
+        try:
+            plot_index = int(d.get("plot_index", -1))
+        except (TypeError, ValueError):
+            return {"type": "error", "message": "无效的格子编号"}
+        result = await engine.spirit_field_harvest(user_id, plot_index)
+        return {"type": "action_result", "action": "spirit_field_harvest", "data": result}
+
+    elif msg_type == "spirit_field_warehouse":
+        d = msg.get("data", {})
+        filter_rarity = int(d.get("filter_rarity", -1))
+        search = str(d.get("search", "")).strip()
+        data = await engine.spirit_field_warehouse(user_id, filter_rarity, search)
+        return {"type": "spirit_field_warehouse_data", "data": data}
+
+    elif msg_type == "spirit_field_withdraw":
+        d = msg.get("data", {})
+        material_id = str(d.get("material_id", "")).strip()
+        try:
+            count = max(1, int(d.get("count", 1) or 1))
+        except (TypeError, ValueError):
+            return {"type": "error", "message": "数量无效"}
+        if not material_id:
+            return {"type": "error", "message": "缺少材料ID"}
+        result = await engine.spirit_field_withdraw(user_id, material_id, count)
+        return {"type": "action_result", "action": "spirit_field_withdraw", "data": result}
 
     else:
         return {"type": "error", "message": f"未知操作: {msg_type}"}

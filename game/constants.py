@@ -173,7 +173,7 @@ class ItemDef:
     """物品定义。"""
     item_id: str
     name: str
-    item_type: str  # "consumable" | "material" | "equipment" | "heart_method" | "gongfa"
+    item_type: str  # "consumable" | "material" | "seed" | "equipment" | "heart_method" | "gongfa"
     description: str
     effect: dict = field(default_factory=dict)
 
@@ -508,6 +508,13 @@ def get_recycle_base_price(item_id: str) -> int | None:
             multiplier, lo, hi = cfg
             return max(lo, min(hi, int((eq.attack + eq.defense) * multiplier)))
         return 5
+
+    # 丹药：根据售价推算回收价（售价 / 10）
+    if item_id.startswith("pill_"):
+        from .pills import PILL_REGISTRY
+        pill = PILL_REGISTRY.get(item_id)
+        if pill:
+            return max(2, pill.price // 10)
 
     # 临时心法道具不可回收
     stored_hm_id = parse_stored_heart_method_item_id(item_id)
@@ -1348,7 +1355,86 @@ class MaterialDef:
     recycle_price: int = 0  # 灵石回收价
 
 
+@dataclass
+class SeedDef:
+    """灵田种子定义。"""
+    seed_id: str
+    material_id: str
+    name: str
+    rarity: int
+    category: str
+    grow_time: float
+    description: str = ""
+
+
 MATERIAL_REGISTRY: dict[str, MaterialDef] = {}
+SEED_REGISTRY: dict[str, SeedDef] = {}
+
+SEED_PREFIX = "seed_"
+SPIRIT_FIELD_GROW_TIME_BASE = 3600
+SPIRIT_FIELD_GROW_TIME_PER_RARITY = 1800
+
+
+def get_seed_id(material_id: str) -> str:
+    """材料 ID -> 种子 ID。"""
+    return f"{SEED_PREFIX}{material_id}"
+
+
+def get_seed_material_id(seed_id: str) -> str:
+    """种子 ID -> 材料 ID。"""
+    return str(seed_id or "").removeprefix(SEED_PREFIX)
+
+
+def build_seed_registry(materials: dict[str, MaterialDef]) -> dict[str, SeedDef]:
+    """根据材料注册表构建默认种子注册表。"""
+    seeds: dict[str, SeedDef] = {}
+    for mat in materials.values():
+        grow_time = SPIRIT_FIELD_GROW_TIME_BASE + int(mat.rarity) * SPIRIT_FIELD_GROW_TIME_PER_RARITY
+        seed_id = get_seed_id(mat.item_id)
+        seeds[seed_id] = SeedDef(
+            seed_id=seed_id,
+            material_id=mat.item_id,
+            name=f"{mat.name}种子",
+            rarity=int(mat.rarity),
+            category=mat.category,
+            grow_time=float(grow_time),
+            description=f"种植后可收获「{mat.name}」",
+        )
+    return seeds
+
+
+def _refresh_seed_items():
+    """根据当前 SEED_REGISTRY 同步刷新种子物品定义。"""
+    new_items = {}
+    for seed in SEED_REGISTRY.values():
+        new_items[seed.seed_id] = ItemDef(
+            item_id=seed.seed_id,
+            name=seed.name,
+            item_type="seed",
+            description=seed.description,
+            effect={"seed_id": seed.seed_id, "material_id": seed.material_id},
+        )
+    stale_items = [
+        item_id for item_id, item in ITEM_REGISTRY.items()
+        if getattr(item, "item_type", "") == "seed" and item_id not in new_items
+    ]
+    for item_id in stale_items:
+        ITEM_REGISTRY.pop(item_id, None)
+    ITEM_REGISTRY.update(new_items)
+
+
+def set_seed_registry(seeds: dict[str, SeedDef]):
+    """替换种子注册表（供数据库加载后同步到运行时）。"""
+    new_data = {
+        k: SeedDef(**v) if not isinstance(v, SeedDef) else v
+        for k, v in seeds.items()
+    }
+    with _registry_lock:
+        stale = [k for k in SEED_REGISTRY if k not in new_data]
+        for k in stale:
+            del SEED_REGISTRY[k]
+        SEED_REGISTRY.update(new_data)
+        _refresh_seed_items()
 
 
 def set_material_registry(materials: dict[str, MaterialDef]):
@@ -1418,6 +1504,42 @@ class PillRecipeDef:
 
 
 PILL_RECIPE_REGISTRY: dict[str, PillRecipeDef] = {}
+
+PILL_RECIPE_ITEM_PREFIX = "recipe_"
+
+
+def get_pill_recipe_item_id(recipe_id: str) -> str:
+    """将丹方 ID 转换为背包 item_id。"""
+    return f"{PILL_RECIPE_ITEM_PREFIX}{recipe_id}"
+
+
+def parse_pill_recipe_item_id(item_id: str) -> str | None:
+    """从 item_id 解析出 recipe_id，非丹方道具返回 None。"""
+    if item_id.startswith(PILL_RECIPE_ITEM_PREFIX):
+        return item_id[len(PILL_RECIPE_ITEM_PREFIX):]
+    return None
+
+
+def sync_pill_recipe_items(pill_registry: dict) -> None:
+    """将丹方同步到 ITEM_REGISTRY（需在 pill_registry 已加载后调用）。"""
+    with _registry_lock:
+        # 清除旧条目
+        stale = [k for k in list(ITEM_REGISTRY.keys()) if k.startswith(PILL_RECIPE_ITEM_PREFIX)]
+        for k in stale:
+            ITEM_REGISTRY.pop(k, None)
+        # 写入当前丹方
+        for recipe in PILL_RECIPE_REGISTRY.values():
+            iid = get_pill_recipe_item_id(recipe.recipe_id)
+            pill = pill_registry.get(recipe.pill_id)
+            pill_name = pill.name if pill else recipe.pill_id
+            grade_name = PILL_GRADE_NAMES.get(recipe.grade, "")
+            ITEM_REGISTRY[iid] = ItemDef(
+                item_id=iid,
+                name=f"{pill_name}丹方",
+                item_type="pill_recipe",
+                description=f"炼制{grade_name}{pill_name}所需配方，学会后可在炼丹阁中使用。",
+                effect={"recipe_id": recipe.recipe_id},
+            )
 
 
 def set_pill_recipe_registry(recipes: dict[str, PillRecipeDef]):
@@ -1818,6 +1940,8 @@ def _build_default_pill_recipes() -> dict[str, PillRecipeDef]:
 # 加载种子数据到注册表（启动时即有默认值，数据库后续可覆盖）
 _DEFAULT_MATERIALS = _build_default_materials()
 MATERIAL_REGISTRY.update(_DEFAULT_MATERIALS)
+_DEFAULT_SEEDS = build_seed_registry(_DEFAULT_MATERIALS)
+set_seed_registry(_DEFAULT_SEEDS)
 
 _DEFAULT_PILL_RECIPES = _build_default_pill_recipes()
 PILL_RECIPE_REGISTRY.update(_DEFAULT_PILL_RECIPES)

@@ -9,6 +9,7 @@ from .constants import (
     HEART_METHOD_REGISTRY, HeartMethodQuality, get_heart_method_manual_id,
     EQUIPMENT_REGISTRY, EQUIPMENT_TIER_NAMES, EquipmentTier,
     GONGFA_REGISTRY, GONGFA_TIER_NAMES, GongfaTier, MASTERY_LEVELS, MASTERY_MAX,
+    MATERIAL_REGISTRY, MATERIAL_RARITY_NAMES,
     get_gongfa_scroll_id, get_total_gongfa_bonus, can_cultivate_gongfa,
     get_player_base_max_lingqi, get_realm_base_stats,
     RealmLevel, has_sub_realm,
@@ -19,7 +20,7 @@ from .constants import (
 from .inventory import add_item
 from .models import Player
 
-_REWARD_TYPES = ("stones", "exp", "pill", "equip")
+_REWARD_TYPES = ("stones", "exp", "pill", "equip", "material")
 _COMBO_SIZES = (4, 3, 2, 1)  # 1+1+1+1, 1+1+1, 1+1, 1
 _HEART_METHOD_DROP_BASE_RATE = 0.18
 
@@ -122,6 +123,17 @@ async def _apply_victory_rewards(player: Player, result: dict, enemy_scale: floa
             fallback_exp = _apply_exp(player, enemy_scale * 0.8)
             result["exp_gained"] = result.get("exp_gained", 0) + fallback_exp
             reward_lines.append(f"装备池空，改为修为 +{fallback_exp}")
+    if "material" in reward_types:
+        mat = await _apply_material_drop(player)
+        if mat:
+            result["material_name"] = mat["name"]
+            result["material_rarity"] = mat["rarity_name"]
+            reward_lines.append(f"材料 +{mat['rarity_name']}【{mat['name']}】")
+        else:
+            fallback_stones = random.randint(50, 200)
+            player.spirit_stones += fallback_stones
+            result["stones_gained"] = result.get("stones_gained", 0) + fallback_stones
+            reward_lines.append(f"材料池空，改为灵石 +{fallback_stones}")
 
     hm_drop = await _apply_heart_method_drop(player, enemy_scale)
     if hm_drop:
@@ -199,6 +211,38 @@ async def _apply_pill(player: Player) -> str:
     pill_id = random.choices(pill_ids, weights=pill_weights, k=1)[0]
     await add_item(player, pill_id)
     return ITEM_REGISTRY[pill_id].name
+
+
+# ── 材料掉落 ──────────────────────────────────────
+_ADVENTURE_MATERIAL_RARITY_WEIGHTS: dict[int, int] = {
+    0: 6000,  # 普通
+    1: 2500,  # 稀有
+    2: 800,   # 珍稀
+    3: 150,   # 史诗
+    4: 15,    # 传说
+    5: 1,     # 神话（万分之一）
+}
+
+
+async def _apply_material_drop(player: Player) -> dict | None:
+    """随机获得一份材料，按稀有度加权。"""
+    if not MATERIAL_REGISTRY:
+        return None
+    rarity_pool: list[tuple[int, int]] = [
+        (r, w) for r, w in _ADVENTURE_MATERIAL_RARITY_WEIGHTS.items()
+    ]
+    rarities = [r for r, _ in rarity_pool]
+    weights = [w for _, w in rarity_pool]
+    chosen_rarity = random.choices(rarities, weights=weights, k=1)[0]
+    candidates = [m for m in MATERIAL_REGISTRY.values() if m.rarity == chosen_rarity]
+    if not candidates:
+        candidates = list(MATERIAL_REGISTRY.values())
+    if not candidates:
+        return None
+    mat = random.choice(candidates)
+    await add_item(player, mat.item_id)
+    rarity_name = MATERIAL_RARITY_NAMES.get(mat.rarity, "未知")
+    return {"name": mat.name, "rarity_name": rarity_name, "item_id": mat.item_id}
 
 
 async def _apply_equip_drop(player: Player) -> dict | None:

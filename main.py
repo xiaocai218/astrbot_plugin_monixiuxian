@@ -83,8 +83,9 @@ class XiuxianPlugin(Star):
             "checkin_exp_max": self._get_cfg_int("checkin_exp_max", 5000),
             "checkin_stones_with_pill_min": self._get_cfg_int("checkin_stones_with_pill_min", 10),
             "checkin_stones_with_pill_max": self._get_cfg_int("checkin_stones_with_pill_max", 100),
-            "checkin_prob_stones": self._get_cfg_int("checkin_prob_stones", 60),
-            "checkin_prob_exp": self._get_cfg_int("checkin_prob_exp", 25),
+            "checkin_prob_stones": self._get_cfg_int("checkin_prob_stones", 45),
+            "checkin_prob_exp": self._get_cfg_int("checkin_prob_exp", 20),
+            "checkin_prob_material": self._get_cfg_int("checkin_prob_material", 20),
             "afk_cultivate_max_minutes": self._get_cfg_int("afk_cultivate_max_minutes", 60),
             "adventure_cooldown": self._get_cfg_int("adventure_cooldown", 1800),
         }

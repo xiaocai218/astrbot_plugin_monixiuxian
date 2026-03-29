@@ -48,6 +48,7 @@ from .models import Player
 from . import market as market_mod
 from . import shop as shop_mod
 from . import sect as sect_mod
+from . import spirit_field as field_mod
 
 logger = logging.getLogger("xiuxian.engine")
 
@@ -84,7 +85,8 @@ class GameEngine:
         """加载所有玩家数据到内存。"""
         # 启动时先从独立心法表加载定义，再进入玩家数据归一化流程
         from .constants import set_heart_method_registry, set_equipment_registry, set_gongfa_registry, set_realm_config, set_pill_registry
-        from .pills import clean_expired_buffs
+        from .constants import set_material_registry, set_seed_registry, set_pill_recipe_registry, sync_pill_recipe_items
+        from .pills import clean_expired_buffs, PILL_REGISTRY as _pill_reg
 
         realms = await self._data_manager.load_realms()
         set_realm_config(realms)
@@ -96,6 +98,14 @@ class GameEngine:
         set_gongfa_registry(gongfas)
         pills = await self._data_manager.load_pills()
         set_pill_registry(pills)
+        materials = await self._data_manager.load_materials()
+        set_material_registry(materials)
+        await self._data_manager.sync_spirit_field_seeds(materials)
+        seeds = await self._data_manager.load_spirit_field_seeds()
+        set_seed_registry(seeds)
+        pill_recipes = await self._data_manager.load_pill_recipes()
+        set_pill_recipe_registry(pill_recipes)
+        sync_pill_recipe_items(_pill_reg)
 
         self._players = await self._data_manager.load_all_players()
         normalized = False
@@ -254,7 +264,7 @@ class GameEngine:
         return result
 
     async def daily_checkin(self, user_id: str) -> dict:
-        """每日签到，随机获得灵石、丹药或修为。"""
+        """每日签到，随机获得灵石、丹药、修为或材料。"""
         player = self._players.get(user_id)
         if not player:
             return {"success": False, "message": "你还没有角色，请先创建"}
@@ -274,10 +284,12 @@ class GameEngine:
         def _clamp(value: int, lo: int, hi: int) -> int:
             return max(lo, min(hi, value))
 
-        prob_stones = _clamp(_to_int(cfg.get("checkin_prob_stones", 60), 60), 0, 100)
-        prob_exp = _clamp(_to_int(cfg.get("checkin_prob_exp", 25), 25), 0, 100)
-        if prob_stones + prob_exp > 100:
-            prob_exp = max(0, 100 - prob_stones)
+        prob_stones = _clamp(_to_int(cfg.get("checkin_prob_stones", 45), 45), 0, 100)
+        prob_exp = _clamp(_to_int(cfg.get("checkin_prob_exp", 20), 20), 0, 100)
+        prob_material = _clamp(_to_int(cfg.get("checkin_prob_material", 20), 20), 0, 100)
+        total = prob_stones + prob_exp + prob_material
+        if total > 100:
+            prob_material = max(0, 100 - prob_stones - prob_exp)
 
         realm_mult = 1.0 + player.realm * 0.3
 
@@ -304,6 +316,30 @@ class GameEngine:
             )
             player.exp += exp
             rewards = f"{exp}修为"
+
+        elif roll <= prob_stones + prob_exp + prob_material:
+            # 随机材料
+            mat_rewards = ""
+            if MATERIAL_REGISTRY:
+                rarity_weights = {0: 6000, 1: 2500, 2: 800, 3: 150, 4: 15, 5: 1}
+                rarities = list(rarity_weights.keys())
+                weights = list(rarity_weights.values())
+                chosen_rarity = random.choices(rarities, weights=weights, k=1)[0]
+                candidates = [m for m in MATERIAL_REGISTRY.values() if m.rarity == chosen_rarity]
+                if not candidates:
+                    candidates = list(MATERIAL_REGISTRY.values())
+                if candidates:
+                    mat = random.choice(candidates)
+                    await add_item(player, mat.item_id)
+                    rarity_name = MATERIAL_RARITY_NAMES.get(mat.rarity, "")
+                    mat_rewards = f"{rarity_name}材料【{mat.name}】"
+            if not mat_rewards:
+                stones = random.randint(
+                    int(20 * realm_mult), int(150 * realm_mult)
+                )
+                player.spirit_stones += stones
+                mat_rewards = f"{stones}灵石（材料池空）"
+            rewards = mat_rewards
 
         else:
             # 灵石 + 丹药
@@ -617,7 +653,7 @@ class GameEngine:
     async def _reload_runtime_registries(self):
         """从数据库重载境界、装备、心法、功法、材料、丹方定义到运行时注册表。"""
         from .constants import set_equipment_registry, set_heart_method_registry, set_gongfa_registry, set_realm_config, set_pill_registry
-        from .constants import set_material_registry, set_pill_recipe_registry
+        from .constants import set_material_registry, set_seed_registry, set_pill_recipe_registry, sync_pill_recipe_items
 
         realms = await self._data_manager.load_realms()
         set_realm_config(realms)
@@ -631,8 +667,14 @@ class GameEngine:
         set_pill_registry(pills)
         materials = await self._data_manager.load_materials()
         set_material_registry(materials)
+        await self._data_manager.sync_spirit_field_seeds(materials)
+        seeds = await self._data_manager.load_spirit_field_seeds()
+        set_seed_registry(seeds)
         pill_recipes = await self._data_manager.load_pill_recipes()
         set_pill_recipe_registry(pill_recipes)
+        # 丹方 item 同步（需要 pill_registry 已就绪）
+        from .pills import PILL_REGISTRY as _pill_reg
+        sync_pill_recipe_items(_pill_reg)
 
     async def _normalize_players_after_registry_change(self):
         """当定义表变化后，归一化玩家境界与装备/心法状态。"""
@@ -3233,3 +3275,84 @@ class GameEngine:
     async def sect_get_contribution_rules(self, user_id: str) -> dict:
         """获取宗门贡献点规则。"""
         return await sect_mod.get_contribution_rules(user_id, self._data_manager)
+
+    async def sect_shop_get_items(self, user_id: str) -> dict:
+        """获取宗门商店今日商品列表（每宗门独立刷新，贡献点结算）。"""
+        return await sect_mod.sect_shop_get_items(user_id, self._data_manager)
+
+    async def sect_shop_buy(self, user_id: str, item_id: str, quantity: int = 1) -> dict:
+        """从宗门商店购买物品，消耗贡献点。"""
+        player = self._players.get(user_id)
+        if not player:
+            return {"success": False, "message": "你还没有角色，请先创建"}
+        async with self._get_player_lock(user_id):
+            snapshot = self._snapshot_player(player)
+            result = await sect_mod.sect_shop_buy(player, item_id, quantity, self._data_manager)
+            if not result["success"]:
+                self._apply_player_snapshot(player, snapshot)
+                return result
+            await self._notify_player_update(player)
+            return result
+
+    # ── 灵田系统 ──────────────────────────────────────────
+
+    async def spirit_field_status(self, user_id: str) -> dict:
+        """获取灵田状态。"""
+        return await field_mod.get_field_status(user_id, self._data_manager)
+
+    async def spirit_field_claim(self, user_id: str) -> dict:
+        """领取灵田。"""
+        player = self._players.get(user_id)
+        if not player:
+            return {"success": False, "message": "你还没有角色，请先创建"}
+        async with self._get_player_lock(user_id):
+            result = await field_mod.claim_field(user_id, self._data_manager)
+            return result
+
+    async def spirit_field_seeds(self, user_id: str) -> dict:
+        """获取可种植的种子列表。"""
+        player = self._players.get(user_id)
+        if not player:
+            return {"success": False, "message": "你还没有角色，请先创建"}
+        field = await self._data_manager.get_spirit_field(user_id)
+        if not field:
+            return {"success": False, "message": "你还没有灵田"}
+        return await field_mod.get_plantable_seeds(player, field["field_level"], self._data_manager)
+
+    async def spirit_field_plant(self, user_id: str, plot_index: int, seed_id: str) -> dict:
+        """种植种子。"""
+        player = self._players.get(user_id)
+        if not player:
+            return {"success": False, "message": "你还没有角色，请先创建"}
+        async with self._get_player_lock(user_id):
+            snapshot = self._snapshot_player(player)
+            result = await field_mod.plant_seed(player, plot_index, seed_id, self._data_manager)
+            if not result["success"]:
+                self._apply_player_snapshot(player, snapshot)
+                return result
+            await self._save_player(player)
+            return result
+
+    async def spirit_field_harvest(self, user_id: str, plot_index: int) -> dict:
+        """收获作物。"""
+        player = self._players.get(user_id)
+        if not player:
+            return {"success": False, "message": "你还没有角色，请先创建"}
+        async with self._get_player_lock(user_id):
+            result = await field_mod.harvest_plot(player, plot_index, self._data_manager)
+            return result
+
+    async def spirit_field_warehouse(self, user_id: str, filter_rarity: int = -1, search: str = "") -> dict:
+        """获取灵田仓库。"""
+        return await field_mod.get_field_warehouse(user_id, self._data_manager, filter_rarity, search)
+
+    async def spirit_field_withdraw(self, user_id: str, material_id: str, count: int) -> dict:
+        """从灵田仓库取出材料。"""
+        player = self._players.get(user_id)
+        if not player:
+            return {"success": False, "message": "你还没有角色，请先创建"}
+        async with self._get_player_lock(user_id):
+            result = await field_mod.warehouse_withdraw(player, material_id, count, self._data_manager)
+            if result["success"]:
+                await self._save_player(player)
+            return result

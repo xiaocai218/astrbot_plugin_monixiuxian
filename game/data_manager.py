@@ -444,6 +444,59 @@ class DataManager:
             CREATE INDEX IF NOT EXISTS idx_sect_contrib_config_sect
             ON sect_contribution_config (sect_id)
         """)
+        # 宗门商店每日限购记录表
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS sect_shop_purchases (
+                user_id  TEXT NOT NULL,
+                item_id  TEXT NOT NULL,
+                date     TEXT NOT NULL,
+                quantity INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (user_id, item_id, date)
+            )
+        """)
+        # ── 灵田系统表 ──
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS spirit_fields (
+                field_id    TEXT PRIMARY KEY,
+                user_id     TEXT NOT NULL UNIQUE,
+                field_level INTEGER NOT NULL DEFAULT 1,
+                created_at  REAL NOT NULL
+            )
+        """)
+        await self.db.execute("""
+            CREATE TABLE IF NOT EXISTS spirit_field_plots (
+                field_id    TEXT NOT NULL,
+                plot_index  INTEGER NOT NULL,
+                state       TEXT NOT NULL DEFAULT 'empty',
+                material_id TEXT DEFAULT '',
+                planted_at  REAL DEFAULT 0.0,
+                grow_time   REAL DEFAULT 0.0,
+                PRIMARY KEY (field_id, plot_index),
+                FOREIGN KEY (field_id) REFERENCES spirit_fields(field_id)
+            )
+        """)
+        await self.db.execute("""
+        CREATE TABLE IF NOT EXISTS spirit_field_warehouse (
+            field_id    TEXT NOT NULL,
+            user_id     TEXT NOT NULL DEFAULT '',
+            material_id TEXT NOT NULL,
+            count       INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY (field_id, material_id),
+            FOREIGN KEY (field_id) REFERENCES spirit_fields(field_id)
+        )
+        """)
+        await self.db.execute("""
+        CREATE TABLE IF NOT EXISTS spirit_field_seeds (
+            seed_id     TEXT PRIMARY KEY,
+            material_id TEXT NOT NULL UNIQUE,
+            name        TEXT NOT NULL,
+            rarity      INTEGER NOT NULL DEFAULT 0,
+            category    TEXT NOT NULL DEFAULT 'herb',
+            grow_time   REAL NOT NULL DEFAULT 3600,
+            description TEXT DEFAULT '',
+            enabled     INTEGER NOT NULL DEFAULT 1
+        )
+        """)
         await self.db.commit()
         # 数据库升级：为旧表添加新列
         await self._alter_add_column("players", "last_adventure_time", "REAL DEFAULT 0.0")
@@ -497,6 +550,7 @@ class DataManager:
         await self._seed_pills()
         # 填充材料定义（仅补齐缺失，不覆盖已有配置）
         await self._seed_materials()
+        await self.sync_spirit_field_seeds()
         # 填充丹方定义（仅补齐缺失）
         await self._seed_pill_recipes()
 
@@ -538,6 +592,15 @@ class DataManager:
                 player = Player.from_dict(d)
                 players[player.user_id] = player
         return players
+
+    async def load_player(self, user_id: str) -> Optional[Player]:
+        """加载单个玩家数据，不存在返回 None。"""
+        async with self.db.execute("SELECT * FROM players WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return None
+        d = self._row_to_dict(row)
+        return Player.from_dict(d)
 
     async def load_heart_methods(self) -> dict:
         """加载启用的心法定义（独立表 -> 运行时）。"""
@@ -783,8 +846,22 @@ class DataManager:
         await self._alter_add_column("sect_applications", "resolved_by", "TEXT")
         await self._alter_add_column("sect_members", "contribution_points", "INTEGER DEFAULT 0")
         await self._alter_add_column("sects", "warehouse_capacity", "INTEGER DEFAULT 200")
+        await self._alter_add_column("spirit_field_warehouse", "user_id", "TEXT DEFAULT ''")
+        await self.db.execute("""
+        UPDATE spirit_field_warehouse
+        SET user_id = (
+            SELECT spirit_fields.user_id
+            FROM spirit_fields
+            WHERE spirit_fields.field_id = spirit_field_warehouse.field_id
+        )
+        WHERE user_id = ''
+        """)
         try:
             await self.db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sects_name_unique ON sects (name)")
+            await self.db.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_spirit_field_warehouse_user_material "
+                "ON spirit_field_warehouse (user_id, material_id)"
+            )
             await self.db.commit()
         except Exception:
             pass
@@ -1701,6 +1778,80 @@ class DataManager:
         except Exception:
             return dict(_DEFAULT_MATERIALS)
         return materials
+
+    async def sync_spirit_field_seeds(self, materials: dict | None = None):
+        """根据材料表同步灵田种子表。"""
+        from .constants import build_seed_registry
+
+        source_materials = materials or await self.load_materials()
+        seeds = build_seed_registry(source_materials)
+        rows = [
+            (
+                seed.seed_id,
+                seed.material_id,
+                seed.name,
+                int(seed.rarity),
+                seed.category,
+                float(seed.grow_time),
+                seed.description,
+                1,
+            )
+            for seed in seeds.values()
+        ]
+
+        if rows:
+            await self.db.executemany(
+                """
+                INSERT INTO spirit_field_seeds (
+                    seed_id, material_id, name, rarity, category, grow_time, description, enabled
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(seed_id) DO UPDATE SET
+                    material_id = excluded.material_id,
+                    name = excluded.name,
+                    rarity = excluded.rarity,
+                    category = excluded.category,
+                    grow_time = excluded.grow_time,
+                    description = excluded.description,
+                    enabled = excluded.enabled
+                """,
+                rows,
+            )
+            placeholders = ", ".join(["?"] * len(rows))
+            await self.db.execute(
+                f"DELETE FROM spirit_field_seeds WHERE seed_id NOT IN ({placeholders})",
+                tuple(seed.seed_id for seed in seeds.values()),
+            )
+        else:
+            await self.db.execute("DELETE FROM spirit_field_seeds")
+        await self.db.commit()
+
+    async def load_spirit_field_seeds(self) -> dict:
+        """加载灵田种子定义（独立表 -> 运行时 SEED_REGISTRY）。"""
+        from .constants import SeedDef, build_seed_registry, _DEFAULT_MATERIALS
+
+        seeds = {}
+        try:
+            async with self.db.execute(
+                """
+                SELECT seed_id, material_id, name, rarity, category, grow_time, description
+                FROM spirit_field_seeds
+                WHERE enabled = 1
+                ORDER BY rarity ASC, category ASC, seed_id ASC
+                """
+            ) as cur:
+                async for row in cur:
+                    seeds[row["seed_id"]] = SeedDef(
+                        seed_id=row["seed_id"],
+                        material_id=row["material_id"],
+                        name=row["name"],
+                        rarity=int(row["rarity"] or 0),
+                        category=row["category"] or "herb",
+                        grow_time=float(row["grow_time"] or 0.0),
+                        description=row["description"] or "",
+                    )
+        except Exception:
+            return build_seed_registry(dict(_DEFAULT_MATERIALS))
+        return seeds or build_seed_registry(dict(_DEFAULT_MATERIALS))
 
     async def admin_list_materials(self) -> list[dict[str, Any]]:
         result = []
@@ -3131,3 +3282,157 @@ class DataManager:
         )
         await self.db.commit()
         return await self.get_member_contribution(user_id)
+
+    async def sect_shop_buy_atomic(self, player: "Player", cost: int,
+                                    item_id: str = "", date_str: str = "",
+                                    quantity: int = 1) -> dict:
+        """原子扣减贡献点并保存玩家状态（宗门商店购买）。"""
+        await self._ensure_sect_schema()
+        if cost > 0:
+            cur = await self.db.execute(
+                "SELECT contribution_points FROM sect_members WHERE user_id = ?",
+                (player.user_id,),
+            )
+            row = await cur.fetchone()
+            current = int((row["contribution_points"] if row else 0) or 0)
+            if current < cost:
+                return {"success": False, "message": f"贡献点不足（需 {cost}，当前 {current}）"}
+            await self.db.execute(
+                "UPDATE sect_members SET contribution_points = contribution_points - ? WHERE user_id = ?",
+                (cost, player.user_id),
+            )
+        if item_id and date_str:
+            await self.db.execute(
+                """INSERT INTO sect_shop_purchases (user_id, item_id, date, quantity)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(user_id, item_id, date)
+                   DO UPDATE SET quantity = quantity + excluded.quantity""",
+                (player.user_id, item_id, date_str, quantity),
+            )
+        await self._upsert_player(player)
+        await self.db.commit()
+        new_contrib = await self.get_member_contribution(player.user_id)
+        return {"success": True, "contribution": new_contrib}
+
+    async def get_sect_shop_purchases_today(self, user_id: str, date_str: str) -> dict[str, int]:
+        """获取用户今日在宗门商店各物品的已购数量，返回 {item_id: quantity}。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT item_id, quantity FROM sect_shop_purchases WHERE user_id = ? AND date = ?",
+            (user_id, date_str),
+        )
+        rows = await cur.fetchall()
+        return {row["item_id"]: int(row["quantity"]) for row in rows}
+
+    # ══════════════════════════════════════════════════════════
+    #   灵田系统
+    # ══════════════════════════════════════════════════════════
+
+    async def get_spirit_field(self, user_id: str) -> dict | None:
+        """获取玩家灵田信息。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT field_id, user_id, field_level, created_at FROM spirit_fields WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+    async def create_spirit_field(self, user_id: str, level: int, plots: int) -> str:
+        """创建灵田并初始化格子，返回 field_id。"""
+        import secrets
+        await self._ensure_sect_schema()
+        field_id = f"field_{secrets.token_hex(6)}"
+        now = time.time()
+        await self.db.execute(
+            "INSERT INTO spirit_fields (field_id, user_id, field_level, created_at) VALUES (?, ?, ?, ?)",
+            (field_id, user_id, level, now),
+        )
+        for i in range(plots):
+            await self.db.execute(
+                "INSERT INTO spirit_field_plots (field_id, plot_index, state) VALUES (?, ?, 'empty')",
+                (field_id, i),
+            )
+        await self.db.commit()
+        return field_id
+
+    async def get_spirit_field_plots(self, field_id: str) -> list[dict]:
+        """获取灵田所有格子状态。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT plot_index, state, material_id, planted_at, grow_time "
+            "FROM spirit_field_plots WHERE field_id = ? ORDER BY plot_index",
+            (field_id,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def plant_spirit_field(
+        self, field_id: str, plot_index: int, material_id: str,
+        planted_at: float, grow_time: float
+    ):
+        """在格子种植材料。"""
+        await self._ensure_sect_schema()
+        await self.db.execute(
+            "UPDATE spirit_field_plots SET state='growing', material_id=?, planted_at=?, grow_time=? "
+            "WHERE field_id=? AND plot_index=?",
+            (material_id, planted_at, grow_time, field_id, plot_index),
+        )
+        await self.db.commit()
+
+    async def harvest_spirit_field_plot(self, field_id: str, plot_index: int):
+        """收获格子：重置为空。"""
+        await self._ensure_sect_schema()
+        await self.db.execute(
+            "UPDATE spirit_field_plots SET state='empty', material_id='', planted_at=0.0, grow_time=0.0 "
+            "WHERE field_id=? AND plot_index=?",
+            (field_id, plot_index),
+        )
+        await self.db.commit()
+
+    async def add_to_field_warehouse(self, user_id: str, field_id: str, material_id: str, count: int):
+        """向灵田仓库添加材料。"""
+        await self._ensure_sect_schema()
+        await self.db.execute(
+            """INSERT INTO spirit_field_warehouse (field_id, user_id, material_id, count)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id, material_id) DO UPDATE SET
+                field_id = excluded.field_id,
+                count = count + excluded.count""",
+            (field_id, user_id, material_id, count),
+        )
+        await self.db.commit()
+
+    async def get_field_warehouse_items(self, user_id: str) -> list[dict]:
+        """获取灵田仓库中所有物品。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT material_id, count FROM spirit_field_warehouse WHERE user_id=? AND count > 0",
+            (user_id,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_field_warehouse_count(self, user_id: str, material_id: str) -> int:
+        """获取灵田仓库中指定材料的数量。"""
+        await self._ensure_sect_schema()
+        cur = await self.db.execute(
+            "SELECT count FROM spirit_field_warehouse WHERE user_id=? AND material_id=?",
+            (user_id, material_id),
+        )
+        row = await cur.fetchone()
+        return int(row["count"]) if row else 0
+
+    async def remove_from_field_warehouse(self, user_id: str, material_id: str, count: int):
+        """从灵田仓库扣除材料。"""
+        await self._ensure_sect_schema()
+        await self.db.execute(
+            "UPDATE spirit_field_warehouse SET count = count - ? WHERE user_id=? AND material_id=?",
+            (count, user_id, material_id),
+        )
+        # 清理归零记录
+        await self.db.execute(
+            "DELETE FROM spirit_field_warehouse WHERE user_id=? AND material_id=? AND count <= 0",
+            (user_id, material_id),
+        )
+        await self.db.commit()

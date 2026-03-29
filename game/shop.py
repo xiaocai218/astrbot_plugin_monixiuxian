@@ -19,10 +19,16 @@ from .constants import (
     GONGFA_TIER_NAMES,
     GONGFA_SCROLL_PREFIX,
     ITEM_REGISTRY,
+    MATERIAL_REGISTRY,
+    MATERIAL_RARITY_NAMES,
+    PILL_RECIPE_REGISTRY,
+    PILL_GRADE_NAMES,
     REALM_CONFIG,
+    SEED_REGISTRY,
     get_daily_recycle_price,
     get_heart_method_manual_id,
     get_gongfa_scroll_id,
+    get_pill_recipe_item_id,
 )
 from .inventory import add_item
 
@@ -31,16 +37,19 @@ if TYPE_CHECKING:
 
 # ── 常量 ──────────────────────────────────────────────────────
 
-SHOP_ITEM_COUNT = 12
+SHOP_ITEM_COUNT = 40
 SHOP_ITEM_DAILY_LIMIT = 20
 SHOP_PRICE_MULTIPLIER = 50
 
 TYPE_WEIGHTS: dict[str, int] = {
-    "consumable": 150,
-    "pill": 250,
-    "equipment": 250,
-    "heart_method": 200,
-    "gongfa": 150,
+    "consumable": 120,
+    "pill": 200,
+    "equipment": 200,
+    "heart_method": 160,
+    "gongfa": 120,
+    "material": 120,
+    "pill_recipe": 80,   # 丹方相对稀少
+    "seed": 80,          # 种子与丹方出现率相近
 }
 
 TIER_WEIGHTS: dict[int, int] = {
@@ -67,6 +76,55 @@ GONGFA_TIER_WEIGHTS: dict[int, int] = {
     1: 500,   # 玄阶 — 多
     2: 350,   # 地阶
     3: 1,     # 天阶 — 极稀
+}
+
+MATERIAL_RARITY_WEIGHTS: dict[int, int] = {
+    0: 6000,  # 普通
+    1: 2500,  # 稀有
+    2: 800,   # 珍稀
+    3: 150,   # 史诗
+    4: 15,    # 传说
+    5: 1,     # 神话（万分之一）
+}
+
+# 天机阁材料按稀有度叠加价格倍率（在基础价×50之上再乘）
+MATERIAL_RARITY_PRICE_MULTIPLIER: dict[int, int] = {
+    0: 1,      # 普通   — 原价
+    1: 4,      # 稀有   — 4×
+    2: 15,     # 珍稀   — 15×
+    3: 60,     # 史诗   — 60×
+    4: 300,    # 传说   — 300×
+    5: 2000,   # 神话   — 离谱的贵
+}
+
+# 天机阁丹方价格 = SHOP_PRICE_MULTIPLIER × 本倍率（故意定价昂贵）
+RECIPE_GRADE_PRICE_MULTIPLIER: dict[int, int] = {
+    0: 60,    # 下品丹方 — 贵
+    1: 200,   # 上品丹方 — 很贵
+    2: 800,   # 无垢丹方 — 极贵
+}
+
+# 天机阁丹方基础价（灵石，在 × 倍率前）
+RECIPE_BASE_PRICE = 100
+
+# 种子稀有度出现权重（越高稀有度越难出现）
+SEED_RARITY_WEIGHTS: dict[int, int] = {
+    0: 6000,  # 普通
+    1: 2500,  # 稀有
+    2: 800,   # 珍稀
+    3: 150,   # 史诗
+    4: 15,    # 传说
+    5: 1,     # 神话（万分之一）
+}
+
+# 种子稀有度价格倍率（高稀有度更贵）
+SEED_RARITY_PRICE_MULTIPLIER: dict[int, int] = {
+    0: 1,     # 普通   — 原价
+    1: 5,     # 稀有   — 5×
+    2: 20,    # 珍稀   — 20×
+    3: 80,    # 史诗   — 80×
+    4: 400,   # 传说   — 400×
+    5: 2000,  # 神话   — 2000×
 }
 
 # ── 辅助 ──────────────────────────────────────────────────────
@@ -161,13 +219,14 @@ def generate_daily_items(target_date: date | None = None) -> list[dict]:
             iid = pill.pill_id
             if iid in seen_ids:
                 continue
+            price = (get_daily_recycle_price(iid, d) or 5) * SHOP_PRICE_MULTIPLIER
             tier_name = PILL_TIER_NAMES.get(pill.tier, "")
             grade_name = PILL_GRADE_NAMES.get(pill.grade, "")
             items.append(_build_item_dict(
                 item_id=iid,
                 name=pill.name,
                 item_type="pill",
-                price=pill.price,
+                price=price,
                 description=pill.description,
                 daily_limit=SHOP_ITEM_DAILY_LIMIT,
                 extra={
@@ -279,6 +338,98 @@ def generate_daily_items(target_date: date | None = None) -> list[dict]:
                     "hp_regen": gf.hp_regen,
                     "lingqi_regen": gf.lingqi_regen,
                     "stat_str": stat_str,
+                },
+            ))
+
+        elif cat == "material":
+            mat_rarity = _weighted_choice(rng, MATERIAL_RARITY_WEIGHTS)
+            candidates = [m for m in MATERIAL_REGISTRY.values() if m.rarity == mat_rarity]
+            if not candidates:
+                continue
+            mat = rng.choice(candidates)
+            iid = mat.item_id
+            if iid in seen_ids:
+                continue
+            rarity_mult = MATERIAL_RARITY_PRICE_MULTIPLIER.get(mat.rarity, 1)
+            price = max(mat.recycle_price, 5) * SHOP_PRICE_MULTIPLIER * rarity_mult
+            rarity_name = MATERIAL_RARITY_NAMES.get(mat.rarity, "未知")
+            items.append(_build_item_dict(
+                item_id=iid,
+                name=mat.name,
+                item_type="material",
+                price=price,
+                description=mat.description,
+                daily_limit=SHOP_ITEM_DAILY_LIMIT,
+                extra={
+                    "rarity": mat.rarity,
+                    "rarity_name": rarity_name,
+                    "category": mat.category,
+                },
+            ))
+
+        elif cat == "pill_recipe":
+            from .pills import PILL_REGISTRY, PILL_TIER_NAMES
+            if not PILL_RECIPE_REGISTRY:
+                continue
+            recipe = rng.choice(list(PILL_RECIPE_REGISTRY.values()))
+            iid = get_pill_recipe_item_id(recipe.recipe_id)
+            if iid in seen_ids:
+                continue
+            grade_mult = RECIPE_GRADE_PRICE_MULTIPLIER.get(recipe.grade, 60)
+            price = RECIPE_BASE_PRICE * SHOP_PRICE_MULTIPLIER * grade_mult
+            grade_name = PILL_GRADE_NAMES.get(recipe.grade, "")
+            pill = PILL_REGISTRY.get(recipe.pill_id)
+            pill_name = pill.name if pill else recipe.pill_id
+            pill_tier = pill.tier if pill else 0
+            tier_name = PILL_TIER_NAMES.get(pill_tier, "")
+            items.append(_build_item_dict(
+                item_id=iid,
+                name=f"{pill_name}丹方",
+                item_type="pill_recipe",
+                price=price,
+                description=f"炼制{grade_name}{pill_name}所需配方，学会后可在炼丹阁使用。",
+                daily_limit=SHOP_ITEM_DAILY_LIMIT,
+                extra={
+                    "recipe_id": recipe.recipe_id,
+                    "pill_id": recipe.pill_id,
+                    "pill_name": pill_name,
+                    "pill_tier": pill_tier,
+                    "pill_tier_name": tier_name,
+                    "grade": recipe.grade,
+                    "grade_name": grade_name,
+                },
+            ))
+
+        elif cat == "seed":
+            if not SEED_REGISTRY:
+                continue
+            seed_rarity = _weighted_choice(rng, SEED_RARITY_WEIGHTS)
+            candidates = [s for s in SEED_REGISTRY.values() if s.rarity == seed_rarity]
+            if not candidates:
+                continue
+            seed = rng.choice(candidates)
+            iid = seed.seed_id
+            if iid in seen_ids:
+                continue
+            rarity_mult = SEED_RARITY_PRICE_MULTIPLIER.get(seed.rarity, 1)
+            # 种子价格参考同材料回收价
+            base_mat = MATERIAL_REGISTRY.get(seed.material_id)
+            base_price = base_mat.recycle_price if base_mat else 10
+            price = max(base_price, 5) * SHOP_PRICE_MULTIPLIER * rarity_mult
+            rarity_name = MATERIAL_RARITY_NAMES.get(seed.rarity, "未知")
+            items.append(_build_item_dict(
+                item_id=iid,
+                name=seed.name,
+                item_type="seed",
+                price=price,
+                description=seed.description,
+                daily_limit=SHOP_ITEM_DAILY_LIMIT,
+                extra={
+                    "rarity": seed.rarity,
+                    "rarity_name": rarity_name,
+                    "category": seed.category,
+                    "material_id": seed.material_id,
+                    "grow_time": seed.grow_time,
                 },
             ))
 

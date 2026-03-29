@@ -86,14 +86,20 @@
   "checkin_prob_stones": {
     "description": "签到获得纯灵石的概率(%)",
     "type": "int",
-    "default": 60,
-    "hint": "0-100之间的整数，三种签到结果概率之和应为100"
+    "default": 45,
+    "hint": "四分支概率模型：灵石/修为/材料/灵石+丹药，四项之和≤100，剩余归灵石+丹药分支"
   },
   "checkin_prob_exp": {
     "description": "签到获得纯修为的概率(%)",
     "type": "int",
-    "default": 25,
-    "hint": "0-100之间的整数，剩余概率为灵石+丹药"
+    "default": 20,
+    "hint": "四分支概率模型，建议与 checkin_prob_stones、checkin_prob_material 之和不超过85"
+  },
+  "checkin_prob_material": {
+    "description": "签到获得随机材料的概率(%)",
+    "type": "int",
+    "default": 20,
+    "hint": "四分支概率模型，材料按稀有度加权随机；材料池为空时 fallback 为灵石"
   },
   "afk_cultivate_max_minutes": {
     "description": "挂机修炼最大时长(分钟)",

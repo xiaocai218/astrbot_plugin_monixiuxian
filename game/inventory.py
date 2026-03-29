@@ -6,9 +6,11 @@ from .constants import (
     ITEM_REGISTRY, EQUIPMENT_REGISTRY, EQUIPMENT_TIER_NAMES,
     HEART_METHOD_REGISTRY, HEART_METHOD_QUALITY_NAMES, MASTERY_LEVELS, REALM_CONFIG,
     GONGFA_REGISTRY, GONGFA_TIER_NAMES,
+    MATERIAL_REGISTRY, MATERIAL_RARITY_NAMES, SEED_REGISTRY,
     NON_RECYCLABLE_ITEMS,
     can_equip, get_daily_recycle_price, parse_heart_method_manual_id,
-    parse_stored_heart_method_item_id, parse_gongfa_scroll_id, get_player_base_max_lingqi,
+    parse_stored_heart_method_item_id, parse_gongfa_scroll_id, parse_pill_recipe_item_id,
+    get_player_base_max_lingqi,
 )
 from .models import Player
 
@@ -457,6 +459,29 @@ def get_inventory_display_sync(player: Player) -> list[dict]:
                 entry["defense_bonus"] = gf.defense_bonus
                 entry["hp_regen"] = gf.hp_regen
                 entry["lingqi_regen"] = gf.lingqi_regen
+        # 丹方详情
+        recipe_id = parse_pill_recipe_item_id(item_id)
+        if recipe_id:
+            from .constants import PILL_RECIPE_REGISTRY, PILL_GRADE_NAMES as _PG
+            recipe = PILL_RECIPE_REGISTRY.get(recipe_id)
+            if recipe:
+                entry["recipe_grade"] = recipe.grade
+                entry["recipe_grade_name"] = _PG.get(recipe.grade, "")
+        # 材料 / 种子详情
+        if item.item_type == "seed":
+            seed = SEED_REGISTRY.get(item_id)
+            if seed:
+                entry["rarity"] = seed.rarity
+                entry["rarity_name"] = MATERIAL_RARITY_NAMES.get(seed.rarity, "未知")
+                entry["material_id"] = seed.material_id
+                material = MATERIAL_REGISTRY.get(seed.material_id)
+                entry["material_name"] = material.name if material else seed.material_id
+                entry["grow_time"] = seed.grow_time
+        elif item.item_type == "material":
+            mat = MATERIAL_REGISTRY.get(item_id)
+            if mat:
+                entry["rarity"] = mat.rarity
+                entry["rarity_name"] = MATERIAL_RARITY_NAMES.get(mat.rarity, "未知")
         result.append(entry)
     return result
 
