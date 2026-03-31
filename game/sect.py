@@ -103,11 +103,11 @@ QUALITY_CATEGORY_NAMES: dict[str, str] = {
     "gongfa_3": "天阶功法",
 }
 
-# 角色兑换折扣：宗主免费，副宗主三折，长老五折，弟子全价
+# 角色兑换折扣：宗主五折，副宗主六折，长老八折，弟子全价
 ROLE_EXCHANGE_DISCOUNT: dict[str, float] = {
-    "leader": 0.0,
-    "vice_leader": 0.3,
-    "elder": 0.5,
+    "leader": 0.5,
+    "vice_leader": 0.6,
+    "elder": 0.8,
     "disciple": 1.0,
 }
 
@@ -770,7 +770,7 @@ async def warehouse_exchange(
     pre_commit=None,
 ) -> dict:
     """从宗门仓库兑换物品，消耗贡献点。
-    宗主免费，副宗主三折，长老五折，弟子全价。
+    宗主五折，副宗主六折，长老八折，弟子全价。
     """
     if count <= 0:
         return {"success": False, "message": "数量必须大于0"}
