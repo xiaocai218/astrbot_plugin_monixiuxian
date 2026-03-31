@@ -211,7 +211,7 @@ def generate_daily_items(target_date: date | None = None) -> list[dict]:
         elif cat == "pill":
             from .pills import (
                 pick_random_pill, SHOP_PILL_TIER_WEIGHTS, SHOP_PILL_GRADE_WEIGHTS,
-                PILL_TIER_NAMES, PILL_GRADE_NAMES,
+                PILL_TIER_NAMES as _PILL_TIER_NAMES,
             )
             pill = pick_random_pill(rng, SHOP_PILL_TIER_WEIGHTS, SHOP_PILL_GRADE_WEIGHTS)
             if not pill:
@@ -220,7 +220,7 @@ def generate_daily_items(target_date: date | None = None) -> list[dict]:
             if iid in seen_ids:
                 continue
             price = (get_daily_recycle_price(iid, d) or 5) * SHOP_PRICE_MULTIPLIER
-            tier_name = PILL_TIER_NAMES.get(pill.tier, "")
+            tier_name = _PILL_TIER_NAMES.get(pill.tier, "")
             grade_name = PILL_GRADE_NAMES.get(pill.grade, "")
             items.append(_build_item_dict(
                 item_id=iid,
