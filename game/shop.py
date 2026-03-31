@@ -368,7 +368,7 @@ def generate_daily_items(target_date: date | None = None) -> list[dict]:
             ))
 
         elif cat == "pill_recipe":
-            from .pills import PILL_REGISTRY, PILL_TIER_NAMES
+            from .pills import PILL_REGISTRY, PILL_TIER_NAMES, PILL_GRADE_NAMES
             if not PILL_RECIPE_REGISTRY:
                 continue
             recipe = rng.choice(list(PILL_RECIPE_REGISTRY.values()))

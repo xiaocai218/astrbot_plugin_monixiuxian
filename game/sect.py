@@ -113,7 +113,7 @@ ROLE_EXCHANGE_DISCOUNT: dict[str, float] = {
 
 # ── 宗门商店常量 ─────────────────────────────────────────
 SECT_SHOP_ITEM_COUNT = 40          # 每日刷新件数
-SECT_SHOP_DAILY_LIMIT = 100        # 每人每件商品每日限购数量
+SECT_SHOP_DAILY_LIMIT = 50         # 每人每件商品每日限购数量
 SECT_SHOP_DISCOUNT_VS_TIANJI = 0.3  # 宗门商店贡献点 = 天机阁灵石价格 ÷ 除数
 SECT_SHOP_SPIRIT_TO_CONTRIB_RATE = 50  # 天机阁价格 / 此数 = 宗门商店贡献点
 

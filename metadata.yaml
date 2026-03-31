@@ -1,6 +1,6 @@
 name: astrbot_plugin_xiuxian
 display_name: 修仙世界
 desc: 修仙文字RPG游戏插件，支持聊天指令和网页游戏界面
-version: v0.8.2
+version: v0.8.3
 author: xiuxian-dev
 repo: https://github.com/linjianyan0229/astrbot_plugin_monixiuxian
